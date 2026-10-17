@@ -5,9 +5,10 @@ import WebKit
 
 @MainActor
 @Observable
-final class BrowserModel {
+final class BrowserModel: NSObject {
     let downloads: DownloadManager
     let sitePermissions: SitePermissions
+    let pinnedPages: PinnedPageStore
 
     private(set) var tabs: [BrowserTab] = []
     private var closedTabs: [ClosedTab] = []
@@ -21,10 +22,16 @@ final class BrowserModel {
             }
             activeTab?.restore()
             activeTab?.didBecomeSelected()
+            if let activeTab {
+                BrowserExtensions.shared.didActivate(activeTab, previous: tab(withID: oldValue))
+            }
         }
     }
     var addressFocusRequest = 0
+    @ObservationIgnored var consumedAddressFocusRequest = 0
     @ObservationIgnored private var suspender: TabSuspender?
+    @ObservationIgnored weak var window: NSWindow?
+    @ObservationIgnored var isExtensionWindow = false
 
     private struct ClosedTab {
         let url: URL?
@@ -33,10 +40,14 @@ final class BrowserModel {
         let interactionState: Any?
     }
 
-    init(downloads: DownloadManager = DownloadManager(), sitePermissions: SitePermissions = .shared) {
+    init(downloads: DownloadManager = DownloadManager(), sitePermissions: SitePermissions = .shared,
+         configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), pinnedPages: PinnedPageStore? = nil) {
         self.downloads = downloads
         self.sitePermissions = sitePermissions
-        addTab()
+        self.pinnedPages = pinnedPages ?? (BrowserProfile.isTesting
+            ? PinnedPageStore(directory: BrowserProfile.directory, enabled: false) : .shared)
+        super.init()
+        addTab(configuration: configuration)
         suspender = TabSuspender(browser: self)
     }
 
@@ -46,6 +57,67 @@ final class BrowserModel {
 
     var canReopenClosedTab: Bool {
         !closedTabs.isEmpty
+    }
+
+    var regularTabs: [BrowserTab] {
+        let ids = Set(pinnedPages.items.map(\.id))
+        return tabs.filter { !ids.contains($0.pinnedPageID ?? $0.id) }
+    }
+
+    func canPin(_ tab: BrowserTab) -> Bool {
+        guard let url = tab.url, PinnedPageStore.valid(url) else { return false }
+        return pinnedPages.items.count < PinnedPageStore.limit || pinnedPages.items.contains { $0.url == url }
+    }
+
+    func pin(_ tab: BrowserTab) {
+        guard let url = tab.url else { return }
+        do {
+            let page = try pinnedPages.pin(url: url, title: tab.title)
+            tabs.filter { $0.pinnedPageID == page.id }.forEach { $0.pinnedPageID = nil }
+            tab.pinnedPageID = page.id
+        } catch { reportPinnedPageError(error) }
+    }
+
+    func unpin(_ page: PinnedPage) {
+        do {
+            try pinnedPages.remove(page.id)
+            tabs.filter { $0.pinnedPageID == page.id }.forEach { $0.pinnedPageID = nil }
+        } catch { reportPinnedPageError(error) }
+    }
+
+    private func reportPinnedPageError(_ error: Error) {
+        pinnedPages.errorMessage = error.localizedDescription
+        if let window { NSAlert(error: error).beginSheetModal(for: window) }
+    }
+
+    func openPinned(_ page: PinnedPage) {
+        guard pinnedPages.items.contains(where: { $0.id == page.id }) else { return }
+        if let tab = tabs.first(where: { $0.pinnedPageID == page.id }) {
+            activeTabID = tab.id
+        } else {
+            let tab = adopt(BrowserTab(url: page.url, title: page.title, interactionState: nil))
+            tab.pinnedPageID = page.id
+            tabs.append(tab)
+            BrowserExtensions.shared.didOpen(tab)
+            activeTabID = tab.id
+        }
+    }
+
+    func restoreSession(_ session: BrowserSessionSnapshot) {
+        guard !session.tabs.isEmpty else { return }
+        let previous = tabs
+        var boundPins = Set<UUID>()
+        tabs = session.tabs.map { saved in
+            guard let url = saved.url, ["https", "http", "webkit-extension"].contains(url.scheme ?? "") else { return makeTab() }
+            let tab = adopt(BrowserTab(url: url, title: saved.title, interactionState: nil))
+            let page = pinnedPages.items.first { $0.id == saved.pinnedPageID }
+                ?? pinnedPages.items.first { $0.url == url }
+            if let page, boundPins.insert(page.id).inserted { tab.pinnedPageID = page.id }
+            return tab
+        }
+        previous.forEach { BrowserExtensions.shared.didClose($0) }
+        tabs.forEach { BrowserExtensions.shared.didOpen($0) }
+        activeTabID = tabs[min(max(0, session.selectedIndex), tabs.count - 1)].id
     }
 
     func tab(withID id: UUID?) -> BrowserTab? {
@@ -62,11 +134,12 @@ final class BrowserModel {
         return tab
     }
 
-    func addTab() {
-        let tab = makeTab()
+    func addTab(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), focusAddress: Bool = true) {
+        let tab = makeTab(configuration: configuration)
         tabs.append(tab)
+        BrowserExtensions.shared.didOpen(tab)
         activeTabID = tab.id
-        requestAddressFocus()
+        if focusAddress { requestAddressFocus() }
     }
 
     func duplicateTab(_ id: UUID) {
@@ -76,7 +149,9 @@ final class BrowserModel {
         let tab = original.url == nil ? makeTab()
             : adopt(BrowserTab(url: original.url, title: original.pageTitle, interactionState: original.interactionState))
         tabs.insert(tab, at: index + 1)
+        BrowserExtensions.shared.didOpen(tab)
         activeTabID = tab.id
+        if tab.isNewTab { requestAddressFocus() }
     }
 
     func moveTab(_ id: UUID, to destinationIndex: Int) {
@@ -85,23 +160,27 @@ final class BrowserModel {
               sourceIndex != destinationIndex else { return }
         tabs.move(fromOffsets: IndexSet(integer: sourceIndex),
                   toOffset: destinationIndex > sourceIndex ? destinationIndex + 1 : destinationIndex)
+        BrowserExtensions.shared.controller.didMoveTab(tabs[destinationIndex], from: sourceIndex, in: self)
     }
 
     func closeOtherTabs(than id: UUID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
-        for tab in tabs where tab.id != id {
+        let closingTabs = tabs.filter { $0.id != id }
+        for tab in closingTabs {
             rememberClosedTab(tab)
         }
         tabs.removeAll { $0.id != id }
+        closingTabs.forEach { BrowserExtensions.shared.didClose($0) }
         activeTabID = id
     }
 
     func closeTabs(after id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        let closingTabs = tabs[(index + 1)...]
+        let closingTabs = Array(tabs[(index + 1)...])
         closingTabs.forEach(rememberClosedTab)
         let closingIDs = Set(closingTabs.map(\.id))
         tabs.removeAll { closingIDs.contains($0.id) }
+        closingTabs.forEach { BrowserExtensions.shared.didClose($0) }
         if let activeTabID, closingIDs.contains(activeTabID) {
             self.activeTabID = id
         }
@@ -115,9 +194,15 @@ final class BrowserModel {
     func closeTab(_ id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         rememberClosedTab(tabs[index])
-        tabs.remove(at: index)
+        let closed = tabs.remove(at: index)
+        BrowserExtensions.shared.didClose(closed)
         if tabs.isEmpty {
-            addTab()
+            if isExtensionWindow {
+                activeTabID = nil
+                window?.close()
+            } else {
+                addTab()
+            }
         } else if activeTabID == id {
             activeTabID = tabs[min(index, tabs.count - 1)].id
         }
@@ -142,6 +227,7 @@ final class BrowserModel {
         let tab = adopt(BrowserTab(url: closedTab.url, title: closedTab.title,
                                    interactionState: closedTab.interactionState))
         tabs.append(tab)
+        BrowserExtensions.shared.didOpen(tab)
         activeTabID = tab.id
     }
 
@@ -161,6 +247,7 @@ final class BrowserModel {
             index += 1
         }
         tabs.insert(tab, at: index)
+        BrowserExtensions.shared.didOpen(tab)
         if let request { tab.webView?.load(request) }
         if select { activeTabID = tab.id }
         return tab
@@ -186,6 +273,7 @@ final class BrowserModel {
         if inNewTab || activeTab == nil {
             let tab = makeTab()
             tabs.append(tab)
+            BrowserExtensions.shared.didOpen(tab)
             activeTabID = tab.id
         }
         activeTab?.load(url)

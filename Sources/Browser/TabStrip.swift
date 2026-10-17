@@ -14,7 +14,10 @@ struct TabStrip: View {
     let layout: TabLayout
     let isFullScreen: Bool
     @Binding var hoverCardTabID: UUID?
+    var usesNativeHoverPopover = false
+    var customize: () -> Void = {}
     @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
+    @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
 
     @State private var hoveredTabID: UUID?
     @State private var suppressedHoverCardTabID: UUID?
@@ -23,7 +26,6 @@ struct TabStrip: View {
     private let spacing: CGFloat = 4
     private let maxTabWidth: CGFloat = 220
     private let minTabWidth: CGFloat = 56
-    private let newTabButtonSize: CGFloat = 28
     /// Always leave some empty strip to drag the window by.
     private let minDragAreaWidth: CGFloat = 40
 
@@ -39,11 +41,9 @@ struct TabStrip: View {
 
     private var horizontalStrip: some View {
         GeometryReader { geometry in
-            let leading = isFullScreen ? BrowserChrome.edgeInset
-                : BrowserChrome.windowButtonsTrailing(titlebarHeight: BrowserChrome.tabRowHeight) + 12
-            let count = CGFloat(browser.tabs.count)
-            let availableWidth = max(minTabWidth, geometry.size.width - leading - BrowserChrome.edgeInset
-                                     - newTabButtonSize - spacing - minDragAreaWidth)
+            let count = CGFloat(max(1, browser.regularTabs.count))
+            let availableWidth = max(minTabWidth, geometry.size.width - BrowserChrome.edgeInset
+                                     - minDragAreaWidth)
             let tabWidth = min(maxTabWidth,
                                max(minTabWidth, ((availableWidth - spacing * (count - 1)) / count).rounded(.down)))
             let tabsWidth = tabWidth * count + spacing * (count - 1)
@@ -52,7 +52,7 @@ struct TabStrip: View {
                 ScrollViewReader { scrollProxy in
                     ScrollView(.horizontal) {
                         HStack(spacing: spacing) {
-                            ForEach(Array(browser.tabs.enumerated()), id: \.element.id) { index, tab in
+                            ForEach(Array(browser.regularTabs.enumerated()), id: \.element.id) { index, tab in
                                 tabItem(for: tab, at: index, width: tabWidth)
                                     .id(tab.id)
                             }
@@ -61,90 +61,93 @@ struct TabStrip: View {
                     }
                     .scrollIndicators(.never)
                     .scrollDisabled(tabsWidth <= availableWidth)
+                    .onAppear { if let id = browser.activeTabID { scrollProxy.scrollTo(id) } }
+                    .onChange(of: geometry.size.width) { _, _ in
+                        if let id = browser.activeTabID { scrollProxy.scrollTo(id) }
+                    }
                     .onChange(of: browser.activeTabID) { _, activeTabID in
                         guard let activeTabID else { return }
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            scrollProxy.scrollTo(activeTabID)
-                        }
+                        scrollProxy.scrollTo(activeTabID)
                     }
                 }
                 .frame(width: min(tabsWidth, availableWidth))
 
-                Button { browser.addTab() } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(ChromeIconButtonStyle(size: newTabButtonSize))
-                .help("New Tab (⌘T)")
-                .accessibilityLabel("New Tab")
-
                 Color.clear
                     .contentShape(Rectangle())
                     .gesture(WindowDragGesture())
                     .contextMenu { stripMenu }
             }
-            .padding(.leading, leading)
+            // The native titlebar container owns the gap after the traffic lights.
             .padding(.trailing, BrowserChrome.edgeInset)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            .animation(.snappy(duration: 0.22), value: browser.tabs.map(\.id))
-            .animation(.snappy(duration: 0.22), value: tabWidth)
         }
         .frame(height: BrowserChrome.tabRowHeight)
+        .background(HorizontalTabAnchor())
     }
 
     private var sidebar: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 2) {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .gesture(WindowDragGesture())
-                    .contextMenu { stripMenu }
-                Button { tabLayout = .horizontal } label: {
-                    Image(systemName: "rectangle.topthird.inset.filled")
-                }
-                .buttonStyle(ChromeIconButtonStyle(size: 28))
-                .help("Use Horizontal Tabs (⇧⌘S)")
-                .accessibilityLabel("Use Horizontal Tabs")
-                Button { browser.addTab() } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(ChromeIconButtonStyle(size: 28))
-                .help("New Tab (⌘T)")
-                .accessibilityLabel("New Tab")
-            }
-            .padding(.leading, isFullScreen ? BrowserChrome.edgeInset
-                     : BrowserChrome.windowButtonsTrailing(titlebarHeight: BrowserChrome.navigationBarHeight) + 8)
-            .padding(.trailing, BrowserChrome.edgeInset)
-            .frame(height: BrowserChrome.navigationBarHeight)
+        GeometryReader { geometry in
+            let rowHeight = compactTabs ? BrowserChrome.sidebarTabHeight : 42
+            let count = browser.regularTabs.count
+            let tabsHeight = CGFloat(count) * rowHeight + CGFloat(max(0, count - 1)) * BrowserChrome.smallGap
+            let pinRows = CGFloat((browser.pinnedPages.items.count + 2) / 3)
+            let pinHeight = pinRows == 0 ? 0 : pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset
+            let newTabFits = tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
 
-            ScrollViewReader { scrollProxy in
-                ScrollView(.vertical) {
-                    VStack(spacing: 2) {
-                        ForEach(Array(browser.tabs.enumerated()), id: \.element.id) { index, tab in
-                            tabItem(for: tab, at: index, width: nil)
-                                .id(tab.id)
-                        }
-                    }
-                    .padding(.horizontal, BrowserChrome.edgeInset)
-                    .padding(.top, 2)
-                    .padding(.bottom, BrowserChrome.edgeInset)
+            VStack(spacing: BrowserChrome.edgeInset) {
+                if !browser.pinnedPages.items.isEmpty {
+                    PinnedPagesGrid(browser: browser)
+                        .padding(.horizontal, BrowserChrome.edgeInset)
                 }
-                .scrollIndicators(.never)
-                .onChange(of: browser.activeTabID) { _, activeTabID in
-                    guard let activeTabID else { return }
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        scrollProxy.scrollTo(activeTabID)
+                ScrollViewReader { scrollProxy in
+                    ScrollView(.vertical) {
+                        VStack(spacing: BrowserChrome.smallGap) {
+                            ForEach(Array(browser.regularTabs.enumerated()), id: \.element.id) { index, tab in
+                                tabItem(for: tab, at: index, width: nil).id(tab.id)
+                            }
+                            if newTabFits { newTabRow(height: rowHeight) }
+                        }
+                        .padding(.horizontal, BrowserChrome.edgeInset)
+
+                        .padding(.bottom, newTabFits ? BrowserChrome.edgeInset : 0)
                     }
+                    .scrollIndicators(.never)
+                    .onChange(of: browser.activeTabID) { _, activeTabID in
+                        guard let activeTabID else { return }
+                        withAnimation(.easeOut(duration: 0.2)) { scrollProxy.scrollTo(activeTabID) }
+                    }
+                }
+                if !newTabFits {
+                    newTabRow(height: rowHeight)
+                        .padding(.horizontal, BrowserChrome.edgeInset)
+                        .padding(.bottom, BrowserChrome.edgeInset)
                 }
             }
             .contextMenu { stripMenu }
             .animation(.snappy(duration: 0.22), value: browser.tabs.map(\.id))
         }
+        .padding(.top, BrowserChrome.edgeInset)
+    }
+
+    private func newTabRow(height: CGFloat) -> some View {
+        Button { browser.addTab() } label: {
+            Label("New Tab", systemImage: "plus")
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: height)
+                .padding(.leading, BrowserChrome.edgeInset)
+                .contentShape(RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius))
+        }
+        .buttonStyle(NewTabRowButtonStyle())
+        .help("New Tab (⌘T)")
+        .accessibilityLabel("New Tab")
     }
 
     private func tabItem(for tab: BrowserTab, at index: Int, width: CGFloat?) -> some View {
         let isActive = browser.activeTabID == tab.id
         let isHovered = hoveredTabID == tab.id
-        let nextTab = browser.tabs.indices.contains(index + 1) ? browser.tabs[index + 1] : nil
+        let nextTab = browser.regularTabs.indices.contains(index + 1) ? browser.regularTabs[index + 1] : nil
         let showsSeparator = layout == .horizontal && nextTab.map { next in
             !isActive && !isHovered && browser.activeTabID != next.id && hoveredTabID != next.id
         } ?? false
@@ -153,7 +156,7 @@ struct TabStrip: View {
                        isActive: isActive,
                        isHovered: isHovered,
                        width: width,
-                       height: layout == .vertical ? BrowserChrome.sidebarTabHeight : BrowserChrome.tabHeight,
+                       height: layout == .vertical ? (compactTabs ? BrowserChrome.sidebarTabHeight : 42) : BrowserChrome.tabHeight,
                        select: {
                            suppressedHoverCardTabID = tab.id
                            hoverCardTabID = nil
@@ -188,6 +191,10 @@ struct TabStrip: View {
                                                            browser: browser,
                                                            draggedTabID: $draggedTabID))
             .contextMenu { tabMenu(for: tab, at: index) }
+            .popover(isPresented: Binding(get: { usesNativeHoverPopover && hoverCardTabID == tab.id },
+                                           set: { if !$0 { hoverCardTabID = nil } }), arrowEdge: .top) {
+                TabHoverCard(tab: tab, isActive: isActive).padding(8)
+            }
     }
 
     /// Shows the card after a short delay, then follows the pointer between tabs without waiting again.
@@ -216,6 +223,8 @@ struct TabStrip: View {
         Button("Reload") { browser.reloadTab(tab.id) }
             .disabled(tab.isNewTab)
         Button("Duplicate") { browser.duplicateTab(tab.id) }
+        Button("Pin Webpage") { browser.pin(tab) }
+            .disabled(!browser.canPin(tab))
         Button("Copy Link") {
             guard let url = tab.url else { return }
             NSPasteboard.general.clearContents()
@@ -227,7 +236,7 @@ struct TabStrip: View {
         Button("Close Other Tabs") { browser.closeOtherTabs(than: tab.id) }
             .disabled(browser.tabs.count < 2)
         Button("Close Tabs to the Right") { browser.closeTabs(after: tab.id) }
-            .disabled(index == browser.tabs.count - 1)
+            .disabled(browser.tabs.last?.id == tab.id)
         Divider()
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }
             .disabled(!browser.canReopenClosedTab)
@@ -244,10 +253,19 @@ struct TabStrip: View {
 
     @ViewBuilder
     private var layoutToggle: some View {
-        Divider()
-        Button(layout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs") {
-            tabLayout = layout.toggled
-        }
+        ChromeCustomizationMenu(customize: customize)
+    }
+}
+
+private struct NewTabRowButtonStyle: ButtonStyle {
+    @State private var isHovered = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(configuration.isPressed ? Color.primary.opacity(0.09)
+                        : isHovered ? Color.primary.opacity(0.045) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous))
+            .onHover { isHovered = $0 }
     }
 }
 
@@ -266,7 +284,7 @@ private struct TabItem: View {
     private var showsCloseButton: Bool { isHovered || (isActive && !isCompact) }
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous)
 
         HStack(spacing: 7) {
             if !(isCompact && showsCloseButton) {
@@ -282,15 +300,12 @@ private struct TabItem: View {
                     .allowsHitTesting(showsCloseButton)
             }
         }
-        .padding(.leading, isCompact ? 0 : 10)
+        .padding(.leading, isCompact ? 0 : BrowserChrome.edgeInset)
         .padding(.trailing, isCompact ? 0 : 4)
         .frame(width: width, height: height)
         .frame(maxWidth: width == nil ? .infinity : nil)
-        .background {
-            shape.fill(isActive ? Color.primary.opacity(0.11) :
-                       isHovered ? Color.primary.opacity(0.055) : Color.clear)
-                .shadow(color: .black.opacity(isActive ? 0.08 : 0), radius: 1, y: 0.5)
-        }
+        .background(shape.fill(isHovered && !isActive ? Color.primary.opacity(0.055) : Color.clear))
+        .modifier(ActiveTabGlass(isActive: isActive, shape: shape))
         .overlay {
             shape.strokeBorder(Color.primary.opacity(isActive ? 0.07 : 0), lineWidth: 1)
         }
@@ -407,7 +422,7 @@ struct TabHoverCard: View {
             .padding(.vertical, 10)
         }
         .frame(width: Self.width, alignment: .leading)
-        .background(.regularMaterial, in: shape)
+        .glassEffect(.regular, in: shape)
         .clipShape(shape)
         .overlay { shape.strokeBorder(Color.primary.opacity(0.1), lineWidth: 1) }
         .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
@@ -418,6 +433,20 @@ struct TabHoverCard: View {
         let host = tab.host.map { $0.hasPrefix("www.") ? String($0.dropFirst(4)) : $0 }
             ?? tab.url?.absoluteString ?? ""
         return tab.isLoading ? "\(host) · Loading…" : host
+    }
+}
+
+private struct ActiveTabGlass: ViewModifier {
+    let isActive: Bool
+    let shape: RoundedRectangle
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isActive {
+            content.glassEffect(.regular.interactive(), in: shape)
+        } else {
+            content
+        }
     }
 }
 

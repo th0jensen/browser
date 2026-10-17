@@ -17,6 +17,16 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
         if navigationAction.shouldPerformDownload { return .download }
+        if navigationAction.targetFrame?.isMainFrame == true, let url = navigationAction.request.url,
+           url.absoluteString != "about:blank" {
+            let controller = BrowserExtensions.shared.controller
+            let currentContext = tab?.extensionOrigin.flatMap { controller.extensionContext(for: $0) }
+            let nextContext = controller.extensionContext(for: url)
+            if currentContext !== nextContext {
+                tab?.load(url)
+                return .cancel
+            }
+        }
         if navigationAction.navigationType == .linkActivated,
            navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == Self.middleButtonMask,
            let tab, let browser = tab.browser {
@@ -132,6 +142,11 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         guard let tab, let browser = tab.browser else { return nil }
+        if webView.url?.scheme == "webkit-extension" {
+            let popup = BrowserExtensions.shared.openWindow(configuration: configuration, opener: tab).activeTab
+            popup?.extensionOrigin = tab.extensionOrigin
+            return popup?.webView
+        }
         return browser.openChildTab(of: tab, configuration: configuration, select: true).webView
     }
 
@@ -147,8 +162,12 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webViewDidClose(_ webView: WKWebView) {
-        guard let tab else { return }
-        tab.browser?.closeTab(tab.id)
+        guard let tab, let browser = tab.browser else { return }
+        if tab.isPopUp, browser.tabs.count == 1, let window = browser.window {
+            window.close()
+        } else {
+            browser.closeTab(tab.id)
+        }
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,

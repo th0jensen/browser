@@ -1,19 +1,34 @@
 import SwiftUI
+import Darwin
 
 @main
 struct BrowserApp: App {
     @State private var bookmarks = BookmarkStore()
     @State private var downloads = DownloadManager()
 
+    init() {
+        // Deployment initializes the canonical sandbox before copying an older debug profile into it.
+        if CommandLine.arguments.contains("--prepare-profile") {
+            do { try BrowserProfile.prepare(); exit(0) }
+            catch {
+                FileHandle.standardError.write(Data("Could not prepare Browser profile: \(error.localizedDescription)\n".utf8))
+                exit(1)
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             BrowserWindow(bookmarks: bookmarks, downloads: downloads)
                 .frame(minWidth: 680, minHeight: 440)
         }
+        .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
         .commands {
+            ToolbarCommands()
             BrowserCommands(bookmarks: bookmarks)
         }
+        Settings { BrowserSettings() }
     }
 }
 
@@ -33,6 +48,7 @@ private struct BrowserCommands: Commands {
     @FocusedValue(\.browserModel) private var browser
     @AppStorage(BookmarksBarVisibility.storageKey) private var bookmarksBarVisibility = BookmarksBarVisibility.always
     @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
+    @AppStorage(SidebarVisibility.autoHideKey) private var autoHideSidebar = false
 
     private var bookmarkableTab: BrowserTab? {
         guard let tab = browser?.activeTab, !tab.isNewTab, tab.url != nil else { return nil }
@@ -48,7 +64,24 @@ private struct BrowserCommands: Commands {
             Button("Close Tab") { browser?.closeActiveTab() }
                 .keyboardShortcut("w", modifiers: .command)
         }
+        CommandGroup(replacing: .saveItem) {
+            Button("Save Webpage As…") { browser?.saveWebpage() }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(browser?.activeTab?.isNewTab != false)
+        }
         CommandMenu("Tabs") {
+            Button("Pin Webpage") {
+                if let browser, let tab = browser.activeTab { browser.pin(tab) }
+            }
+            .disabled(browser.flatMap { model in model.activeTab.map { model.canPin($0) } } != true)
+            if let browser, !browser.pinnedPages.items.isEmpty {
+                Menu("Pinned Pages") {
+                    ForEach(browser.pinnedPages.items) { page in
+                        Button(page.title) { browser.openPinned(page) }
+                    }
+                }
+            }
+            Divider()
             Button("Next Tab") { browser?.switchTab(by: 1) }
                 .keyboardShortcut("]", modifiers: [.command, .shift])
             Button("Previous Tab") { browser?.switchTab(by: -1) }
@@ -81,7 +114,13 @@ private struct BrowserCommands: Commands {
             Button(tabLayout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs") {
                 tabLayout = tabLayout.toggled
             }
-            .keyboardShortcut("s", modifiers: [.command, .shift])
+            .keyboardShortcut("s", modifiers: [.command, .option])
+            Button(autoHideSidebar && tabLayout == .vertical ? "Pin Sidebar" : "Automatically Hide Sidebar") {
+                let isAutoHiding = tabLayout == .vertical && autoHideSidebar
+                tabLayout = .vertical
+                autoHideSidebar = !isAutoHiding
+            }
+            .keyboardShortcut("s", modifiers: .command)
             Divider()
             Picker("Bookmarks Bar", selection: $bookmarksBarVisibility) {
                 ForEach(BookmarksBarVisibility.allCases) { visibility in

@@ -8,23 +8,30 @@ struct DownloadsButton: View {
 
     var body: some View {
         Button { isShowingList.toggle() } label: {
-            ZStack {
-                if downloads.isDownloading {
-                    Circle()
-                        .stroke(Color.primary.opacity(0.12), lineWidth: 2)
-                    Circle()
-                        .trim(from: 0, to: max(0.02, downloads.progress))
-                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                        .animation(.easeOut(duration: 0.2), value: downloads.progress)
+            Label {
+                Text("Downloads")
+            } icon: {
+                ZStack {
+                    if downloads.isDownloading {
+                        Circle()
+                            .stroke(Color.primary.opacity(0.12), lineWidth: 2)
+                        Circle()
+                            .trim(from: 0, to: max(0.02, downloads.progress))
+                            .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .animation(.easeOut(duration: 0.2), value: downloads.progress)
+                    }
+                    Image(systemName: downloads.isDownloading ? "arrow.down" : "arrow.down.circle")
+                        .font(.system(size: downloads.isDownloading ? 8.5 : BrowserChrome.toolbarSymbolSize, weight: .regular))
+                        .symbolEffect(.bounce, value: downloads.items.count)
                 }
-                Image(systemName: downloads.isDownloading ? "arrow.down" : "arrow.down.circle")
-                    .font(.system(size: downloads.isDownloading ? 8.5 : 14, weight: .semibold))
-                    .symbolEffect(.bounce, value: downloads.items.count)
+                .frame(width: 16, height: 16)
             }
-            .frame(width: 17, height: 17)
         }
-        .buttonStyle(ChromeIconButtonStyle(size: 34))
+        .labelStyle(.iconOnly)
+        .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
+        .buttonStyle(.automatic)
+        .controlSize(.regular)
         .help("Downloads")
         .accessibilityLabel("Downloads")
         .accessibilityValue(downloads.isDownloading ? Text(downloads.progress, format: .percent.precision(.fractionLength(0)))

@@ -51,10 +51,8 @@ final class BookmarkStoreTests: XCTestCase {
         XCTAssertFalse(BookmarksBarVisibility.never.isVisible(onNewTab: true))
     }
 
-    func testTabLayoutTogglesAndSizesTheWindowControlsRow() {
+    func testTabLayoutToggles() {
         XCTAssertEqual(TabLayout.horizontal.toggled, .vertical)
         XCTAssertEqual(TabLayout.vertical.toggled, .horizontal)
-        XCTAssertEqual(BrowserChrome.titlebarHeight(for: .horizontal), BrowserChrome.tabRowHeight)
-        XCTAssertEqual(BrowserChrome.titlebarHeight(for: .vertical), BrowserChrome.navigationBarHeight)
     }
 }

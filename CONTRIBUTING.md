@@ -4,18 +4,16 @@ Thank you for contributing! Please check existing issues and pull requests befor
 
 ## Setup
 
-Browser requires macOS 26 or later, Xcode 26 or later, and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
+Browser requires macOS 26 or later, Xcode 26 or later, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and [just](https://github.com/casey/just).
 
 ```sh
-xcodegen generate
-xcodebuild -project Browser.xcodeproj -scheme Browser -configuration Debug -derivedDataPath DerivedData build CODE_SIGNING_ALLOWED=NO
-open DerivedData/Build/Products/Debug/Browser.app
+just
 ```
 
 Run the tests with:
 
 ```sh
-xcodebuild -project Browser.xcodeproj -scheme Browser -derivedDataPath DerivedData test CODE_SIGNING_ALLOWED=NO
+just test
 ```
 
 ## Before Submitting

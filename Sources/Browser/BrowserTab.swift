@@ -5,18 +5,21 @@ import WebKit
 
 @MainActor
 @Observable
-final class BrowserTab: Identifiable {
+final class BrowserTab: NSObject, Identifiable {
     let id = UUID()
     /// The page's web view, or `nil` while the tab is suspended to free its memory.
     private(set) var webView: WKWebView?
     /// Hosts the web view, and the Web Inspector when it's docked, so both move together between windows and tabs.
     let contentView = NSView()
     var isNewTab = true
+    var pinnedPageID: UUID?
     /// The tab whose page opened this one, so its links and pop-ups open next to each other.
     @ObservationIgnored var openerID: UUID?
     /// Whether another page's script opened this one, and can still reach it through `window.opener`.
     @ObservationIgnored var isPopUp = false
     @ObservationIgnored weak var browser: BrowserModel?
+    /// Extension pages require a configuration restricted to that extension's origin.
+    @ObservationIgnored var extensionOrigin: URL?
     /// When the tab was last selected, so the least recently used tabs are suspended first.
     @ObservationIgnored var lastActive = ContinuousClock.now
     var favicon: Image?
@@ -48,6 +51,8 @@ final class BrowserTab: Identifiable {
 
     /// Pass the configuration WebKit provides when a page opens a window, so the new page keeps its opener.
     init(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration()) {
+        super.init()
+        Self.prepareConfiguration(configuration)
         pageDelegate.tab = self
         install(WKWebView(frame: .zero, configuration: configuration))
     }
@@ -60,6 +65,7 @@ final class BrowserTab: Identifiable {
         suspendedState = interactionState
         favicon = FaviconStore.cachedIcon(for: url)
         faviconHost = url?.host()
+        super.init()
         pageDelegate.tab = self
     }
 
@@ -85,17 +91,23 @@ final class BrowserTab: Identifiable {
         webView.navigationDelegate = pageDelegate
         webView.uiDelegate = pageDelegate
         self.webView = webView
+        BrowserExtensions.shared.updateRules(in: webView)
 
         let options: NSKeyValueObservingOptions = isRestoring ? [] : .initial
         observe(webView, \.url, options) { tab, webView in
             tab.url = tab.loadError?.url ?? webView.url
+            BrowserExtensions.shared.didChange(.URL, for: tab)
             // Same-document navigations don't load, but can still change the icon.
             if !webView.isLoading { tab.updateFavicon() }
         }
-        observe(webView, \.title, options) { $0.pageTitle = $1.title ?? "" }
+        observe(webView, \.title, options) {
+            $0.pageTitle = $1.title ?? ""
+            BrowserExtensions.shared.didChange(.title, for: $0)
+        }
         observe(webView, \.isLoading, options) { tab, webView in
             let didFinish = tab.isLoading && !webView.isLoading
             tab.isLoading = webView.isLoading
+            BrowserExtensions.shared.didChange(.loading, for: tab)
             if didFinish {
                 tab.scheduleThumbnail()
                 tab.updateFavicon()
@@ -128,7 +140,9 @@ final class BrowserTab: Identifiable {
     /// A pop-up gets a fresh configuration too, since its tie to the opener can't be restored.
     func restore() {
         guard isSuspended else { return }
-        let webView = WKWebView(frame: .zero, configuration: Self.makeConfiguration())
+        let context = url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
+        extensionOrigin = context?.baseURL
+        let webView = WKWebView(frame: .zero, configuration: context?.webViewConfiguration ?? Self.makeConfiguration())
         install(webView, isRestoring: true)
         if let suspendedState {
             webView.interactionState = suspendedState
@@ -178,6 +192,20 @@ final class BrowserTab: Identifiable {
 
     static func makeConfiguration() -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
+        prepareConfiguration(configuration)
+        return configuration
+    }
+
+    /// Apply browser settings to WebKit-provided pop-up and extension configurations as well as ordinary tabs.
+    /// Keep the supplied process pool, data store and content controller so opener and extension messaging survive.
+    private static func prepareConfiguration(_ configuration: WKWebViewConfiguration) {
+        applyBrowserPreferences(to: configuration)
+        BrowserExtensions.shared.configure(configuration)
+    }
+
+    /// Also used for extension background pages, so network requests keep the same browser identity.
+    static func applyBrowserPreferences(to configuration: WKWebViewConfiguration) {
+        configuration.websiteDataStore = BrowserProfile.websiteDataStore
         let safariURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari")
         let safariVersion = safariURL.flatMap { Bundle(url: $0)?
             .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String }
@@ -188,7 +216,6 @@ final class BrowserTab: Identifiable {
         #if DEBUG
         WebInspector.enableDeveloperExtras(in: configuration)
         #endif
-        return configuration
     }
 
     /// Mirrors a KVO-observable web view property into observable state.
@@ -232,6 +259,17 @@ final class BrowserTab: Identifiable {
     func load(_ url: URL) {
         isNewTab = false
         restore()
+        let controller = BrowserExtensions.shared.controller
+        let oldContext = extensionOrigin.flatMap { controller.extensionContext(for: $0) }
+        let newContext = controller.extensionContext(for: url)
+        if oldContext !== newContext {
+            // WebKit forbids ordinary web pages in an extension-owned configuration, and vice versa.
+            suspend()
+            suspendedState = nil
+            install(WKWebView(frame: .zero, configuration: newContext?.webViewConfiguration ?? Self.makeConfiguration()))
+        }
+        extensionOrigin = newContext?.baseURL
+        self.url = url
         pageDelegate.isLoadingFromBrowser = true
         webView?.load(URLRequest(url: url))
     }

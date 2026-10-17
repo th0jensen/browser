@@ -106,7 +106,9 @@ final class TabSuspensionTests: XCTestCase {
         guard let pid else { throw XCTSkip("WebKit doesn't expose the page's process") }
         browser.addTab()
 
-        kill(pid, SIGKILL)
+        guard kill(pid, SIGKILL) == 0 else {
+            throw XCTSkip("The app sandbox does not allow killing WebKit’s process: \(String(cString: strerror(errno)))")
+        }
 
         try await waitUntil { tab.isSuspended }
         browser.activeTabID = tab.id

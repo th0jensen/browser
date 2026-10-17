@@ -1,0 +1,7 @@
+{
+  "manifest_version": 3,
+  "name": "Fixture Extension",
+  "description": "Signed Safari Web Extension used by Browser's integration tests.",
+  "version": "1.0",
+  "action": { "default_title": "Fixture" }
+}

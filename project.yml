@@ -7,6 +7,17 @@ settings:
   base:
     SWIFT_VERSION: 6.0
     MACOSX_DEPLOYMENT_TARGET: "26.0"
+schemes:
+  Browser:
+    build:
+      targets:
+        Browser: all
+        BrowserTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets: [BrowserTests]
 targets:
   Browser:
     type: application
@@ -28,6 +39,22 @@ targets:
         ENABLE_RESOURCE_ACCESS_CAMERA: YES
         ENABLE_RESOURCE_ACCESS_AUDIO_INPUT: YES
         ENABLE_RESOURCE_ACCESS_PRINTING: YES
+      configs:
+        Debug:
+          PRODUCT_NAME: Browser-Debug
+          PRODUCT_MODULE_NAME: Browser
+          INFOPLIST_KEY_CFBundleDisplayName: Browser Debug
+        Release:
+          PRODUCT_NAME: Browser
+          PRODUCT_MODULE_NAME: Browser
+    info:
+      path: DerivedData/Browser-Info.plist
+      properties:
+        CFBundleURLTypes:
+          - CFBundleURLName: Web URLs
+            CFBundleURLSchemes: [http, https]
+            CFBundleTypeRole: Viewer
+        NSUserActivityTypes: [NSUserActivityTypeBrowsingWeb]
     entitlements:
       path: Browser.entitlements
   BrowserTests:
@@ -37,7 +64,30 @@ targets:
       - path: Tests/BrowserTests
     dependencies:
       - target: Browser
+      - target: BrowserExtensionFixture
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser.tests
         GENERATE_INFOPLIST_FILE: YES
+      configs:
+        Debug:
+          TEST_HOST: $(BUILT_PRODUCTS_DIR)/Browser-Debug.app/Contents/MacOS/Browser-Debug
+  BrowserExtensionFixture:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Tests/ExtensionFixture
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.browser.fixture.extension
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES
+    info:
+      path: DerivedData/ExtensionFixture-Info.plist
+      properties:
+        CFBundleDisplayName: Fixture Extension
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.Safari.web-extension
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FixtureHandler
