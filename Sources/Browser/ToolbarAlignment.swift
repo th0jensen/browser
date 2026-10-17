@@ -61,9 +61,9 @@ final class ToolbarAlignmentView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func scheduleUpdate() {
-        guard !updateIsScheduled else { return }
+        guard !updateIsScheduled, browserWindow?.toolbar?.isVisible == true else { return }
         updateIsScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             updateIsScheduled = false
             guard let window = browserWindow,

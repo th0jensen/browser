@@ -23,7 +23,9 @@ Debug and release share the `dev.athas.browser` sandbox identity, settings, exte
 
 ## Tabs and glass
 
-The address bar, navigation controls, extension buttons, and selected tabs use native Liquid Glass. Vertical tabs normally occupy a pinned sidebar. Turn on **Automatically Hide Sidebar** in Settings or press **⌘S** to let the page fill the window. Hover at the left edge (or click the sidebar button) to reveal a floating glass panel with rounded corners, inset spacing, and a shadow. It hides after the pointer leaves. Press **⌘S** again to pin it.
+The address bar, navigation controls, extension buttons, and selected tabs use native Liquid Glass. Vertical tabs normally occupy a pinned sidebar. Turn on **Automatically Hide Sidebar** in Settings or press **⌃⌘S** to let the page fill the window. Hover at the left edge (or click the sidebar button) to reveal a floating glass panel with rounded corners, inset spacing, and a shadow. It hides after the pointer leaves. Press **⌃⌘S** again to pin it.
+
+Press **⌘S** for Compact Toolbar: the entire header hides and hovering the top edge reveals its native glass over the webpage. The page keeps the same viewport, and revealing the toolbar and sidebar works independently. Address editing, menus, popovers, and toolbar customization keep their controls available until dismissed. Fullscreen uses the same saved toolbar layout, including dividers, spaces, and extension actions, as a glass overlay over the page.
 
 Right-click the toolbar, a tab, or empty sidebar space and choose **Customize Toolbar…** to open macOS's native drag-and-drop toolbar palette. Sidebar layout/pin controls are available alongside individual navigation and extension controls. Add dividers, **Space**, or **Flexible Space** to separate groups; drag the native default set into the toolbar to restore the app's original setup. The address field stays available and expands naturally between the toolbar controls. Drag the sidebar’s right edge to resize it in docked or floating mode; both modes share the saved width. Horizontal tabs occupy the titlebar above the address field. Settings provides sidebar width and row density; the shared right-click menu provides layout, auto-hide, and bookmark toggles.
 
@@ -35,7 +37,8 @@ Settings and the shared right-click menu have separate **Show Bookmarks Bar** an
 
 | Shortcut | Action |
 | --- | --- |
-| ⌘S | Auto-hide / pin the vertical sidebar |
+| ⌘S | Compact / permanent toolbar |
+| ⌃⌘S | Auto-hide / pin the vertical sidebar |
 | ⇧⌘S | Save Webpage As… (`.webarchive`, including page resources) |
 | ⌥⌘S | Switch between horizontal and vertical tabs |
 

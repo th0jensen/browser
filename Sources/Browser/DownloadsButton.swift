@@ -4,6 +4,7 @@ import SwiftUI
 /// The navigation bar's downloads button, which shows overall progress and lists downloads in a popover.
 struct DownloadsButton: View {
     let downloads: DownloadManager
+    @Environment(\.chromeHoverController) private var chromeHover
     @State private var isShowingList = false
 
     var body: some View {
@@ -30,7 +31,7 @@ struct DownloadsButton: View {
         }
         .labelStyle(.iconOnly)
         .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .buttonStyle(.automatic)
+        .buttonStyle(ChromeToolbarButtonStyle())
         .controlSize(.regular)
         .help("Downloads")
         .accessibilityLabel("Downloads")
@@ -39,6 +40,7 @@ struct DownloadsButton: View {
         .popover(isPresented: $isShowingList, arrowEdge: .bottom) {
             DownloadsList(downloads: downloads)
         }
+        .chromePresentation(isPresented: isShowingList, controller: chromeHover)
     }
 }
 

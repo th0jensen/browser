@@ -4,6 +4,7 @@ import SwiftUI
 /// A native field lets every new-tab path explicitly request the toolbar's field editor.
 struct AddressTextField: NSViewRepresentable {
     @Binding var text: String
+    var requiresVisibleToolbar = true
     let focusRequest: Int
     let onFocusApplied: (Int) -> Void
     let onFocusChange: (Bool) -> Void
@@ -13,10 +14,12 @@ struct AddressTextField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AddressField {
         let field = AddressField()
+        field.requiresVisibleToolbar = requiresVisibleToolbar
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
         field.font = .systemFont(ofSize: 13)
+        field.textColor = .labelColor
         field.placeholderString = "Search or enter address"
         field.usesSingleLineMode = true
         field.lineBreakMode = .byTruncatingMiddle
@@ -33,6 +36,7 @@ struct AddressTextField: NSViewRepresentable {
 
     func updateNSView(_ field: AddressField, context: Context) {
         context.coordinator.parent = self
+        field.requiresVisibleToolbar = requiresVisibleToolbar
         if field.stringValue != text { field.stringValue = text }
         field.requestFocus(focusRequest)
     }
@@ -49,6 +53,7 @@ struct AddressTextField: NSViewRepresentable {
 }
 
 final class AddressField: NSTextField {
+    var requiresVisibleToolbar = true
     var onFocusChange: ((Bool) -> Void)?
     var onFocusApplied: ((Int) -> Void)?
     private var requestedFocus = 0
@@ -56,26 +61,39 @@ final class AddressField: NSTextField {
 
     func requestFocus(_ request: Int) {
         requestedFocus = request
-        DispatchQueue.main.async { [weak self] in self?.applyFocus() }
+        DispatchQueue.main.async { [weak self] in self?.applyPendingFocus() }
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        DispatchQueue.main.async { [weak self] in self?.applyFocus() }
+        DispatchQueue.main.async { [weak self] in self?.applyPendingFocus() }
     }
 
-    private func applyFocus() {
-        guard requestedFocus > 0, requestedFocus != appliedFocus, let window else { return }
+    func applyPendingFocus() {
+        guard requestedFocus > 0, requestedFocus != appliedFocus, !isHiddenOrHasHiddenAncestor,
+              let window, !requiresVisibleToolbar || window.toolbar?.isVisible != false else { return }
         if window.makeFirstResponder(self) {
             selectText(nil)
             appliedFocus = requestedFocus
+            onFocusChange?(true)
             onFocusApplied?(requestedFocus)
         }
     }
 
+    override func cancelOperation(_ sender: Any?) {
+        window?.makeFirstResponder(nil)
+        onFocusChange?(false)
+    }
+
     override func becomeFirstResponder() -> Bool {
         let result = super.becomeFirstResponder()
-        if result { DispatchQueue.main.async { [weak self] in self?.onFocusChange?(true) } }
+        if result {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let window else { return }
+                let focused = window.firstResponder === self || window.firstResponder === currentEditor()
+                onFocusChange?(focused)
+            }
+        }
         return result
     }
 

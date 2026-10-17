@@ -35,7 +35,9 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private let directory: URL
     @ObservationIgnored private var restoration: Task<Void, Never>?
     @ObservationIgnored private let applicationDirectories: [URL]
-    @ObservationIgnored private var popup: NSPopover?
+    @ObservationIgnored private var popupPresentation: ChromePopoverPresentation?
+    @ObservationIgnored private weak var popupBrowser: BrowserModel?
+    @ObservationIgnored private weak var popupContext: WKWebExtensionContext?
     @ObservationIgnored private var extensionWindows: [UUID: ExtensionWindowController] = [:]
 
     init(directory: URL? = nil, persistent: Bool = true, applicationDirectories: [URL]? = nil) {
@@ -134,6 +136,7 @@ final class BrowserExtensions: NSObject {
     }
 
     func unregister(_ browser: BrowserModel) {
+        if popupBrowser === browser { closePopup() }
         guard windows.contains(browser) else { return }
         for tab in browser.tabs { controller.didCloseTab(tab, windowIsClosing: true) }
         controller.didCloseWindow(browser)
@@ -330,7 +333,11 @@ final class BrowserExtensions: NSObject {
     }
 
     private func unload(_ item: InstalledExtension) throws {
-        if let context = contexts[item.id] { try controller.unload(context); contexts[item.id] = nil }
+        if let context = contexts[item.id] {
+            if popupContext === context { closePopup() }
+            try controller.unload(context)
+            contexts[item.id] = nil
+        }
         actionRevision += 1
         if let list = ruleLists.removeValue(forKey: item.id) {
             for browser in windows.allObjects {
@@ -453,13 +460,31 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
     func webExtensionController(_ controller: WKWebExtensionController, presentActionPopup action: WKWebExtension.Action,
                                 for context: WKWebExtensionContext) async throws {
         guard let tab = action.associatedTab as? BrowserTab ?? focusedBrowser?.activeTab,
-              let view = tab.contentView.superview, let popover = action.popupPopover else {
+              let browser = tab.browser, let view = tab.contentView.superview,
+              let window = view.window, let popover = action.popupPopover else {
             throw ExtensionFailure("The extension popup needs a visible browser tab.")
         }
-        popup?.close()
-        popup = popover
+        closePopup()
+        popupBrowser = browser
+        popupContext = context
+        let presentation = ChromePopoverPresentation(popover: popover, owner: window, controller: browser.chromeHover) { [weak self] closed in
+            guard let self, popupPresentation === closed else { return }
+            popupPresentation = nil
+            popupBrowser = nil
+            popupContext = nil
+        }
+        popupPresentation = presentation
         popover.behavior = .transient
         popover.show(relativeTo: NSRect(x: view.bounds.maxX - 40, y: view.bounds.maxY - 1, width: 1, height: 1),
                      of: view, preferredEdge: .minY)
+        if !popover.isShown { presentation.finish() }
+    }
+
+    private func closePopup() {
+        let presentation = popupPresentation
+        popupPresentation = nil
+        popupBrowser = nil
+        popupContext = nil
+        presentation?.close()
     }
 }

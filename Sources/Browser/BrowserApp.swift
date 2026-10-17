@@ -21,6 +21,9 @@ struct BrowserApp: App {
         WindowGroup {
             BrowserWindow(bookmarks: bookmarks, downloads: downloads)
                 .frame(minWidth: 680, minHeight: 440)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    BrowserSessionStore.shared.flush()
+                }
         }
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
@@ -49,6 +52,7 @@ private struct BrowserCommands: Commands {
     @AppStorage(BookmarksBarVisibility.storageKey) private var bookmarksBarVisibility = BookmarksBarVisibility.always
     @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
     @AppStorage(SidebarVisibility.autoHideKey) private var autoHideSidebar = false
+    @AppStorage(CompactToolbar.storageKey) private var compactToolbar = false
 
     private var bookmarkableTab: BrowserTab? {
         guard let tab = browser?.activeTab, !tab.isNewTab, tab.url != nil else { return nil }
@@ -111,6 +115,8 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("]", modifiers: .command)
         }
         CommandGroup(after: .sidebar) {
+            Button(compactToolbar ? "Show Toolbar Permanently" : "Compact Toolbar") { compactToolbar.toggle() }
+                .keyboardShortcut("s", modifiers: .command)
             Button(tabLayout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs") {
                 tabLayout = tabLayout.toggled
             }
@@ -120,7 +126,7 @@ private struct BrowserCommands: Commands {
                 tabLayout = .vertical
                 autoHideSidebar = !isAutoHiding
             }
-            .keyboardShortcut("s", modifiers: .command)
+            .keyboardShortcut("s", modifiers: [.command, .control])
             Divider()
             Picker("Bookmarks Bar", selection: $bookmarksBarVisibility) {
                 ForEach(BookmarksBarVisibility.allCases) { visibility in

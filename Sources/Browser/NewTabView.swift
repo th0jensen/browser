@@ -142,25 +142,18 @@ private struct FavoriteTile: View {
     }
 }
 
-/// A soft, slowly drifting wash of color behind the new tab content.
+/// A soft wash of color that stays idle between changes to the window's appearance.
 private struct NewTabBackground: View {
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 15, paused: reduceMotion)) { context in
-            let time = context.date.timeIntervalSinceReferenceDate
-            let drift = Float(sin(time / 9)) * 0.08
-            let sway = Float(cos(time / 11)) * 0.08
-
-            MeshGradient(width: 3, height: 3, points: [
-                [0, 0], [0.5 + sway, 0], [1, 0],
-                [0, 0.5 + drift], [0.5 + drift, 0.5 - sway], [1, 0.5 - drift],
-                [0, 1], [0.5 - sway, 1], [1, 1],
-            ], colors: colors)
-            // Low enough that the window's translucent material shows through.
-            .opacity(colorScheme == .dark ? 0.28 : 0.3)
-        }
+        MeshGradient(width: 3, height: 3, points: [
+            [0, 0], [0.5, 0], [1, 0],
+            [0, 0.5], [0.5, 0.5], [1, 0.5],
+            [0, 1], [0.5, 1], [1, 1],
+        ], colors: colors)
+        // Low enough that the window's translucent material shows through.
+        .opacity(colorScheme == .dark ? 0.28 : 0.3)
         .ignoresSafeArea()
         .allowsHitTesting(false)
     }

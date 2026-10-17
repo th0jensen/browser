@@ -5,6 +5,54 @@ import XCTest
 
 @MainActor
 final class WindowChromeTests: XCTestCase {
+    func testTrafficLightInsetsDoNotDependOnAddressHost() async throws {
+        let window = ChromeTestWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
+                                      styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                      backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let toolbar = NSToolbar(identifier: "InsetsWithoutAddress")
+        toolbar.isVisible = true
+        window.toolbar = toolbar
+        let chrome = WindowChromeView()
+        window.contentView = chrome
+        defer { window.close() }
+        window.orderBack(nil)
+        var positions: [NSWindow.ButtonType: CGFloat] = [:]
+        for layout in [TabLayout.vertical, .horizontal, .vertical, .horizontal] {
+            chrome.update(layout: layout, tabs: AnyView(EmptyView()))
+            try await Task.sleep(for: .milliseconds(100))
+            // Simulate AppKit restoring its standard inset while toolbar hosts are rebuilt.
+            for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                let button = try XCTUnwrap(window.standardWindowButton(type))
+                button.frame.origin.x -= 8
+            }
+            chrome.refresh()
+            try await Task.sleep(for: .milliseconds(100))
+            for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                let button = try XCTUnwrap(window.standardWindowButton(type))
+                let frame = button.convert(button.bounds, to: nil)
+                if let previous = positions[type] {
+                    XCTAssertEqual(frame.minX, previous, accuracy: 0.5,
+                                   "Traffic lights must preserve their inset without an address host")
+                }
+                positions[type] = frame.minX
+                if type == .closeButton {
+                    XCTAssertEqual(frame.minX, BrowserChrome.windowControlsLeadingInset(controlHeight: frame.height), accuracy: 0.5)
+                }
+            }
+            // A native relayout can move one control independently of the close button.
+            let zoom = try XCTUnwrap(window.standardWindowButton(.zoomButton))
+            zoom.frame.origin.x -= 8
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(zoom.convert(zoom.bounds, to: nil).minX, try XCTUnwrap(positions[.zoomButton]), accuracy: 0.5)
+            let parent = try XCTUnwrap(zoom.superview)
+            parent.setBoundsOrigin(NSPoint(x: parent.bounds.minX + 8, y: parent.bounds.minY))
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertEqual(zoom.convert(zoom.bounds, to: nil).minX, try XCTUnwrap(positions[.zoomButton]), accuracy: 0.5,
+                           "Ancestor movement must also preserve the shared window inset")
+        }
+    }
+
     private func assertToolbarCenters(in window: NSWindow, at center: CGFloat, file: StaticString = #filePath, line: UInt = #line) {
         for item in window.toolbar?.visibleItems ?? [] {
             guard ![NSToolbarItem.Identifier.space, .flexibleSpace].contains(item.itemIdentifier),

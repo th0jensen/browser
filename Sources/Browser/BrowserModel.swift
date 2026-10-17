@@ -6,6 +6,7 @@ import WebKit
 @MainActor
 @Observable
 final class BrowserModel: NSObject {
+    @ObservationIgnored weak var chromeHover: ChromeHoverController?
     let downloads: DownloadManager
     let sitePermissions: SitePermissions
     let pinnedPages: PinnedPageStore
@@ -17,7 +18,7 @@ final class BrowserModel: NSObject {
             guard oldValue != activeTabID else { return }
             if let previousTab = tab(withID: oldValue) {
                 // Keep a preview of the page being left for background-tab hover cards.
-                previousTab.captureThumbnail(afterScreenUpdates: false)
+                previousTab.captureThumbnail(afterScreenUpdates: false, minimumAge: .seconds(2))
                 previousTab.lastActive = .now
             }
             activeTab?.restore()

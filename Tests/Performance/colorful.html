@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Browser deterministic color fixture</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; font: 16px system-ui; color: #122332; background: #e6f4f5; }
+  header { padding: 32px; color: white; background: #2449a4; }
+  h1 { margin: 0 0 8px; font-size: 34px; }
+  main { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding: 28px; }
+  article { min-height: 220px; padding: 24px; border-radius: 18px; }
+  article:nth-child(1) { background: #ffbd59; }
+  article:nth-child(2) { background: #ed6a82; }
+  article:nth-child(3) { background: #6ed5b7; }
+  .band { height: 110px; margin: 0 28px 28px; border-radius: 18px; background: linear-gradient(110deg,#7753c6,#29b6cf); }
+  footer { padding: 24px 32px; background: #122332; color: white; }
+</style>
+<header><h1>Color, ready.</h1>Local content. No network, assets, timers, or animation.</header>
+<main>
+  <article><h2>Amber</h2><p>Native chrome and page bounds stay easy to distinguish.</p></article>
+  <article><h2>Coral</h2><p>A fixed layout makes resize changes visible.</p></article>
+  <article><h2>Mint</h2><p>System fonts avoid resource loading variability.</p></article>
+</main>
+<div class="band"></div>
+<footer>Browser performance fixture · static pixels after readiness</footer>
+<script>
+  const benchmarkToken = "__BENCHMARK_TOKEN__";
+  const acknowledge = kind => requestAnimationFrame(() => requestAnimationFrame(() => {
+    window.__benchmarkReady = true;
+    window.webkit?.messageHandlers?.browserBenchmark?.postMessage({
+      kind, token: kind === "resize" ? window.__resizeToken : benchmarkToken,
+      width: innerWidth, height: innerHeight
+    });
+  }));
+  addEventListener("load", () => acknowledge("ready"), { once: true });
+  addEventListener("resize", () => acknowledge("resize"));
+</script>
+</html>

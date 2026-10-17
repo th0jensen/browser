@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Prism · Glass QA</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;font:16px system-ui;color:#fff;background:#122332}
+.color{min-height:62vh;padding:120px 48px 48px;background:repeating-linear-gradient(135deg,#ffffff16 0 1px,transparent 1px 32px),linear-gradient(110deg,#2061e4 0%,#9f48e4 24%,#ef5a77 49%,#ffb636 73%,#16bba0 100%)}
+h1{font-size:64px;letter-spacing:-3px;line-height:1.05;margin:0 0 20px;max-width:900px}p{max-width:640px;line-height:1.5}
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;padding:32px 48px;background:#eef4f5;color:#172735}
+article{padding:24px;min-height:170px;border-radius:18px;background:#fff}h2{margin-top:0}
+#probe{position:absolute;top:8px;left:26%;border:1px solid #ffffff66;border-radius:8px;background:#14233333;color:#fff;padding:4px 12px;height:24px}
+footer{padding:32px 48px;color:#d5e9f4}button{font:inherit}
+</style>
+<button id="probe" onclick="this.textContent='Page target clicked '+(++window.clicks)">Page target under hidden toolbar</button>
+<section class="color"><h1>Colour beneath.<br>Glass above.</h1><p>A static page for checking real refraction, independent hover regions, and a viewport that stays in place when the toolbar appears.</p></section>
+<section class="cards"><article><h2>Top edge</h2><p>Reveal only the toolbar. The colour and fine lines continue underneath its glass.</p></article><article><h2>Left edge</h2><p>Reveal only the sidebar. Its glass floats over the same page.</p></article><article><h2>Same viewport</h2><p>The page stays fixed while either set of controls appears or disappears.</p></article></section>
+<footer>Prism · local visual QA fixture · no external assets or animation</footer>
+<script>window.clicks=0</script>
+</html>

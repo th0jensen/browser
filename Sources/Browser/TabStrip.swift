@@ -15,6 +15,7 @@ struct TabStrip: View {
     let isFullScreen: Bool
     @Binding var hoverCardTabID: UUID?
     var usesNativeHoverPopover = false
+    var floating = false
     var customize: () -> Void = {}
     @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
     @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
@@ -124,7 +125,6 @@ struct TabStrip: View {
                 }
             }
             .contextMenu { stripMenu }
-            .animation(.snappy(duration: 0.22), value: browser.tabs.map(\.id))
         }
         .padding(.top, BrowserChrome.edgeInset)
     }
@@ -155,6 +155,7 @@ struct TabStrip: View {
         return TabItem(tab: tab,
                        isActive: isActive,
                        isHovered: isHovered,
+                       floating: floating,
                        width: width,
                        height: layout == .vertical ? (compactTabs ? BrowserChrome.sidebarTabHeight : 42) : BrowserChrome.tabHeight,
                        select: {
@@ -273,6 +274,7 @@ private struct TabItem: View {
     let tab: BrowserTab
     let isActive: Bool
     let isHovered: Bool
+    let floating: Bool
     /// A fixed width in the tab strip, or `nil` to fill the sidebar.
     let width: CGFloat?
     let height: CGFloat
@@ -288,8 +290,8 @@ private struct TabItem: View {
 
         HStack(spacing: 7) {
             if !(isCompact && showsCloseButton) {
-                TabIcon(tab: tab, isActive: isActive)
-                    .opacity(tab.isSuspended ? 0.5 : 1)
+                TabIcon(tab: tab, isActive: isActive || floating)
+                    .opacity(tab.isSuspended ? (floating ? 0.8 : 0.5) : 1)
             }
             if !isCompact {
                 title
@@ -323,7 +325,7 @@ private struct TabItem: View {
                 Text(tab.title)
                     .font(.system(size: 12.5, weight: isActive ? .medium : .regular))
                     .tracking(-0.1)
-                    .foregroundStyle(isActive ? Color.primary : Color.secondary)
+                    .foregroundStyle(isActive || floating ? Color.primary : Color.secondary)
                     .lineLimit(1)
                     .fixedSize()
             }

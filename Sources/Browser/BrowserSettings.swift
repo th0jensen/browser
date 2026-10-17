@@ -8,6 +8,7 @@ struct BrowserSettings: View {
     @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
     @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
     @AppStorage(SidebarVisibility.autoHideKey) private var autoHideSidebar = false
+    @AppStorage(CompactToolbar.storageKey) private var compactToolbar = false
     @AppStorage(BookmarksBarVisibility.storageKey) private var bookmarksBar = BookmarksBarVisibility.always
     @AppStorage(ChromeCustomization.bookmarkButtonKey) private var showsBookmarkButton = true
 
@@ -15,16 +16,19 @@ struct BrowserSettings: View {
         Form {
             Section("Tabs") {
                 Button("Customize Toolbar…") { ChromeCustomization.customizeToolbar() }
+                Toggle("Compact toolbar (⌘S)", isOn: $compactToolbar)
+                Text("Hide the top bar until the pointer reaches the top edge. ⌘L and ⌘T reveal and focus the address field. Sidebar auto-hide is independent.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("Tab layout", selection: $tabLayout) {
                     Text("Horizontal").tag(TabLayout.horizontal)
                     Text("Vertical").tag(TabLayout.vertical)
                 }
-                Toggle("Automatically hide sidebar (⌘S)", isOn: $autoHideSidebar)
+                Toggle("Automatically hide sidebar (⌃⌘S)", isOn: $autoHideSidebar)
                     .disabled(tabLayout != .vertical)
                 Toggle("Compact sidebar tabs", isOn: $compactTabs)
                 LabeledContent("Sidebar width", value: "\(Int(sidebarWidth)) pt")
                 Slider(value: $sidebarWidth, in: BrowserChrome.sidebarMinimumWidth...BrowserChrome.sidebarMaximumWidth, step: 4)
-                Text("With auto-hide enabled, move the pointer to the left edge to reveal a floating sidebar. Press ⌘S to pin it. Save a webpage with ⇧⌘S.")
+                Text("With auto-hide enabled, move the pointer to the left edge to reveal a floating sidebar. Press ⌃⌘S to pin it. Save a webpage with ⇧⌘S.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Bookmarks") {
@@ -126,7 +130,7 @@ struct ExtensionButton: View {
             }
             .labelStyle(.iconOnly)
             .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .buttonStyle(.automatic)
+        .buttonStyle(ChromeToolbarButtonStyle())
         .controlSize(.regular)
             .disabled(!action.isEnabled || browser.activeTab == nil)
             .help(action.label.isEmpty ? item.name : action.label)

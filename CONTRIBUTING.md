@@ -16,6 +16,10 @@ Run the tests with:
 just test
 ```
 
+## Performance checks
+
+Use `scripts/benchmark.sh candidate /absolute/derived-data/path` for the opt-in Release benchmark. Compare against a frozen baseline with the exact same harness, fixture, architecture, and display, running each revision separately. [Measurement definitions and resource sampling](docs/resources.md) explain CPU, memory, bundle sizes, provenance, and the limits of each latency metric.
+
 ## Before Submitting
 
 1. The app builds and the tests pass

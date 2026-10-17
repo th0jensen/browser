@@ -38,7 +38,8 @@ struct PinnedPagesButton: View {
             Label("Pinned Pages", systemImage: "square.grid.3x3")
         }
         .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .buttonStyle(.automatic)
+        .labelStyle(.iconOnly)
+        .buttonStyle(ChromeToolbarButtonStyle())
         .controlSize(.regular)
         .disabled(browser.pinnedPages.items.isEmpty)
         .help("Pinned Pages")
@@ -46,6 +47,7 @@ struct PinnedPagesButton: View {
             PinnedPagesGrid(browser: browser).padding(BrowserChrome.edgeInset).frame(width: sidebarWidth)
                 .onChange(of: browser.activeTabID) { _, _ in isPresented = false }
         }
+        .chromePresentation(isPresented: isPresented, controller: browser.chromeHover)
     }
 }
 
