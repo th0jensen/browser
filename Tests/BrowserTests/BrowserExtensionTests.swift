@@ -186,6 +186,66 @@ final class BrowserExtensionTests: XCTestCase {
         } catch { XCTAssertTrue(store.installed.isEmpty) }
     }
 
+    private func makeBlockerApp() throws -> (applications: URL, resources: URL) {
+        let applications = directory.appending(path: "BlockerApplications")
+        let app = applications.appending(path: "FixtureBlocker.app")
+        let plugin = app.appending(path: "Contents/PlugIns/Ads.appex")
+        let resources = plugin.appending(path: "Contents/Resources")
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        let appInfo: [String: Any] = ["CFBundleIdentifier": "dev.browser.blocker", "CFBundlePackageType": "APPL", "CFBundleDisplayName": "Fixture Blocker"]
+        let pluginInfo: [String: Any] = ["CFBundleIdentifier": "dev.browser.blocker.ads", "CFBundlePackageType": "XPC!", "CFBundleDisplayName": "Block Ads",
+                                       "NSExtension": ["NSExtensionPointIdentifier": "com.apple.Safari.content-blocker"]]
+        try PropertyListSerialization.data(fromPropertyList: appInfo, format: .xml, options: 0).write(to: app.appending(path: "Contents/Info.plist"))
+        try PropertyListSerialization.data(fromPropertyList: pluginInfo, format: .xml, options: 0).write(to: plugin.appending(path: "Contents/Info.plist"))
+        try #"[{"trigger":{"url-filter":"webkit.svg"},"action":{"type":"block"}}]"#
+            .write(to: resources.appending(path: "blockerList.json"), atomically: true, encoding: .utf8)
+        return (applications, resources)
+    }
+
+    func testDiscoveryMigratesEnabledPlaceholderToRealBundledRules() async throws {
+        let fixture = try makeBlockerApp()
+        let storage = directory.appending(path: "installed")
+        let original = BrowserExtensions(directory: storage, persistent: false, applicationDirectories: [fixture.applications])
+        await original.restore()
+        var item = try XCTUnwrap(original.installed.first)
+        XCTAssertEqual(item.ruleCount, 0)
+        item.isEnabled = true // Reproduce the previously persisted, falsely enabled placeholder.
+        try JSONEncoder().encode([item]).write(to: storage.appending(path: "extensions.json"))
+        try #"[{"trigger":{"url-filter":".*"},"action":{"type":"css-display-none","selector":".advert"}}]"#
+            .write(to: fixture.resources.appending(path: "precompiledList.json"), atomically: true, encoding: .utf8)
+
+        let restored = BrowserExtensions(directory: storage, persistent: false, applicationDirectories: [fixture.applications])
+        await restored.restore()
+        XCTAssertEqual(restored.installed.first?.id, item.id)
+        XCTAssertEqual(restored.installed.first?.isEnabled, true)
+        XCTAssertEqual(restored.activeRuleCounts[item.id], 1)
+        XCTAssertNil(restored.errors[item.id])
+        XCTAssertEqual(restored.toolbarExtensions.map { restored.toolbarName(for: $0) }, ["Fixture Blocker"])
+
+        // Also covers registering an already-created page after rule restoration.
+        let browser = BrowserModel()
+        restored.register(browser)
+        defer { restored.unregister(browser) }
+        try await assertDisplay("none", in: XCTUnwrap(browser.activeTab?.webView))
+        await restored.refreshInstalledApplications()
+        XCTAssertEqual(restored.installed.count, 1)
+        XCTAssertEqual(restored.installed[0].id, item.id)
+        XCTAssertEqual(restored.activeRuleCounts[item.id], 1)
+    }
+
+    func testPlaceholderIsNeverReportedAsActiveBlocking() async throws {
+        let fixture = try makeBlockerApp()
+        let store = BrowserExtensions(directory: directory.appending(path: "installed"), persistent: false,
+                                      applicationDirectories: [fixture.applications])
+        await store.restore()
+        let item = try XCTUnwrap(store.installed.first)
+        await store.setEnabled(item, true)
+        XCTAssertFalse(store.installed[0].isEnabled)
+        XCTAssertNotNil(store.errors[item.id])
+        XCTAssertNil(store.activeRuleCounts[item.id])
+        XCTAssertEqual(store.toolbarExtensions.count, 1, "The blocker control remains available for customization")
+    }
+
     func testVerificationTabReportsLoadCompletionAndBridgesMessagesToExtensionPage() async throws {
         let source = try makeExtension()
         let manifest: [String: Any] = [

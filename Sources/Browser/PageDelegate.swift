@@ -82,10 +82,19 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         return await present(alert, in: webView).map { $0 == .alertSecondButtonReturn }
     }
 
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        PagePaintObserver.shared.navigationStarted(in: webView)
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         isLoadingFromBrowser = false
         dialogs = DialogLimiter()
         tab?.clearLoadError()
+        PagePaintObserver.shared.navigationCommitted(in: webView)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        PagePaintObserver.shared.navigationFinished(in: webView)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -99,6 +108,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// A load that fails before it commits leaves the previous page in place, so the error covers it.
     private func showLoadError(_ error: Error, in webView: WKWebView, isProvisional: Bool) {
         isLoadingFromBrowser = false
+        if let tab { tab.browser?.chromeHover?.navigationFailed(in: tab.id) }
         guard let tab, let loadError = PageLoadError(error, url: webView.url) else { return }
         tab.showLoadError(loadError, coversPreviousPage: isProvisional && webView.backForwardList.currentItem != nil)
     }

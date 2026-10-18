@@ -9,6 +9,21 @@ struct TabFrameKey: PreferenceKey {
     }
 }
 
+/// Native horizontal popovers position themselves; only the in-window sidebar
+/// hover card needs to send changing row geometry through the window tree.
+private struct TabFrameReporter: ViewModifier {
+    let id: UUID
+    let enabled: Bool
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if enabled {
+            content.anchorPreference(key: TabFrameKey.self, value: .bounds) { [id: $0] }
+        } else {
+            content
+        }
+    }
+}
+
 struct TabStrip: View {
     let browser: BrowserModel
     let layout: TabLayout
@@ -16,8 +31,6 @@ struct TabStrip: View {
     @Binding var hoverCardTabID: UUID?
     var usesNativeHoverPopover = false
     var floating = false
-    var customize: () -> Void = {}
-    @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
     @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
 
     @State private var hoveredTabID: UUID?
@@ -42,7 +55,8 @@ struct TabStrip: View {
 
     private var horizontalStrip: some View {
         GeometryReader { geometry in
-            let count = CGFloat(max(1, browser.regularTabs.count))
+            let regularTabs = browser.unpinnedTabs
+            let count = CGFloat(max(1, regularTabs.count))
             let availableWidth = max(minTabWidth, geometry.size.width - BrowserChrome.edgeInset
                                      - minDragAreaWidth)
             let tabWidth = min(maxTabWidth,
@@ -53,8 +67,10 @@ struct TabStrip: View {
                 ScrollViewReader { scrollProxy in
                     ScrollView(.horizontal) {
                         HStack(spacing: spacing) {
-                            ForEach(Array(browser.regularTabs.enumerated()), id: \.element.id) { index, tab in
-                                tabItem(for: tab, at: index, width: tabWidth)
+                            ForEach(Array(regularTabs.enumerated()), id: \.element.id) { index, tab in
+                                tabItem(for: tab, at: index,
+                                        nextTab: regularTabs.indices.contains(index + 1) ? regularTabs[index + 1] : nil,
+                                        width: tabWidth)
                                     .id(tab.id)
                             }
                         }
@@ -62,12 +78,16 @@ struct TabStrip: View {
                     }
                     .scrollIndicators(.never)
                     .scrollDisabled(tabsWidth <= availableWidth)
-                    .onAppear { if let id = browser.activeTabID { scrollProxy.scrollTo(id) } }
+                    .onAppear {
+                        if tabsWidth > availableWidth, let id = browser.activeTabID { scrollProxy.scrollTo(id) }
+                    }
                     .onChange(of: geometry.size.width) { _, _ in
-                        if let id = browser.activeTabID { scrollProxy.scrollTo(id) }
+                        // Fitting tabs are already visible. Scrolling them on every window-size update
+                        // adds a second scroll/layout transaction to the native resize path.
+                        if tabsWidth > availableWidth, let id = browser.activeTabID { scrollProxy.scrollTo(id) }
                     }
                     .onChange(of: browser.activeTabID) { _, activeTabID in
-                        guard let activeTabID else { return }
+                        guard tabsWidth > availableWidth, let activeTabID else { return }
                         scrollProxy.scrollTo(activeTabID)
                     }
                 }
@@ -89,11 +109,13 @@ struct TabStrip: View {
     private var sidebar: some View {
         GeometryReader { geometry in
             let rowHeight = compactTabs ? BrowserChrome.sidebarTabHeight : 42
-            let count = browser.regularTabs.count
+            let regularTabs = browser.regularTabs
+            let count = regularTabs.count + browser.folders.visibleRows.count
             let tabsHeight = CGFloat(count) * rowHeight + CGFloat(max(0, count - 1)) * BrowserChrome.smallGap
+            let folderSpacing = browser.folders.items.isEmpty ? 0 : BrowserChrome.edgeInset + BrowserChrome.smallGap
             let pinRows = CGFloat((browser.pinnedPages.items.count + 2) / 3)
             let pinHeight = pinRows == 0 ? 0 : pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset
-            let newTabFits = tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
+            let newTabFits = tabsHeight + folderSpacing + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
 
             VStack(spacing: BrowserChrome.edgeInset) {
                 if !browser.pinnedPages.items.isEmpty {
@@ -103,11 +125,15 @@ struct TabStrip: View {
                 ScrollViewReader { scrollProxy in
                     ScrollView(.vertical) {
                         VStack(spacing: BrowserChrome.smallGap) {
-                            ForEach(Array(browser.regularTabs.enumerated()), id: \.element.id) { index, tab in
+                            if !browser.folders.items.isEmpty {
+                                FolderSidebar(browser: browser, rowHeight: rowHeight, onDropAccepted: { draggedTabID = nil })
+                            }
+                            ForEach(Array(regularTabs.enumerated()), id: \.element.id) { index, tab in
                                 tabItem(for: tab, at: index, width: nil).id(tab.id)
                             }
                             if newTabFits { newTabRow(height: rowHeight) }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, BrowserChrome.edgeInset)
 
                         .padding(.bottom, newTabFits ? BrowserChrome.edgeInset : 0)
@@ -115,7 +141,7 @@ struct TabStrip: View {
                     .scrollIndicators(.never)
                     .onChange(of: browser.activeTabID) { _, activeTabID in
                         guard let activeTabID else { return }
-                        withAnimation(.easeOut(duration: 0.2)) { scrollProxy.scrollTo(activeTabID) }
+                        withAnimation(.easeOut(duration: 0.2)) { scrollProxy.scrollTo(browser.activeTab?.folderPageID ?? activeTabID) }
                     }
                 }
                 if !newTabFits {
@@ -139,15 +165,15 @@ struct TabStrip: View {
                 .padding(.leading, BrowserChrome.edgeInset)
                 .contentShape(RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius))
         }
+        .folderEditorAnchor(.sidebar)
         .buttonStyle(NewTabRowButtonStyle())
         .help("New Tab (⌘T)")
         .accessibilityLabel("New Tab")
     }
 
-    private func tabItem(for tab: BrowserTab, at index: Int, width: CGFloat?) -> some View {
+    private func tabItem(for tab: BrowserTab, at index: Int, nextTab: BrowserTab? = nil, width: CGFloat?) -> some View {
         let isActive = browser.activeTabID == tab.id
         let isHovered = hoveredTabID == tab.id
-        let nextTab = browser.regularTabs.indices.contains(index + 1) ? browser.regularTabs[index + 1] : nil
         let showsSeparator = layout == .horizontal && nextTab.map { next in
             !isActive && !isHovered && browser.activeTabID != next.id && hoveredTabID != next.id
         } ?? false
@@ -174,7 +200,7 @@ struct TabStrip: View {
                     .offset(x: (spacing + 1) / 2)
                     .opacity(showsSeparator ? 1 : 0)
             }
-            .anchorPreference(key: TabFrameKey.self, value: .bounds) { [tab.id: $0] }
+            .modifier(TabFrameReporter(id: tab.id, enabled: !usesNativeHoverPopover))
             .onHover { isHovering in
                 if isHovering {
                     hoveredTabID = tab.id
@@ -192,6 +218,7 @@ struct TabStrip: View {
                                                            browser: browser,
                                                            draggedTabID: $draggedTabID))
             .contextMenu { tabMenu(for: tab, at: index) }
+            .folderEditorAnchor(.tab(tab.id))
             .popover(isPresented: Binding(get: { usesNativeHoverPopover && hoverCardTabID == tab.id },
                                            set: { if !$0 { hoverCardTabID = nil } }), arrowEdge: .top) {
                 TabHoverCard(tab: tab, isActive: isActive).padding(8)
@@ -219,13 +246,9 @@ struct TabStrip: View {
 
     @ViewBuilder
     private func tabMenu(for tab: BrowserTab, at index: Int) -> some View {
-        Button("New Tab") { browser.addTab() }
-        Divider()
         Button("Reload") { browser.reloadTab(tab.id) }
             .disabled(tab.isNewTab)
         Button("Duplicate") { browser.duplicateTab(tab.id) }
-        Button("Pin Webpage") { browser.pin(tab) }
-            .disabled(!browser.canPin(tab))
         Button("Copy Link") {
             guard let url = tab.url else { return }
             NSPasteboard.general.clearContents()
@@ -233,28 +256,29 @@ struct TabStrip: View {
         }
         .disabled(tab.url == nil)
         Divider()
+        FolderMoveMenu(browser: browser, tab: tab)
+        Button("Pin Page") { browser.pin(tab) }
+            .disabled(!browser.canPin(tab))
+        Divider()
         Button("Close Tab") { browser.closeTab(tab.id) }
         Button("Close Other Tabs") { browser.closeOtherTabs(than: tab.id) }
             .disabled(browser.tabs.count < 2)
-        Button("Close Tabs to the Right") { browser.closeTabs(after: tab.id) }
+        Button(layout == .vertical ? "Close Tabs Below" : "Close Tabs to the Right") { browser.closeTabs(after: tab.id) }
             .disabled(browser.tabs.last?.id == tab.id)
         Divider()
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }
             .disabled(!browser.canReopenClosedTab)
-        layoutToggle
     }
 
     @ViewBuilder
     private var stripMenu: some View {
         Button("New Tab") { browser.addTab() }
+        Button("New Folder…") { browser.requestNewFolder() }
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }
             .disabled(!browser.canReopenClosedTab)
-        layoutToggle
-    }
-
-    @ViewBuilder
-    private var layoutToggle: some View {
-        ChromeCustomizationMenu(customize: customize)
+        Divider()
+        TabLayoutMenu()
+        if layout == .vertical { SidebarBehaviorMenu() }
     }
 }
 
@@ -290,20 +314,20 @@ private struct TabItem: View {
 
         HStack(spacing: 7) {
             if !(isCompact && showsCloseButton) {
-                TabIcon(tab: tab, isActive: isActive || floating)
-                    .opacity(tab.isSuspended ? (floating ? 0.8 : 0.5) : 1)
+                TabIcon(tab: tab)
             }
             if !isCompact {
                 title
             }
-            if showsCloseButton || !isCompact {
+            if showsCloseButton || (width != nil && !isCompact) {
                 closeButton
                     .opacity(showsCloseButton ? 1 : 0)
                     .allowsHitTesting(showsCloseButton)
             }
         }
         .padding(.leading, isCompact ? 0 : BrowserChrome.edgeInset)
-        .padding(.trailing, isCompact ? 0 : 4)
+        .padding(.trailing, isCompact ? 0 : (width == nil ? BrowserChrome.edgeInset : 4))
+        .opacity(BrowserChrome.tabContentOpacity(active: isActive, hovered: isHovered, loaded: !tab.isSuspended))
         .frame(width: width, height: height)
         .frame(maxWidth: width == nil ? .infinity : nil)
         .background(shape.fill(isHovered && !isActive ? Color.primary.opacity(0.055) : Color.clear))
@@ -325,7 +349,7 @@ private struct TabItem: View {
                 Text(tab.title)
                     .font(.system(size: 12.5, weight: isActive ? .medium : .regular))
                     .tracking(-0.1)
-                    .foregroundStyle(isActive || floating ? Color.primary : Color.secondary)
+                    .foregroundStyle(Color.primary)
                     .lineLimit(1)
                     .fixedSize()
             }
@@ -359,7 +383,6 @@ private struct TabItem: View {
 
 private struct TabIcon: View {
     let tab: BrowserTab
-    let isActive: Bool
 
     var body: some View {
         Group {
@@ -376,7 +399,7 @@ private struct TabIcon: View {
                     .resizable()
                     .scaledToFit()
                     .fontWeight(.light)
-                    .foregroundStyle(isActive ? Color.primary : Color.secondary)
+                    .foregroundStyle(Color.primary)
             }
         }
         .frame(width: 14, height: 14)
@@ -438,7 +461,7 @@ struct TabHoverCard: View {
     }
 }
 
-private struct ActiveTabGlass: ViewModifier {
+struct ActiveTabGlass: ViewModifier {
     let isActive: Bool
     let shape: RoundedRectangle
 

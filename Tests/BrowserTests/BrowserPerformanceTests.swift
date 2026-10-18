@@ -75,6 +75,15 @@ final class BrowserPerformanceTests: XCTestCase {
             print("BENCHMARK_WINDOW_PROTOCOL=floating/allSpaces/fullScreenAuxiliary level=\(window.level.rawValue) occlusion=\(window.occlusionState.rawValue) visible=\(window.occlusionState.contains(.visible)) key=\(window.isKeyWindow) appActive=\(NSApp.isActive) activationPolicy=\(NSApp.activationPolicy().rawValue) appRunning=\(NSApp.isRunning) onActiveSpace=\(window.isOnActiveSpace) windowNumber=\(window.windowNumber)")
             window.toolbar?.autosavesConfiguration = false
             window.makeFirstResponder(nil) // Stop the editor caret during idle windows.
+            if ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "reveal" {
+                let tab = try XCTUnwrap(browser.activeTab)
+                let bridge = PerformanceScriptBridge()
+                try await prepare(tab, bridge: bridge, window: window, browser: browser)
+                try await loadFixture(tab, bridge: bridge, token: UUID().uuidString)
+                try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
+                try writeResults(status: "complete")
+                return
+            }
             resourceWindows.append(try await idleResources(name: "new_tab", seconds: 30))
             try writeResults(status: "running")
 
@@ -209,6 +218,7 @@ final class BrowserPerformanceTests: XCTestCase {
             }
             appendMetric("resize_native_frame", definition:
                 "Same resize operations as resize_dom_ack; NSWindow.setContentSize to first WKWebView NSView.frameDidChangeNotification. Native geometry acknowledgement only; no claim about web content paint.", samples: nativeResizeSamples)
+            try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
             try writeResults(status: "complete")
         } catch {
             try? writeResults(status: "failed: \(error)")
@@ -310,6 +320,121 @@ final class BrowserPerformanceTests: XCTestCase {
                 "definition": "Host process getrusage(RUSAGE_SELF) user+system CPU delta and task_info(MACH_TASK_BASIC_INFO) resident_size endpoints. 1 s quiet period, then 30 s idle. RSS endpoints are not peak memory. XCTest is included; other normal host windows were closed before measurement. WebKit subprocesses are excluded. A resource-phase.json marker supports a separate external registered-service cohort sample during the middle of this interval."]
     }
 
+    private func benchmarkChromeReveal(window: NSWindow, browser: BrowserModel, defaults: UserDefaults) async throws {
+        print("BENCHMARK_PHASE=chrome_reveal")
+        window.makeFirstResponder(nil)
+        defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
+        defaults.set(true, forKey: SidebarVisibility.autoHideKey)
+        defaults.set(true, forKey: CompactToolbar.storageKey)
+        window.setContentSize(NSSize(width: 1100, height: 760))
+        try await settle(window: window, browser: browser) { Self.layoutInstalled(.vertical, in: window) }
+        let root = try XCTUnwrap(window.contentView)
+        let tracker = try XCTUnwrap(Self.firstView(in: root) { $0 is ChromePointerTracker } as? ChromePointerTracker)
+        guard tracker.window === window, tracker.onMove != nil else { throw PerformanceFailure.system("Native pointer tracker is not attached") }
+        // End any focus latch through the actual page responder, then use the production
+        // tracker callback. Only the OS event queue preceding this callback is excluded.
+        if let page = browser.activeTab?.webView { window.makeFirstResponder(page) }
+        for region in ["toolbar", "sidebar"] {
+            var firstVisible: [Double] = []
+            var fullyVisible: [Double] = []
+            for index in 0..<(warmups + repetitions) {
+                tracker.onMove?(CGPoint(x: 800, y: 400))
+                let hidden = PerformanceDisplayMonitor(window: window) {
+                    guard Self.toolbarPresentation(in: window, requiringToolbarVisible: false) == nil,
+                          Self.sidebarPresentation(in: window) == nil else { return nil }
+                    return "both-native-regions-hidden"
+                }
+                do { _ = try await hidden.event.wait() }
+                catch {
+                    hidden.stop()
+                    print("BENCHMARK_REVEAL_HIDE_TIMEOUT region=\(region) \(Self.revealDiagnostics(in: window))")
+                    throw error
+                }
+                hidden.stop()
+                let monitor = PerformanceRevealMonitor(window: window) {
+                    region == "toolbar" ? Self.toolbarPresentation(in: window) : Self.sidebarPresentation(in: window)
+                }
+                let start = Self.now()
+                tracker.onMove?(region == "toolbar" ? CGPoint(x: 500, y: 1) : CGPoint(x: 1, y: 200))
+                let first: Double
+                let full: Double
+                do {
+                    first = try await monitor.firstVisible.wait()
+                    full = try await monitor.fullyVisible.wait()
+                } catch {
+                    monitor.stop()
+                    print("BENCHMARK_REVEAL_VISIBLE_TIMEOUT region=\(region) \(Self.revealDiagnostics(in: window))")
+                    throw error
+                }
+                monitor.stop()
+                if index >= warmups {
+                    firstVisible.append((first - start) * 1000)
+                    fullyVisible.append((full - start) * 1000)
+                }
+                if region == "toolbar" {
+                    XCTAssertNil(Self.sidebarPresentation(in: window), "The top edge must reveal only the toolbar")
+                } else {
+                    XCTAssertNil(Self.toolbarPresentation(in: window), "The left edge must reveal only the floating sidebar")
+                }
+            }
+            appendMetric("\(region)_reveal_first_visible", definition:
+                "Windowed compact chrome, vertical auto-hide sidebar, live local page. Host monotonic time from the attached production ChromePointerTracker.onMove edge callback to first display callback observing a committed presentation layer for the actual native address field (toolbar) or passive native floating-sidebar geometry anchor intersecting the benchmark window by >1 pt with inherited presentation opacity >0.01. Native toolbar visibility also required for toolbar. Excludes OS input dispatch before the production callback; includes display-frame quantization; does not prove GPU pixels presented. Each sample starts after outside-pointer handling and three display callbacks observing both native regions hidden; the toolbar hide probe ignores NSToolbar.isVisible and inspects actual native attachment/visibility/presentation geometry.", samples: firstVisible)
+            appendMetric("\(region)_reveal_fully_visible", definition:
+                "Same operations as first-visible reveal; completion requires inherited presentation opacity >=0.99, >=99% of native geometry inside the window, native/presentation geometry within 0.5 pt, and presentation frame stable at 0.25 pt quantization for three display callbacks. Fullscreen is not measured. No model visibility Boolean is used as completion.", samples: fullyVisible)
+            try writeResults(status: "running")
+        }
+        tracker.onMove?(CGPoint(x: 800, y: 400))
+    }
+
+    private static func firstView(in view: NSView, matching condition: (NSView) -> Bool) -> NSView? {
+        if condition(view) { return view }
+        for child in view.subviews {
+            if let match = firstView(in: child, matching: condition) { return match }
+        }
+        return nil
+    }
+
+    private static func revealDiagnostics(in window: NSWindow) -> String {
+        let marker = window.contentView.flatMap { firstView(in: $0) { $0.identifier?.rawValue == "BrowserFloatingSidebarGeometry" } }
+        return ["toolbarIsVisible=\(window.toolbar?.isVisible == true)", "occlusion=\(window.occlusionState.rawValue)",
+                "field=\(String(describing: addressField(in: window)))", "fieldPresentation=\(addressField(in: window)?.layer?.presentation() != nil)",
+                "marker=\(String(describing: marker))", "markerHidden=\(marker?.isHiddenOrHasHiddenAncestor == true)",
+                "markerAlpha=\(String(describing: marker?.alphaValue))", "markerPresentation=\(marker?.layer?.presentation() != nil)",
+                "rootPresentation=\(window.contentView?.superview?.layer?.presentation() != nil)"].joined(separator: " ")
+    }
+
+    private static func toolbarPresentation(in window: NSWindow, requiringToolbarVisible: Bool = true) -> PerformancePresentation? {
+        if requiringToolbarVisible && window.toolbar?.isVisible != true { return nil }
+        guard let field = addressField(in: window) else { return nil }
+        return presentation(of: field, inside: window)
+    }
+
+    private static func sidebarPresentation(in window: NSWindow) -> PerformancePresentation? {
+        guard let root = window.contentView,
+              let anchor = firstView(in: root, matching: { $0.identifier?.rawValue == "BrowserFloatingSidebarGeometry" }) else { return nil }
+        return presentation(of: anchor, inside: window)
+    }
+
+    private static func presentation(of view: NSView, inside window: NSWindow) -> PerformancePresentation? {
+        guard let owner = view.window, owner.isVisible, owner.occlusionState.contains(.visible), !view.isHiddenOrHasHiddenAncestor,
+              window.occlusionState.contains(.visible), view.bounds.width > 1, view.bounds.height > 1 else { return nil }
+        let nativeRect = owner.convertToScreen(view.convert(view.bounds, to: nil))
+        guard let root = owner.contentView?.superview,
+              let shown = view.layer?.presentation(), let rootShown = root.layer?.presentation() else { return nil }
+        let shownRect = owner.convertToScreen(root.convert(shown.convert(shown.bounds, to: rootShown), to: nil))
+        var opacity: Float = 1
+        var layer: CALayer? = shown
+        while let current = layer { opacity *= current.opacity; layer = current.superlayer }
+        let intersection = shownRect.intersection(window.frame)
+        guard !intersection.isNull, intersection.width > 1, intersection.height > 1, opacity > 0.01 else { return nil }
+        let full = opacity >= 0.99 && intersection.width >= shownRect.width * 0.99 && intersection.height >= shownRect.height * 0.99
+            && abs(shownRect.minX - nativeRect.minX) <= 0.5 && abs(shownRect.minY - nativeRect.minY) <= 0.5
+            && abs(shownRect.width - nativeRect.width) <= 0.5 && abs(shownRect.height - nativeRect.height) <= 0.5
+        let signature = [shownRect.minX, shownRect.minY, shownRect.width, shownRect.height]
+            .map { Int(($0 * 4).rounded()) }.map(String.init).joined(separator: ",")
+        return PerformancePresentation(fullyVisible: full, signature: signature)
+    }
+
     private func writeResourcePhase(name: String, started: Double, duration: Double, status: String, ended: Double? = nil) throws {
         var phase: [String: Any] = ["name": name, "pid": ProcessInfo.processInfo.processIdentifier,
                                     "startedUptime": started, "duration": duration, "status": status]
@@ -396,6 +521,7 @@ final class BrowserPerformanceTests: XCTestCase {
             "os": ProcessInfo.processInfo.operatingSystemVersionString,
             "logical_processor_count": ProcessInfo.processInfo.processorCount,
             "configuration": "Release required; opt-in XCTest host", "warmups": warmups, "repetitions": repetitions,
+            "mode": ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] ?? "full",
             "window_protocol": "Real NSWindow at floating level; canJoinAllSpaces + fullScreenAuxiliary; orderFrontRegardless; initial and pre-load NSWindow.OcclusionState.visible gates. macOS cooperative app activation may remain false. Same visible-window protocol in baseline and candidate.",
             "window_inventory_before_peer_closure": windowInventoryBeforeClosure,
             "closed_normal_host_window_count": closedHostWindowCount,
@@ -548,6 +674,34 @@ final class BrowserPerformanceTests: XCTestCase {
         stableFrames = current == previous ? stableFrames + 1 : 1
         previous = current
         if stableFrames >= 3 { event.finish(); stop() }
+    }
+    func stop() { displayLink?.invalidate(); displayLink = nil }
+}
+
+private struct PerformancePresentation {
+    let fullyVisible: Bool
+    let signature: String
+}
+
+@MainActor private final class PerformanceRevealMonitor: NSObject {
+    let firstVisible = PerformanceEvent()
+    let fullyVisible = PerformanceEvent()
+    private var displayLink: CADisplayLink?
+    private let sample: @MainActor () -> PerformancePresentation?
+    private var previous: String?
+    private var stableFrames = 0
+    init(window: NSWindow, sample: @escaping @MainActor () -> PerformancePresentation?) {
+        self.sample = sample
+        super.init()
+        displayLink = window.displayLink(target: self, selector: #selector(tick))
+        displayLink?.add(to: .main, forMode: .common)
+    }
+    @objc private func tick() {
+        guard let current = sample() else { previous = nil; stableFrames = 0; return }
+        firstVisible.finish()
+        stableFrames = current.fullyVisible && previous == current.signature ? stableFrames + 1 : (current.fullyVisible ? 1 : 0)
+        previous = current.signature
+        if stableFrames >= 3 { fullyVisible.finish(); stop() }
     }
     func stop() { displayLink?.invalidate(); displayLink = nil }
 }

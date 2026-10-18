@@ -6,12 +6,14 @@ struct BrowserSessionSnapshot: Codable, Equatable, Sendable {
         let url: URL?
         let title: String
         var pinnedPageID: UUID? = nil
+        var folderPageID: UUID? = nil
     }
     let tabs: [Tab]
     let selectedIndex: Int
 
     @MainActor init(browser: BrowserModel) {
-        tabs = browser.tabs.map { Tab(url: $0.isNewTab ? nil : $0.url, title: $0.pageTitle, pinnedPageID: $0.pinnedPageID) }
+        tabs = browser.tabs.map { Tab(url: $0.isNewTab ? nil : $0.url, title: $0.pageTitle,
+                                     pinnedPageID: $0.pinnedPageID, folderPageID: $0.folderPageID) }
         selectedIndex = browser.tabs.firstIndex { $0.id == browser.activeTabID } ?? 0
     }
 

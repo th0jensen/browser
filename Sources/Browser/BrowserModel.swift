@@ -10,6 +10,8 @@ final class BrowserModel: NSObject {
     let downloads: DownloadManager
     let sitePermissions: SitePermissions
     let pinnedPages: PinnedPageStore
+    let folders: TabFolderStore
+    var folderEditorRequest: FolderEditorRequest?
 
     private(set) var tabs: [BrowserTab] = []
     private var closedTabs: [ClosedTab] = []
@@ -23,15 +25,19 @@ final class BrowserModel: NSObject {
             }
             activeTab?.restore()
             activeTab?.didBecomeSelected()
+            if let pageID = activeTab?.folderPageID { changeFolders { try folders.reveal(pageID) } }
             if let activeTab {
                 BrowserExtensions.shared.didActivate(activeTab, previous: tab(withID: oldValue))
             }
+            updateWindowTitle()
         }
     }
     var addressFocusRequest = 0
     @ObservationIgnored var consumedAddressFocusRequest = 0
     @ObservationIgnored private var suspender: TabSuspender?
-    @ObservationIgnored weak var window: NSWindow?
+    @ObservationIgnored weak var window: NSWindow? {
+        didSet { updateWindowTitle() }
+    }
     @ObservationIgnored var isExtensionWindow = false
 
     private struct ClosedTab {
@@ -39,14 +45,18 @@ final class BrowserModel: NSObject {
         let title: String
         /// The tab's back-forward history, restored when it reopens.
         let interactionState: Any?
+        let folderPageID: UUID?
     }
 
     init(downloads: DownloadManager = DownloadManager(), sitePermissions: SitePermissions = .shared,
-         configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), pinnedPages: PinnedPageStore? = nil) {
+         configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), pinnedPages: PinnedPageStore? = nil,
+         folders: TabFolderStore? = nil) {
         self.downloads = downloads
         self.sitePermissions = sitePermissions
         self.pinnedPages = pinnedPages ?? (BrowserProfile.isTesting
             ? PinnedPageStore(directory: BrowserProfile.directory, enabled: false) : .shared)
+        self.folders = folders ?? (BrowserProfile.isTesting
+            ? TabFolderStore(directory: BrowserProfile.directory, enabled: false) : .shared)
         super.init()
         addTab(configuration: configuration)
         suspender = TabSuspender(browser: self)
@@ -56,13 +66,107 @@ final class BrowserModel: NSObject {
         tab(withID: activeTabID)
     }
 
+    func updateWindowTitle() {
+        // WindowGroup titles belong to SwiftUI's navigationTitle. Only the
+        // independently hosted extension windows need the AppKit assignment.
+        guard isExtensionWindow else { return }
+        let title = activeTab?.title ?? "Browser"
+        if window?.title != title { window?.title = title }
+    }
+
     var canReopenClosedTab: Bool {
         !closedTabs.isEmpty
     }
 
-    var regularTabs: [BrowserTab] {
+    var unpinnedTabs: [BrowserTab] {
         let ids = Set(pinnedPages.items.map(\.id))
         return tabs.filter { !ids.contains($0.pinnedPageID ?? $0.id) }
+    }
+
+    var regularTabs: [BrowserTab] {
+        let saved = Set(folders.pages.map(\.id))
+        return unpinnedTabs.filter { !saved.contains($0.folderPageID ?? $0.id) }
+    }
+
+    func requestNewFolder(parentID: UUID? = nil, containing tab: BrowserTab? = nil) {
+        folderEditorRequest = FolderEditorRequest(parentID: parentID, tabID: tab?.id)
+    }
+
+    func saveFolder(_ request: FolderEditorRequest, title: String, parentID: UUID?, symbol: String,
+                    emoji: String, color: FolderColor) throws {
+        if let id = request.folderID {
+            try folders.updateFolder(id, title: title, parentID: parentID, symbol: symbol, emoji: emoji, color: color)
+        } else {
+            let tab = tab(withID: request.tabID)
+            let initialPage = tab.flatMap { tab in tab.url.map { (url: $0, title: tab.title) } }
+            let folder = try folders.createFolder(title: title, parentID: parentID, symbol: symbol,
+                                                  emoji: emoji, color: color, initialPage: initialPage)
+            if let tab, let page = folders.pages.first(where: { $0.parentID == folder.id }) {
+                if let old = tab.folderPageID { try folders.removePage(old) }
+                tab.folderPageID = page.id
+                tab.pinnedPageID = nil
+            }
+        }
+    }
+
+    func changeFolders(_ action: () throws -> Void) {
+        do { try action() }
+        catch { if let window { NSAlert(error: error).beginSheetModal(for: window) } }
+    }
+
+    func moveToFolder(_ tab: BrowserTab, parentID: UUID?, before: UUID? = nil) {
+        changeFolders {
+            if let id = tab.folderPageID, folders.item(id) != nil {
+                try folders.move(id, to: parentID, before: before)
+            } else if let url = tab.url {
+                let page = try folders.savePage(url: url, title: tab.title, in: parentID)
+                tab.folderPageID = page.id
+                tab.pinnedPageID = nil
+                if before != nil { try folders.move(page.id, to: parentID, before: before) }
+            }
+        }
+    }
+
+    func openFolderPage(_ page: TabFolderItem) {
+        guard page.kind == .page, folders.item(page.id) != nil, let url = page.url else { return }
+        if let existing = tabs.first(where: { $0.folderPageID == page.id }) {
+            activeTabID = existing.id
+        } else {
+            let tab = adopt(BrowserTab(url: url, title: page.title, interactionState: nil))
+            tab.folderPageID = page.id
+            tabs.append(tab)
+            BrowserExtensions.shared.didOpen(tab)
+            activeTabID = tab.id
+        }
+    }
+
+    func moveFolderPageToTemporaryTabs(_ page: TabFolderItem) {
+        changeFolders {
+            try folders.removePage(page.id)
+            if let tab = tabs.first(where: { $0.folderPageID == page.id }) {
+                tab.folderPageID = nil
+            } else if let url = page.url {
+                let tab = adopt(BrowserTab(url: url, title: page.title, interactionState: nil))
+                tabs.append(tab)
+                BrowserExtensions.shared.didOpen(tab)
+            }
+        }
+    }
+
+    @discardableResult
+    func acceptFolderDrop(_ payload: String, parentID: UUID?, before: UUID? = nil) -> Bool {
+        let prefix = "browser-folder:"
+        if payload.hasPrefix(prefix), let id = UUID(uuidString: String(payload.dropFirst(prefix.count))),
+           folders.item(id) != nil, folders.canMove(id, to: parentID) {
+            changeFolders { try folders.move(id, to: parentID, before: before) }
+            return true
+        }
+        if let id = UUID(uuidString: payload), let tab = tab(withID: id),
+           let url = tab.url, PinnedPageStore.valid(url) {
+            moveToFolder(tab, parentID: parentID, before: before)
+            return true
+        }
+        return false
     }
 
     func canPin(_ tab: BrowserTab) -> Bool {
@@ -108,12 +212,18 @@ final class BrowserModel: NSObject {
         guard !session.tabs.isEmpty else { return }
         let previous = tabs
         var boundPins = Set<UUID>()
+        var boundFolders = Set<UUID>()
         tabs = session.tabs.map { saved in
             guard let url = saved.url, ["https", "http", "webkit-extension"].contains(url.scheme ?? "") else { return makeTab() }
             let tab = adopt(BrowserTab(url: url, title: saved.title, interactionState: nil))
-            let page = pinnedPages.items.first { $0.id == saved.pinnedPageID }
-                ?? pinnedPages.items.first { $0.url == url }
+            let page = saved.folderPageID == nil ? (pinnedPages.items.first { $0.id == saved.pinnedPageID }
+                ?? pinnedPages.items.first { $0.url == url }) : nil
             if let page, boundPins.insert(page.id).inserted { tab.pinnedPageID = page.id }
+            if tab.pinnedPageID == nil {
+                let folderPage = folders.pages.first { $0.id == saved.folderPageID }
+                    ?? folders.pages.first { $0.url == url && !boundFolders.contains($0.id) }
+                if let folderPage, boundFolders.insert(folderPage.id).inserted { tab.folderPageID = folderPage.id }
+            }
             return tab
         }
         previous.forEach { BrowserExtensions.shared.didClose($0) }
@@ -214,7 +324,7 @@ final class BrowserModel: NSObject {
         tab.stopWaitingForSelection()
         let isBlank = tab.isNewTab || tab.url == nil
         closedTabs.append(ClosedTab(url: isBlank ? nil : tab.url, title: tab.pageTitle,
-                                    interactionState: isBlank ? nil : tab.interactionState))
+                                    interactionState: isBlank ? nil : tab.interactionState, folderPageID: tab.folderPageID))
         if closedTabs.count > 10 { closedTabs.removeFirst() }
     }
 
@@ -227,6 +337,8 @@ final class BrowserModel: NSObject {
         // Selecting the suspended tab restores its history, or loads its address.
         let tab = adopt(BrowserTab(url: closedTab.url, title: closedTab.title,
                                    interactionState: closedTab.interactionState))
+        if let id = closedTab.folderPageID, folders.item(id) != nil,
+           !tabs.contains(where: { $0.folderPageID == id }) { tab.folderPageID = id }
         tabs.append(tab)
         BrowserExtensions.shared.didOpen(tab)
         activeTabID = tab.id
@@ -312,15 +424,30 @@ final class BrowserModel: NSObject {
     }
 
     func requestAddressFocus() {
+        chromeHover?.addressFocusRequested()
         addressFocusRequest += 1
     }
 
-    #if DEBUG
+    func toggleAddressFocus() {
+        guard chromeHover?.addressIsFocused == true
+                || addressFocusRequest != consumedAddressFocusRequest else {
+            requestAddressFocus()
+            return
+        }
+
+        consumedAddressFocusRequest = addressFocusRequest
+        // Cancel any queued focus application before returning the field editor to the page.
+        let field = (window?.firstResponder as? AddressField)
+            ?? ((window?.firstResponder as? NSTextView)?.delegate as? AddressField)
+        field?.requestFocus(0)
+        window?.makeFirstResponder(activeTab?.webView)
+        chromeHover?.dismissAddressFocus()
+    }
+
     func showWebInspector() {
         guard let tab = activeTab, !tab.isNewTab, let webView = tab.webView else { return }
         WebInspector.show(for: webView)
     }
-    #endif
 
     /// Background tabs that can be suspended to free memory, least recently used first. A pop-up and its opener
     /// can script each other, so neither is suspended while both are open.

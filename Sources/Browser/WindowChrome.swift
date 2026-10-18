@@ -11,6 +11,14 @@ enum BrowserChrome {
     static let sidebarTabHeight: CGFloat = 32
     /// Inset shared by the navigation bar and the page, so their edges line up.
     static let edgeInset: CGFloat = 8
+    /// One chrome-width inside the page's existing outer chrome-width.
+    static let revealInset: CGFloat = edgeInset * 2
+
+    static func tabContentOpacity(active: Bool, hovered: Bool, loaded: Bool) -> Double {
+        if active { return 1 }
+        if hovered { return loaded ? 1 : 0.82 }
+        return loaded ? 0.88 : 0.6
+    }
     /// Shared by both tab layouts; based on the vertical header's balanced margin.
     static func windowControlsLeadingInset(controlHeight: CGFloat) -> CGFloat {
         (toolbarHeight + edgeInset * 3 - controlHeight) / 2
@@ -44,9 +52,18 @@ struct WindowChromeConfigurator: NSViewRepresentable {
     @Binding var isFullScreen: Bool
     var compactToolbar = false
     var toolbarIsRevealed = true
+    var hoverController: ChromeHoverController?
+    var nativeCommands: [NativeToolbarCommand] = []
+    var toolbarDisplayMode: NSToolbar.DisplayMode? = nil
+    var toolbarContextMenu: (@MainActor () -> NSMenu)?
     var onCustomizationChange: ((Bool) -> Void)?
     var onToolbarItemsChange: (([String]) -> Void)?
     var onWindowChange: ((NSWindow?) -> Void)?
+    var onToolbarRegionHeight: ((CGFloat) -> Void)?
+
+    static func dismantleNSView(_ view: WindowChromeView, coordinator: ()) {
+        view.detachNativeCommands()
+    }
 
     func makeNSView(context: Context) -> WindowChromeView {
         let view = WindowChromeView()
@@ -57,15 +74,22 @@ struct WindowChromeConfigurator: NSViewRepresentable {
     func updateNSView(_ view: WindowChromeView, context: Context) {
         view.onFullScreenChange = { if isFullScreen != $0 { isFullScreen = $0 } }
         view.onWindowChange = onWindowChange
+        view.onToolbarRegionHeight = onToolbarRegionHeight
         view.onCustomizationChange = onCustomizationChange
         view.onToolbarItemsChange = onToolbarItemsChange
-        view.update(layout: tabLayout, tabs: horizontalTabs, compactToolbar: compactToolbar, toolbarIsRevealed: toolbarIsRevealed)
+        view.toolbarContextMenu = toolbarContextMenu
+        view.setNativeCommands(nativeCommands, displayMode: toolbarDisplayMode)
+        hoverController?.nativeToolbarPresenter = view
+        view.update(layout: tabLayout, tabs: horizontalTabs, compactToolbar: compactToolbar,
+                    toolbarIsRevealed: hoverController?.toolbarIsRevealed ?? toolbarIsRevealed)
     }
 }
 
 final class WindowChromeView: NSView {
     var onFullScreenChange: ((Bool) -> Void)?
     var onWindowChange: ((NSWindow?) -> Void)?
+    var onToolbarRegionHeight: ((CGFloat) -> Void)?
+    private(set) var measuredToolbarRegionHeight: CGFloat?
     var onCustomizationChange: ((Bool) -> Void)?
     var onToolbarItemsChange: (([String]) -> Void)?
     private var observers: [NSObjectProtocol] = []
@@ -76,6 +100,7 @@ final class WindowChromeView: NSView {
     private let tabReservation = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: BrowserChrome.tabRowHeight))
     private var hasInstalledTabs = false
     private weak var shiftedToolbar: NSView?
+    private var chromeWasVisible = true
     private var originalToolbarOrigin = NSPoint.zero
     private var alignmentIsScheduled = false
     private var compactToolbar = false
@@ -88,8 +113,15 @@ final class WindowChromeView: NSView {
     private var windowControlOffsets: [NSWindow.ButtonType: CGFloat] = [:]
     private var controlObservers: [NSObjectProtocol] = []
     private var observedControlViews: [ObjectIdentifier] = []
+    private var nativeCommands: [String: NativeToolbarCommand] = [:]
+    private var toolbarDisplayMode: NSToolbar.DisplayMode?
+    private var nativeAdapters: [ObjectIdentifier: NativeToolbarCommandAdapter] = [:]
+    var toolbarContextMenu: (@MainActor () -> NSMenu)?
+    private var contextMenuMonitor: Any?
 
     isolated deinit {
+        if let contextMenuMonitor { NSEvent.removeMonitor(contextMenuMonitor) }
+        nativeAdapters.values.forEach { $0.restore() }
         observers.forEach(NotificationCenter.default.removeObserver)
         controlObservers.forEach(NotificationCenter.default.removeObserver)
         toolbarItemObservers.forEach(NotificationCenter.default.removeObserver)
@@ -97,7 +129,51 @@ final class WindowChromeView: NSView {
 
     func refresh() { updateWindowState() }
 
+    func setNativeCommands(_ commands: [NativeToolbarCommand], displayMode: NSToolbar.DisplayMode? = nil) {
+        toolbarDisplayMode = displayMode
+        nativeCommands = Dictionary(commands.map { ($0.identifier, $0) }, uniquingKeysWith: { _, new in new })
+        applyNativeCommands()
+    }
+
+    func detachNativeCommands() {
+        nativeCommands.removeAll()
+        restoreNativeCommands()
+        toolbarContextMenu = nil
+        if let contextMenuMonitor { NSEvent.removeMonitor(contextMenuMonitor) }
+        contextMenuMonitor = nil
+    }
+
+    private func restoreNativeCommands() {
+        nativeAdapters.values.forEach { $0.restore() }
+        nativeAdapters.removeAll()
+    }
+
+    private func applyNativeCommands() {
+        let items = window?.toolbar?.items ?? []
+        let current = Set(items.filter { nativeCommands[$0.itemIdentifier.rawValue] != nil }.map(ObjectIdentifier.init))
+        for key in Array(nativeAdapters.keys) where !current.contains(key) {
+            nativeAdapters.removeValue(forKey: key)?.restore()
+        }
+        for item in items {
+            guard let command = nativeCommands[item.itemIdentifier.rawValue] else { continue }
+            let key = ObjectIdentifier(item)
+            let mode = toolbarDisplayMode ?? window?.toolbar?.displayMode ?? .iconOnly
+            if let adapter = nativeAdapters[key] { adapter.update(command, displayMode: mode) }
+            else { nativeAdapters[key] = NativeToolbarCommandAdapter(item: item, command: command, displayMode: mode) }
+        }
+    }
+
+    /// The native pointer callback can reveal existing toolbar views immediately,
+    /// without waiting for a SwiftUI update of the page and the rest of the window.
+    func setToolbarRevealed(_ revealed: Bool) {
+        guard toolbarIsRevealed != revealed else { return }
+        toolbarIsRevealed = revealed
+        updateWindowState()
+        centerTitlebarControls()
+    }
+
     func update(layout: TabLayout, tabs content: AnyView, compactToolbar: Bool = false, toolbarIsRevealed: Bool = true) {
+        if tabLayout != layout { measuredToolbarRegionHeight = nil }
         tabLayout = layout
         if self.compactToolbar && !compactToolbar { window?.toolbar?.isVisible = true }
         self.compactToolbar = compactToolbar
@@ -119,7 +195,12 @@ final class WindowChromeView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if let contextMenuMonitor { NSEvent.removeMonitor(contextMenuMonitor) }
+        contextMenuMonitor = nil
+        restoreNativeCommands()
+        measuredToolbarRegionHeight = nil
         restoreToolbarOrigin()
+        chromeWasVisible = true
         windowControlOffsets.removeAll()
         controlObservers.forEach(NotificationCenter.default.removeObserver)
         controlObservers.removeAll()
@@ -129,8 +210,24 @@ final class WindowChromeView: NSView {
         observers = []
         guard let window else { return }
         observeToolbar(in: window)
+        // AppKit owns empty toolbar space and its default context menu. Route only
+        // secondary clicks in that native branch so every item gets our behavior
+        // controls, including extension buttons and flexible spaces. Text editing
+        // and the navigation buttons retain their own contextual actions.
+        contextMenuMonitor = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .leftMouseDown]) { [weak self] event in
+            let handled = MainActor.assumeIsolated {
+                guard let self, let menu = self.contextMenu(for: event), let window = self.window,
+                      let branch = self.toolbarBranch(in: window) else { return false }
+                // Finish routing the input before entering AppKit's menu tracking
+                // loop; otherwise accessibility clicks wait for the menu to close.
+                DispatchQueue.main.async { NSMenu.popUpContextMenu(menu, with: event, for: branch) }
+                return true
+            }
+            return handled ? nil : event
+        }
 
         let names: [Notification.Name] = [
+            NSWindow.willCloseNotification,
             NSWindow.didResizeNotification,
             NSWindow.didEndLiveResizeNotification,
             NSWindow.didEnterFullScreenNotification,
@@ -143,8 +240,18 @@ final class WindowChromeView: NSView {
         observers = names.map { name in
             NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    if name == NSWindow.didUpdateNotification { self?.scheduleAlignment() }
-                    else { self?.updateWindowState() }
+                    if name == NSWindow.willCloseNotification { self?.detachNativeCommands() }
+                    else if name == NSWindow.didUpdateNotification || name == NSWindow.didResizeNotification {
+                        // A resize changes geometry, not window configuration. Its native controls and
+                        // tab row already share one coalesced alignment pass with AppKit's layout updates.
+                        self?.scheduleAlignment()
+                    }
+                    else {
+                        if name == NSWindow.didEnterFullScreenNotification || name == NSWindow.didExitFullScreenNotification {
+                            self?.measuredToolbarRegionHeight = nil
+                        }
+                        self?.updateWindowState()
+                    }
                 }
             }
         }
@@ -154,6 +261,21 @@ final class WindowChromeView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    func contextMenu(for event: NSEvent) -> NSMenu? {
+        guard event.type == .rightMouseDown || (event.type == .leftMouseDown && event.modifierFlags.contains(.control)),
+              let window, event.window === window, window.attachedSheet == nil,
+              let toolbar = window.toolbar, toolbar.isVisible, !toolbar.customizationPaletteIsRunning,
+              let branch = toolbarBranch(in: window), !branch.isHiddenOrHasHiddenAncestor,
+              branch.bounds.contains(branch.convert(event.locationInWindow, from: nil)) else { return nil }
+        for item in toolbar.items where ["back", "forward"].contains(item.itemIdentifier.rawValue) {
+            if let view = item.view, !view.isHiddenOrHasHiddenAncestor,
+               view.bounds.contains(view.convert(event.locationInWindow, from: nil)) { return nil }
+        }
+        if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor,
+           editor.visibleRect.contains(editor.convert(event.locationInWindow, from: nil)) { return nil }
+        return toolbarContextMenu?()
+    }
+
     private func updateWindowState() {
         guard let window else { return }
         if let item = window.toolbar?.items.first(where: { $0.itemIdentifier.rawValue.contains("address") }) {
@@ -161,7 +283,10 @@ final class WindowChromeView: NSView {
         }
         // AppKit can reshape the toolbar even when a setter receives its current value.
         // Refreshes are frequent during page and address updates, so only apply real changes.
-        if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
+        let transparentTitlebar = tabLayout != .horizontal
+        if window.titlebarAppearsTransparent != transparentTitlebar {
+            window.titlebarAppearsTransparent = transparentTitlebar
+        }
         if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
         if !window.styleMask.contains(.fullSizeContentView) { window.styleMask.insert(.fullSizeContentView) }
         if window.tabbingMode != .disallowed { window.tabbingMode = .disallowed }
@@ -170,6 +295,7 @@ final class WindowChromeView: NSView {
         if window.toolbarStyle != style { window.toolbarStyle = style }
         applyToolbarVisibility(in: window)
         publishToolbarItems(in: window)
+        applyNativeCommands()
         if tabLayout == .horizontal && (!compactToolbar || window.toolbar?.isVisible == true) {
             if !window.titlebarAccessoryViewControllers.contains(tabAccessory) {
                 tabAccessory.layoutAttribute = .right
@@ -205,6 +331,7 @@ final class WindowChromeView: NSView {
                 self.observeToolbar(in: window)
                 self.applyToolbarVisibility(in: window)
                 self.publishToolbarItems(in: window)
+                self.applyNativeCommands()
             }
             self.centerTitlebarControls()
         }
@@ -217,25 +344,36 @@ final class WindowChromeView: NSView {
         guard !window.styleMask.contains(.fullScreen) else { restoreToolbarOrigin(); return }
         guard window.toolbar?.isVisible == true else { restoreToolbarOrigin(); return }
         positionWindowControls(in: window)
-        guard
-              let address = window.toolbar?.items.first(where: { $0.itemIdentifier.rawValue.contains("address") })?.view,
-              let close = window.standardWindowButton(.closeButton) else { return }
-        // Find the toolbar's branch beside the window controls without depending on AppKit class names.
-        var branch = address
-        while let parent = branch.superview, !close.isDescendant(of: parent) { branch = parent }
-        guard branch.superview != nil, branch !== close, branch !== window.contentView?.superview else { return }
+        guard let branch = toolbarBranch(in: window) else { return }
         if shiftedToolbar !== branch {
             restoreToolbarOrigin()
             shiftedToolbar = branch
             originalToolbarOrigin = branch.bounds.origin
         }
-        let offset = tabLayout == .vertical ? BrowserChrome.edgeInset / 2 : BrowserChrome.edgeInset
-        let origin = NSPoint(x: originalToolbarOrigin.x,
+        let offset = tabLayout == .vertical
+            ? BrowserChrome.edgeInset / 2 + (compactToolbar ? BrowserChrome.edgeInset / 2 : 0)
+            : BrowserChrome.edgeInset
+        let origin = NSPoint(x: originalToolbarOrigin.x
+                                + (compactToolbar && tabLayout == .vertical ? BrowserChrome.edgeInset : 0),
                              y: originalToolbarOrigin.y + (branch.isFlipped ? -offset : offset))
         if branch.bounds.origin != origin { branch.setBoundsOrigin(origin) }
 
         // Moving the toolbar branch can also move its sibling controls on native relayout.
         positionWindowControls(in: window)
+        reportToolbarRegionHeight(in: window, branch: branch)
+    }
+
+    private func reportToolbarRegionHeight(in window: NSWindow, branch: NSView) {
+        var views = [branch] + (window.toolbar?.items.compactMap(\.view) ?? [])
+        if tabLayout == .horizontal, tabContainer.window === window { views.append(tabContainer) }
+        views += [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap { window.standardWindowButton($0) }
+        let bottom = views.filter { $0.window === window }.map { $0.convert($0.bounds, to: nil).minY }.min()
+        guard let bottom else { return }
+        let height = max(0, window.frame.height - bottom)
+        guard height.isFinite, height > 0,
+              measuredToolbarRegionHeight.map({ abs($0 - height) > 0.01 }) ?? true else { return }
+        measuredToolbarRegionHeight = height
+        onToolbarRegionHeight?(height)
     }
 
     private func positionWindowControls(in window: NSWindow) {
@@ -243,6 +381,7 @@ final class WindowChromeView: NSView {
         // Horizontal traffic lights belong to the tab row; vertical lights share the navigation row.
         let center = tabLayout == .vertical
             ? (window.frame.height + window.contentLayoutRect.maxY - BrowserChrome.edgeInset) / 2
+                - (compactToolbar ? BrowserChrome.edgeInset / 2 : 0)
             : window.frame.height - BrowserChrome.tabRowHeight / 2
         let closeFrame = close.convert(close.bounds, to: nil)
         if windowControlOffsets.isEmpty {
@@ -253,6 +392,7 @@ final class WindowChromeView: NSView {
         }
         // Keep the same left edge when switching layouts, despite their different row heights.
         let leadingInset = BrowserChrome.windowControlsLeadingInset(controlHeight: closeFrame.height)
+            + (compactToolbar && tabLayout == .vertical ? BrowserChrome.edgeInset / 2 : 0)
         for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
             guard let button = window.standardWindowButton(type), let parent = button.superview,
                   let offset = windowControlOffsets[type] else { continue }
@@ -301,13 +441,21 @@ final class WindowChromeView: NSView {
         toolbarItemObservers.forEach(NotificationCenter.default.removeObserver)
         toolbarItemObservers.removeAll()
         observedToolbar = window.toolbar
+        measuredToolbarRegionHeight = nil
         guard let toolbar = window.toolbar else { return }
+        if toolbar.displayMode == .default { toolbar.displayMode = .iconOnly }
         toolbarItemObservers = [NSToolbar.willAddItemNotification, NSToolbar.didRemoveItemNotification].map { name in
             NotificationCenter.default.addObserver(forName: name, object: toolbar, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.scheduleAlignment() }
             }
         }
         toolbarObservations = [
+            toolbar.observe(\.displayMode) { [weak self] _, _ in
+                MainActor.assumeIsolated {
+                    self?.measuredToolbarRegionHeight = nil
+                    self?.scheduleAlignment()
+                }
+            },
             toolbar.observe(\.isVisible) { [weak self] _, _ in
                 MainActor.assumeIsolated { self?.scheduleAlignment() }
             },
@@ -329,8 +477,11 @@ final class WindowChromeView: NSView {
         // Fullscreen compact chrome is a glass overlay inside the page's window. The
         // attached native toolbar still owns configuration and the customization palette.
         let fullscreenOverlay = compactToolbar && window.styleMask.contains(.fullScreen)
-        let visible = toolbar.customizationPaletteIsRunning || (!fullscreenOverlay && (!compactToolbar || toolbarIsRevealed))
-        let visibilityChanged = compactToolbar && toolbar.isVisible != visible
+        let chromeVisible = toolbar.customizationPaletteIsRunning || !compactToolbar || toolbarIsRevealed
+        // Reveal the real toolbar and its system material together. Hiding only its
+        // controls leaves AppKit's header background visible without any controls.
+        let visible = toolbar.customizationPaletteIsRunning || (!fullscreenOverlay && chromeVisible)
+        let visibilityChanged = toolbar.isVisible != visible
         if visibilityChanged {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0
@@ -338,13 +489,15 @@ final class WindowChromeView: NSView {
                 toolbar.isVisible = visible
             }
         }
-        tabContainer.isHidden = compactToolbar && !visible
+        tabContainer.isHidden = fullscreenOverlay || !chromeVisible
         if !window.styleMask.contains(.fullScreen) {
             for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
-                window.standardWindowButton(type)?.isHidden = compactToolbar && !visible
+                window.standardWindowButton(type)?.isHidden = !chromeVisible
             }
         }
-        if visibilityChanged && visible {
+        let didReveal = chromeVisible && !chromeWasVisible
+        chromeWasVisible = chromeVisible
+        if (visibilityChanged || didReveal) && visible && chromeVisible {
             DispatchQueue.main.async { [weak toolbar] in
                 guard toolbar?.isVisible == true,
                       let view = toolbar?.items.first(where: { $0.itemIdentifier.rawValue == "address" })?.view else { return }
@@ -353,13 +506,40 @@ final class WindowChromeView: NSView {
         }
     }
 
+    /// Locate the toolbar branch beside the native window controls through public
+    /// view relationships; this works without the address item in a customized bar.
+    private func toolbarBranch(in window: NSWindow) -> NSView? {
+        guard let toolbar = window.toolbar, let close = window.standardWindowButton(.closeButton),
+              let itemView = toolbar.items.first(where: { $0.itemIdentifier.rawValue.contains("address") })?.view
+                ?? toolbar.items.compactMap(\.view).first else { return nil }
+        var branch = itemView
+        while let parent = branch.superview, !close.isDescendant(of: parent) { branch = parent }
+        guard branch.superview != nil, branch !== close,
+              branch !== window.contentView?.superview else { return nil }
+        return branch
+    }
+
     private func publishToolbarItems(in window: NSWindow) {
         guard let toolbar = window.toolbar else { return }
+        // Native control leaves have explicit metadata instead of relying on
+        // SwiftUI to infer palette captions from a rendered Button/Label tree.
+        for item in toolbar.items {
+            guard let label = nativeCommands[item.itemIdentifier.rawValue]?.title ?? Self.toolbarLabels[item.itemIdentifier.rawValue] else { continue }
+            if item.label != label { item.label = label }
+            if item.paletteLabel != label { item.paletteLabel = label }
+        }
         let identifiers = toolbar.items.map { $0.itemIdentifier.rawValue }
         guard identifiers != lastToolbarItemIdentifiers else { return }
         lastToolbarItemIdentifiers = identifiers
         DispatchQueue.main.async { [weak self] in self?.onToolbarItemsChange?(identifiers) }
     }
+
+    private static let toolbarLabels: [String: String] = [
+        "sidebar": "Sidebar", "layout": "Tab Layout", "pinSidebar": "Pin Sidebar",
+        "back": "Back", "forward": "Forward", "reload": "Reload", "address": "Address and Search", "folders": "Folders",
+        "downloads": "Downloads", "pins": "Pinned Pages", "settings": "Settings", "newTab": "New Tab",
+        "divider0": "Divider", "divider1": "Divider", "divider2": "Divider", "divider3": "Divider"
+    ]
 
     private static func applyPendingAddressFocus(in view: NSView) {
         if let field = view as? AddressField { field.applyPendingFocus() }
@@ -390,6 +570,7 @@ private final class TitlebarTabContainer: NSView {
     override var fittingSize: NSSize { NSSize(width: 0, height: BrowserChrome.tabRowHeight) }
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: BrowserChrome.tabRowHeight) }
 }
+
 
 struct BrowserWindowReference {
     weak var window: NSWindow?

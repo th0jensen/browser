@@ -32,5 +32,12 @@ fi
 
 ./scripts/migrate-profile.sh "$app" "$name"
 ln -sfn "$app" "$link"
+# Refresh this app's registration after adding or changing its bundled icon.
+# Debug and Release deliberately share an identity, but have different artwork.
+touch "$app"
+launch_services="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [[ -x "$launch_services" ]]; then
+    "$launch_services" -f "$app"
+fi
 open -n "$link"
 echo "Launched $link → $app"

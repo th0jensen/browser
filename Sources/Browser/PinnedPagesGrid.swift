@@ -38,8 +38,8 @@ struct PinnedPagesButton: View {
             Label("Pinned Pages", systemImage: "square.grid.3x3")
         }
         .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .labelStyle(.iconOnly)
-        .buttonStyle(ChromeToolbarButtonStyle())
+        .labelStyle(ChromeToolbarLabelStyle())
+        .chromeToolbarButtonStyle()
         .controlSize(.regular)
         .disabled(browser.pinnedPages.items.isEmpty)
         .help("Pinned Pages")
@@ -55,12 +55,19 @@ private struct PinnedPageTile: View {
     let page: PinnedPage
     let browser: BrowserModel
     @State private var tint: Color = .accentColor
+    @State private var isHovered = false
 
     var body: some View {
         let active = browser.activeTab?.pinnedPageID == page.id
+        let loaded = browser.tabs.contains {
+            ($0.pinnedPageID == page.id || $0.url == page.url) && !$0.isSuspended
+        }
         Button { browser.openPinned(page) } label: {
             Color.clear.frame(height: PinnedPagesGrid.tileHeight)
-                .overlay { SiteIcon(url: page.url, size: BrowserChrome.pinIconSize) }
+                .overlay {
+                    SiteIcon(url: page.url, size: BrowserChrome.pinIconSize)
+                        .opacity(BrowserChrome.tabContentOpacity(active: active, hovered: isHovered, loaded: loaded))
+                }
                 .contentShape(RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
@@ -69,6 +76,7 @@ private struct PinnedPageTile: View {
         .help("\(page.title)\n\(page.url.absoluteString)")
         .accessibilityLabel("Pinned: \(page.title)")
         .accessibilityAddTraits(active ? [.isSelected] : [])
+        .onHover { isHovered = $0 }
         .contextMenu {
             Button("Open in New Tab") { browser.open(page.url, inNewTab: true) }
             Button("Copy Link") {

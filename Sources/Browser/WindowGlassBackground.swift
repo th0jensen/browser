@@ -4,7 +4,7 @@ import SwiftUI
 struct WindowGlassBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = TransparentWindowMaterialView()
-        view.material = .underWindowBackground
+        view.material = .titlebar
         view.blendingMode = .behindWindow
         view.state = .active
         return view

@@ -16,19 +16,19 @@ struct BrowserSettings: View {
         Form {
             Section("Tabs") {
                 Button("Customize Toolbar…") { ChromeCustomization.customizeToolbar() }
-                Toggle("Compact toolbar (⌘S)", isOn: $compactToolbar)
-                Text("Hide the top bar until the pointer reaches the top edge. ⌘L and ⌘T reveal and focus the address field. Sidebar auto-hide is independent.")
+                Toggle("Automatically hide toolbar (⌃⌘S)", isOn: $compactToolbar)
+                Text("Hide the top bar until the pointer reaches the top edge. ⌘G, ⌘L and ⌘T reveal and focus the address field. Sidebar auto-hide is independent.")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("Tab layout", selection: $tabLayout) {
                     Text("Horizontal").tag(TabLayout.horizontal)
                     Text("Vertical").tag(TabLayout.vertical)
                 }
-                Toggle("Automatically hide sidebar (⌃⌘S)", isOn: $autoHideSidebar)
+                Toggle("Automatically hide sidebar (⌘S)", isOn: $autoHideSidebar)
                     .disabled(tabLayout != .vertical)
                 Toggle("Compact sidebar tabs", isOn: $compactTabs)
                 LabeledContent("Sidebar width", value: "\(Int(sidebarWidth)) pt")
                 Slider(value: $sidebarWidth, in: BrowserChrome.sidebarMinimumWidth...BrowserChrome.sidebarMaximumWidth, step: 4)
-                Text("With auto-hide enabled, move the pointer to the left edge to reveal a floating sidebar. Press ⌃⌘S to pin it. Save a webpage with ⇧⌘S.")
+                Text("With auto-hide enabled, move the pointer to the left edge to reveal a floating sidebar. Press ⌘S to pin it. Save a webpage with ⇧⌘S.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section("Bookmarks") {
@@ -45,7 +45,7 @@ struct BrowserSettings: View {
                             Toggle(item.name, isOn: Binding(get: { item.isEnabled }, set: { enabled in
                                 Task { await extensions.setEnabled(item, enabled) }
                             }))
-                            .disabled(extensions.isBusy || item.needsNativeMessaging)
+                            .disabled(extensions.isBusy || item.needsNativeMessaging || (item.ruleCount == 0 && !item.isEnabled))
                             Spacer()
                             if item.sourceAppName == nil {
                                 Button("Remove", role: .destructive) { extensions.remove(item) }
@@ -55,7 +55,10 @@ struct BrowserSettings: View {
                         if let appName = item.sourceAppName {
                             Text("From \(appName)").font(.caption).foregroundStyle(.secondary)
                         }
-                        Text(item.kind == .contentBlocker ? "Content blocker · reload pages after changing rules" : "Web Extension")
+                        Text(item.kind == .contentBlocker
+                             ? (extensions.activeRuleCounts[item.id].map { "Content blocker · \($0.formatted()) active rules" }
+                                ?? (item.ruleCount == 0 ? "No usable bundled rules for this category" : "Content blocker · reload pages after changing rules"))
+                             : "Web Extension")
                             .font(.caption).foregroundStyle(.secondary)
                         if item.needsNativeMessaging {
                             Text("Requires Safari’s native companion messaging. Browser can use bundled content-blocker rules separately.")
@@ -76,7 +79,7 @@ struct BrowserSettings: View {
                     Text("Load an unpacked Web Extension, ZIP, Safari extension app, or content-blocker JSON.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Bundled 1Blocker rules are snapshots. Development → Import Extension can load updated rules. Safari’s live settings, custom rules, and companion features do not sync.")
+                Text("Bundled content-blocker rules refresh from the installed app when Browser starts or checks for extensions. Categories containing only placeholders are not active. Safari’s live settings, custom rules, and companion features do not sync.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let error = extensions.lastError {
                     Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
@@ -104,7 +107,9 @@ struct ExtensionButton: View {
 
     var body: some View {
         let _ = extensions.actionRevision
-        if let context = extensions.context(for: item), let action = context.action(for: browser.activeTab) {
+        if item.kind == .contentBlocker {
+            ContentBlockerButton(item: item, browser: browser)
+        } else if let context = extensions.context(for: item), let action = context.action(for: browser.activeTab) {
             Button {
                 BrowserExtensions.shared.focus(browser)
                 guard let tab = browser.activeTab else { return }
@@ -128,9 +133,9 @@ struct ExtensionButton: View {
                     }
                 }
             }
-            .labelStyle(.iconOnly)
+            .labelStyle(ChromeToolbarLabelStyle())
             .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .buttonStyle(ChromeToolbarButtonStyle())
+        .chromeToolbarButtonStyle()
         .controlSize(.regular)
             .disabled(!action.isEnabled || browser.activeTab == nil)
             .help(action.label.isEmpty ? item.name : action.label)

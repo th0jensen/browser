@@ -23,5 +23,8 @@ final class AddressToolbarView<Content: View>: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var intrinsicContentSize: NSSize { NSSize(width: 160, height: BrowserChrome.toolbarHeight) }
     override var fittingSize: NSSize { intrinsicContentSize }
-    override func layout() { super.layout(); host.frame = bounds }
+    override func layout() {
+        super.layout()
+        if host.frame != bounds { host.frame = bounds }
+    }
 }

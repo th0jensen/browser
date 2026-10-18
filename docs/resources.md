@@ -178,6 +178,23 @@ benchmark windows. Apple documents Instruments memory investigation in
 [Gathering information about memory
 use](https://developer.apple.com/documentation/xcode/gathering-information-about-memory-use).
 
+## Chrome reveal latency
+
+`scripts/benchmark.sh LABEL /absolute/derived-data reveal` runs the chrome-only
+comparison. The full benchmark includes the same reveal phase. Apply the same
+passive `ChromePresentationMarker` to the frozen baseline's floating sidebar and
+use identical harness files in both source trees.
+
+Each sample starts after three display callbacks observe both regions hidden.
+The attached production pointer tracker's edge callback starts the clock. The
+first-visible result requires a committed native presentation layer intersecting
+the window with inherited opacity above 0.01. The fully-visible result requires
+opacity of at least 0.99, at least 99% of the geometry inside the window, and
+native/presentation geometry stable for three display callbacks. These windowed
+measurements exclude OS input dispatch before the tracker callback and include
+display callback quantization; they do not establish physical GPU presentation
+or fullscreen latency. The toolbar and sidebar must reveal independently.
+
 ## Startup scope
 
 The existing harness measures operations after the XCTest host has launched.

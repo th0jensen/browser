@@ -11,17 +11,37 @@ struct BrowserWindow: View {
     @State private var restoreAddressFocusAfterFullscreen = false
     @State private var chromeHover: ChromeHoverController
     @State private var sidebarIsResizing = false
+    @State private var sidebarWidthState = SidebarWidthState()
     @State private var browserWindow = BrowserWindowReference()
     @State private var toolbarPrefix = BrowserProfile.isTesting ? "BrowserToolbar.tests.\(UUID())" : "BrowserToolbar.v5"
+    @AppStorage(ChromeCustomization.toolbarLabelStyleKey) private var toolbarLabelStyle = ToolbarLabelStyle.iconOnly
     @FocusState private var addressIsFocused: Bool
+    @Environment(\.openSettings) private var openSettings
     @AppStorage(BookmarksBarVisibility.storageKey) private var bookmarksBarVisibility = BookmarksBarVisibility.always
     @AppStorage(CompactToolbar.storageKey) private var compactToolbar = false
     @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
     @AppStorage(SidebarVisibility.autoHideKey) private var autoHideSidebar = false
-    @AppStorage(ChromeCustomization.widthKey) private var sidebarWidth = Double(BrowserChrome.sidebarWidth)
+    @AppStorage(ChromeCustomization.widthKey) private var savedSidebarWidth = Double(BrowserChrome.sidebarWidth)
     @AppStorage(ChromeCustomization.bookmarkButtonKey) private var showsBookmarkButton = true
 
     private let accent = Color(red: 0.38, green: 0.49, blue: 0.54)
+
+    // The saved width supplies the first layout directly, including a window's injected defaults store.
+    // Pointer movement stays in memory; the preference is written once when the drag ends.
+    private var sidebarWidth: Double { sidebarWidthState.width(saved: savedSidebarWidth) }
+    private var sidebarWidthBinding: Binding<Double> {
+        Binding(get: { sidebarWidth }, set: { width in
+            if let widthToSave = sidebarWidthState.update(width, isResizing: sidebarIsResizing),
+               savedSidebarWidth != widthToSave {
+                savedSidebarWidth = widthToSave
+            }
+        })
+    }
+
+    private func persistSidebarWidth() {
+        guard let width = sidebarWidthState.finish() else { return }
+        if savedSidebarWidth != width { savedSidebarWidth = width }
+    }
 
     init(bookmarks: BookmarkStore, downloads: DownloadManager) {
         self.bookmarks = bookmarks
@@ -36,38 +56,46 @@ struct BrowserWindow: View {
     }
 
     var body: some View {
-        // The main column keeps one identity across layouts, so switching layouts doesn't rebuild the page host.
+        // Keep the page host stable while the existing native chrome is shown or hidden.
         HStack(spacing: 0) {
             if tabLayout == .vertical && !autoHideSidebar {
                 TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
-                         hoverCardTabID: $hoverCardTabID, customize: { ChromeCustomization.customizeToolbar(in: browser.window) })
+                         hoverCardTabID: $hoverCardTabID)
                     .frame(width: sidebarWidth)
-                    .overlay(alignment: .trailing) { SidebarResizeHandle(width: $sidebarWidth, isResizing: $sidebarIsResizing) }
+                    .overlay(alignment: .trailing) { SidebarResizeHandle(width: sidebarWidthBinding, isResizing: $sidebarIsResizing) }
                     .transition(.move(edge: .leading).combined(with: .opacity))
             }
             mainColumn
         }
         .overlay(alignment: .leading) {
-            if tabLayout == .vertical && autoHideSidebar && chromeHover.sidebarIsRevealed {
-                TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
-                         hoverCardTabID: $hoverCardTabID, floating: true, customize: { ChromeCustomization.customizeToolbar(in: browser.window) })
+            if tabLayout == .vertical && autoHideSidebar {
+                ChromeRevealRegion(controller: chromeHover, region: .sidebar) {
+                    TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
+                         hoverCardTabID: $hoverCardTabID, floating: true)
                     .frame(width: sidebarWidth)
-                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: BrowserChrome.sidebarCornerRadius, style: .continuous))
-                    .shadow(color: .black.opacity(0.18), radius: 18, y: 6)
-                    .overlay(alignment: .trailing) { SidebarResizeHandle(width: $sidebarWidth, isResizing: $sidebarIsResizing) }
-                    .padding([.leading, .bottom], BrowserChrome.edgeInset)
-                    .padding(.top, BrowserChrome.edgeInset)
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+                    .background(ChromePresentationMarker(identifier: "BrowserFloatingSidebarGeometry", onViewAvailable: { view in
+                        chromeHover.sidebarBoundsProvider = { [weak view] in view?.regionBounds }
+                    }))
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous))
+                    .shadow(color: .black.opacity(0.14), radius: BrowserChrome.edgeInset, y: 4)
+                    .overlay(alignment: .trailing) { SidebarResizeHandle(width: sidebarWidthBinding, isResizing: $sidebarIsResizing) }
+                    .padding([.horizontal, .bottom], BrowserChrome.revealInset)
+                    .modifier(SidebarToolbarInset(controller: chromeHover, outerInset: BrowserChrome.revealInset))
+                }
             }
         }
-        .ignoresSafeArea(.container, edges: compactToolbar ? .top : [])
+        .ignoresSafeArea(.container, edges: effectiveCompactToolbar ? .top : [])
         .overlay(alignment: .top) {
-            if usesFullscreenToolbarOverlay && chromeHover.toolbarIsRevealed && !chromeHover.customizationIsRunning {
-                fullscreenToolbar
+            if usesFullscreenToolbarOverlay {
+                ChromeRevealRegion(controller: chromeHover, region: .toolbar) {
+                    fullscreenToolbar
+                }
             }
         }
         .background(ChromePointerObserver(controller: chromeHover))
+        .background(BrowserShortcutRouter())
         .background(SessionPersistenceView(browser: browser))
+        .modifier(FolderEditorPresentation(browser: browser, controller: chromeHover, verticalTabs: tabLayout == .vertical))
         .overlayPreferenceValue(TabFrameKey.self) { tabFrames in
             hoverCard(tabFrames: tabFrames)
         }
@@ -76,33 +104,55 @@ struct BrowserWindow: View {
             chromeHover.autoHideSidebar = value
             hoverCardTabID = nil
         }
-        .onChange(of: sidebarIsResizing) { _, value in chromeHover.sidebarIsResizing = value }
+        .onChange(of: sidebarIsResizing) { _, value in
+            chromeHover.sidebarIsResizing = value
+            if !value { persistSidebarWidth() }
+        }
         .onChange(of: sidebarWidth) { _, value in chromeHover.sidebarWidth = value }
         .onChange(of: tabLayout) { _, value in
             chromeHover.verticalTabs = value == .vertical
-            chromeHover.headerHeight = value == .vertical ? 40 : 64
+            chromeHover.headerHeight = (value == .vertical ? 40 : 64) + (isFullScreen ? 8 : 0)
             hoverCardTabID = nil
         }
-        .onChange(of: browser.addressFocusRequest) { _, _ in chromeHover.revealToolbar() }
+        .onChange(of: browser.addressFocusRequest) { _, request in
+            if request != browser.consumedAddressFocusRequest { chromeHover.addressFocusRequested() }
+        }
         .onChange(of: isFullScreen) { _, _ in
+            chromeHover.headerHeight = (tabLayout == .vertical ? 40 : 64) + (isFullScreen ? 8 : 0)
             let restore = restoreAddressFocusAfterFullscreen && compactToolbar
             restoreAddressFocusAfterFullscreen = false
             if restore { browser.requestAddressFocus() }
         }
         .background(WindowGlassBackground().ignoresSafeArea())
         .background(WindowChromeConfigurator(tabLayout: tabLayout, horizontalTabs: AnyView(horizontalTabs),
-                                             isFullScreen: $isFullScreen, compactToolbar: compactToolbar,
-                                             toolbarIsRevealed: chromeHover.toolbarIsRevealed,
+                                             isFullScreen: $isFullScreen, compactToolbar: effectiveCompactToolbar,
+                                             hoverController: chromeHover,
+                                             nativeCommands: nativeToolbarCommands,
+                                             toolbarDisplayMode: toolbarLabelStyle.nativeDisplayMode,
+                                             toolbarContextMenu: { NSHostingMenu(rootView: ToolbarContextMenu(
+                                                 customize: { ChromeCustomization.customizeToolbar(in: browser.window) },
+                                                 browser: browser, window: browser.window)) },
                                              onCustomizationChange: { chromeHover.customizationIsRunning = $0 },
-                                             onToolbarItemsChange: { toolbarItemIdentifiers = $0 }, onWindowChange: { browser.window = $0; browserWindow = BrowserWindowReference(window: $0) }))
+                                             onToolbarItemsChange: { toolbarItemIdentifiers = $0 }, onWindowChange: { browser.window = $0; browserWindow = BrowserWindowReference(window: $0) },
+                                             onToolbarRegionHeight: { height in
+                                                 DispatchQueue.main.async {
+                                                     if !isFullScreen { chromeHover.headerHeight = height - BrowserChrome.edgeInset }
+                                                 }
+                                             }))
         .tint(accent)
         .focusedSceneValue(\.browserModel, browser)
+        .navigationTitle(browser.activeTab?.title ?? "Browser")
         .frame(minWidth: 680, minHeight: 440)
         .toolbar(id: "\(toolbarPrefix).\(tabLayout.rawValue)") { browserToolbar }
         .environment(\.chromeHoverController, chromeHover)
-        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
         .onChange(of: browser.activeTabID) { _, _ in
+            chromeHover.activeTabChanged()
             address = browser.activeTab?.url?.absoluteString ?? ""
+            if let tab = browser.activeTab, !tab.isNewTab, let webView = tab.webView,
+               PagePaintObserver.shared.hasPainted(in: webView) {
+                chromeHover.navigationSucceeded(in: tab.id)
+            }
         }
         .onOpenURL { browser.open($0) }
         .task {
@@ -111,6 +161,7 @@ struct BrowserWindow: View {
             if browser.activeTab?.isNewTab == true { browser.requestAddressFocus() }
         }
         .onDisappear {
+            persistSidebarWidth()
             chromeHover.stop()
             BrowserExtensions.shared.unregister(browser)
         }
@@ -124,6 +175,11 @@ struct BrowserWindow: View {
             if let window = notification.object as? NSWindow, browser.window === window {
                 BrowserExtensions.shared.focus(browser)
                 BrowserSessionStore.shared.didFocus(browser)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { notification in
+            if let window = notification.object as? NSWindow, browser.window === window {
+                chromeHover.addressIsFocused = false
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)) { _ in
@@ -166,25 +222,48 @@ struct BrowserWindow: View {
         restoreAddressFocusAfterFullscreen = addressIsFocused || chromeHover.addressIsFocused
     }
 
-    private var usesFullscreenToolbarOverlay: Bool { compactToolbar && isFullScreen }
+    // Horizontal tabs and pinned sidebars reveal the complete native header and
+    // its safe area. Only the vertical auto-hide layout uses floating overlay chrome.
+    private var effectiveCompactToolbar: Bool {
+        compactToolbar && !((tabLayout == .horizontal || !autoHideSidebar) && chromeHover.toolbarIsRevealed)
+    }
+
+    private var usesFullscreenToolbarOverlay: Bool { effectiveCompactToolbar && isFullScreen }
 
     private var fullscreenToolbar: some View {
         VStack(spacing: BrowserChrome.edgeInset) {
             if tabLayout == .horizontal {
-                horizontalTabs
-                    .frame(height: BrowserChrome.tabRowHeight)
-                    .glassEffect(.regular, in: Capsule())
-            }
-            FullscreenToolbarRow(identifiers: toolbarItemIdentifiers,
-                                 focusRequest: browser.addressFocusRequest == browser.consumedAddressFocusRequest ? 0 : browser.addressFocusRequest) { identifier in
-                fullscreenToolbarControl(identifier)
-            } address: {
-                addressField(requiresVisibleToolbar: false)
+                HStack(spacing: BrowserChrome.edgeInset) {
+                    FullscreenWindowControls(window: browserWindow.window)
+                        .fixedSize(horizontal: true, vertical: false)
+                    horizontalTabs
+                        .glassEffect(.regular, in: Capsule())
+                }
+                .frame(height: BrowserChrome.tabRowHeight)
+                fullscreenNavigationRow
+            } else {
+                HStack(spacing: BrowserChrome.edgeInset) {
+                    FullscreenWindowControls(window: browserWindow.window)
+                        .fixedSize(horizontal: true, vertical: false)
+                    fullscreenNavigationRow
+                }
+                .frame(height: toolbarLabelStyle.chromeControlHeight + BrowserChrome.edgeInset * 2)
             }
         }
-        .padding(BrowserChrome.edgeInset)
+        .padding(.horizontal, BrowserChrome.revealInset)
+        .padding(.top, BrowserChrome.edgeInset)
+        .padding(.bottom, BrowserChrome.edgeInset)
         .environment(\.fullscreenToolbarOverlay, true)
-        .contextMenu { ChromeCustomizationMenu { ChromeCustomization.customizeToolbar(in: browser.window) } }
+        .contextMenu { ToolbarContextMenu(customize: { ChromeCustomization.customizeToolbar(in: browser.window) }, browser: browser, window: browser.window) }
+    }
+
+    private var fullscreenNavigationRow: some View {
+        FullscreenToolbarRow(identifiers: toolbarItemIdentifiers,
+                             focusRequest: browser.addressFocusRequest == browser.consumedAddressFocusRequest ? 0 : browser.addressFocusRequest) { identifier in
+            fullscreenToolbarControl(identifier)
+        } address: {
+            addressField(requiresVisibleToolbar: false)
+        }
     }
 
     @ViewBuilder
@@ -198,6 +277,7 @@ struct BrowserWindow: View {
         case "reload": navigationButton(.reload)
         case "downloads": toolbarComponent(.downloads)
         case "pins": PinnedPagesButton(browser: browser)
+        case "folders": FolderToolbarButton(browser: browser)
         case "settings": toolbarComponent(.settings)
         case "newTab": toolbarComponent(.newTab)
         default:
@@ -209,8 +289,7 @@ struct BrowserWindow: View {
 
     private var horizontalTabs: some View {
         TabStrip(browser: browser, layout: .horizontal, isFullScreen: isFullScreen,
-                 hoverCardTabID: $hoverCardTabID, usesNativeHoverPopover: true, floating: usesFullscreenToolbarOverlay,
-                 customize: { ChromeCustomization.customizeToolbar(in: browser.window) })
+                 hoverCardTabID: $hoverCardTabID, usesNativeHoverPopover: true, floating: usesFullscreenToolbarOverlay)
             .frame(maxHeight: .infinity, alignment: .top)
             .tint(accent)
     }
@@ -225,7 +304,7 @@ struct BrowserWindow: View {
         return VStack(spacing: 0) {
             if bookmarksBarVisibility.isVisible(onNewTab: browser.activeTab?.isNewTab ?? true) {
                 BookmarksBar(bookmarks: bookmarks, browser: browser)
-                    .contextMenu { ChromeCustomizationMenu { ChromeCustomization.customizeToolbar(in: browser.window) } }
+                    .contextMenu { BookmarksBehaviorMenu() }
                     .padding(.leading, leadingInset - BrowserChrome.edgeInset)
                     .padding(.bottom, BrowserChrome.edgeInset)
                     .transition(.opacity)
@@ -251,20 +330,16 @@ struct BrowserWindow: View {
     }
 
     private func hoverCard(tabFrames: [UUID: Anchor<CGRect>]) -> some View {
-        GeometryReader { geometry in
+        Group {
             if tabLayout == .vertical, let tab = browser.tab(withID: hoverCardTabID), let anchor = tabFrames[tab.id] {
-                let tabFrame = geometry[anchor]
-                let position = tabLayout == .vertical
-                    // Beside the sidebar row, kept clear of the window's bottom edge.
-                    ? CGPoint(x: tabFrame.maxX + 10,
-                              y: max(BrowserChrome.edgeInset, min(tabFrame.minY - 4, geometry.size.height - 250)))
-                    : CGPoint(x: min(max(tabFrame.minX, BrowserChrome.edgeInset),
-                                     geometry.size.width - TabHoverCard.width - BrowserChrome.edgeInset),
-                              y: tabFrame.maxY + 6)
-                TabHoverCard(tab: tab, isActive: tab.id == browser.activeTabID)
-                    .offset(x: position.x, y: position.y)
-                    .transition(tabLayout == .vertical ? .opacity.combined(with: .offset(x: -3))
-                                                       : .opacity.combined(with: .offset(y: -3)))
+                GeometryReader { geometry in
+                    let tabFrame = geometry[anchor]
+                    let position = CGPoint(x: tabFrame.maxX + 10,
+                                           y: max(BrowserChrome.edgeInset, min(tabFrame.minY - 4, geometry.size.height - 250)))
+                    TabHoverCard(tab: tab, isActive: tab.id == browser.activeTabID)
+                        .offset(x: position.x, y: position.y)
+                        .transition(.opacity.combined(with: .offset(x: -3)))
+                }
             }
         }
         .allowsHitTesting(false)
@@ -336,14 +411,19 @@ struct BrowserWindow: View {
             ToolbarItem(id: "extension.\(item.id.uuidString)", placement: .automatic) { ExtensionButton(item: item, browser: browser) }
                 .sharedBackgroundVisibility(.automatic)
         }
-        ToolbarItem(id: "pins", placement: .automatic) { PinnedPagesButton(browser: browser) }
-            .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
-            .sharedBackgroundVisibility(.automatic)
-        ToolbarItem(id: "settings", placement: .automatic) { toolbarComponent(.settings) }
-            .sharedBackgroundVisibility(.automatic)
-        ToolbarItem(id: "newTab", placement: .automatic) { toolbarComponent(.newTab) }
-            .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
-            .sharedBackgroundVisibility(.automatic)
+        Group {
+            ToolbarItem(id: "pins", placement: .automatic) { PinnedPagesButton(browser: browser) }
+                .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
+                .sharedBackgroundVisibility(.automatic)
+            ToolbarItem(id: "folders", placement: .automatic) { FolderToolbarButton(browser: browser) }
+                .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
+                .sharedBackgroundVisibility(.automatic)
+            ToolbarItem(id: "settings", placement: .automatic) { toolbarComponent(.settings) }
+                .sharedBackgroundVisibility(.automatic)
+            ToolbarItem(id: "newTab", placement: .automatic) { toolbarComponent(.newTab) }
+                .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
+                .sharedBackgroundVisibility(.automatic)
+        }
         Group {
             ToolbarItem(id: NSToolbarItem.Identifier.space.rawValue, placement: .automatic) {
                 Color.clear.frame(width: 20, height: 1).accessibilityLabel("Space")
@@ -371,51 +451,45 @@ struct BrowserWindow: View {
     private func toolbarComponent(_ component: ToolbarComponent) -> some View {
         switch component {
         case .sidebar:
-            Button {
-                if tabLayout == .horizontal { tabLayout = .vertical }
-                else if autoHideSidebar {
-                    chromeHover.toggleSidebarFromToolbar()
-                }
-                else { autoHideSidebar = true }
-            } label: { Label("Sidebar", systemImage: "sidebar.left") }
-                .labelStyle(.iconOnly)
+            Button(action: toggleSidebar) { Label("Sidebar", systemImage: "sidebar.left") }
+                .labelStyle(ChromeToolbarLabelStyle())
                 .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-                .buttonStyle(ChromeToolbarButtonStyle())
+                .chromeToolbarButtonStyle()
                 .controlSize(.regular)
-                .help(autoHideSidebar ? "Show Sidebar (hover the left edge); Pin Sidebar (⌃⌘S)" : "Automatically Hide Sidebar (⌃⌘S)")
+                .help(autoHideSidebar ? "Show Sidebar (hover the left edge); Pin Sidebar (⌘S)" : "Automatically Hide Sidebar (⌘S)")
                 .accessibilityLabel("Sidebar")
         case .tabLayout:
             Button { tabLayout = tabLayout.toggled } label: {
                 Label("Tab Layout", systemImage: tabLayout == .vertical ? "rectangle.topthird.inset.filled" : "sidebar.left")
             }
-            .labelStyle(.iconOnly)
+            .labelStyle(ChromeToolbarLabelStyle())
             .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-            .buttonStyle(ChromeToolbarButtonStyle())
+            .chromeToolbarButtonStyle()
             .controlSize(.regular)
             .help(tabLayout == .vertical ? "Use Horizontal Tabs (⌥⌘S)" : "Use Vertical Tabs (⌥⌘S)")
             .accessibilityLabel(tabLayout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs")
         case .pinSidebar:
             Button { autoHideSidebar.toggle() } label: { Label("Pin Sidebar", systemImage: autoHideSidebar ? "pin" : "pin.fill") }
-                .labelStyle(.iconOnly)
+                .labelStyle(ChromeToolbarLabelStyle())
                 .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-                .buttonStyle(ChromeToolbarButtonStyle())
+                .chromeToolbarButtonStyle()
                 .controlSize(.regular)
                 .disabled(tabLayout != .vertical)
-                .help(autoHideSidebar ? "Pin Sidebar (⌃⌘S)" : "Automatically Hide Sidebar (⌃⌘S)")
+                .help(autoHideSidebar ? "Pin Sidebar (⌘S)" : "Automatically Hide Sidebar (⌘S)")
         case .newTab:
             Button { browser.addTab() } label: { Label("New Tab", systemImage: "plus") }
-                .labelStyle(.iconOnly)
+                .labelStyle(ChromeToolbarLabelStyle())
                 .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-                .buttonStyle(ChromeToolbarButtonStyle())
+                .chromeToolbarButtonStyle()
                 .controlSize(.regular)
                 .help("New Tab (⌘T)").accessibilityLabel("New Tab")
         case .downloads:
             DownloadsButton(downloads: browser.downloads)
         case .settings:
             SettingsLink { Label("Settings", systemImage: "gearshape") }
-                .labelStyle(.iconOnly)
+                .labelStyle(ChromeToolbarLabelStyle())
                 .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-                .buttonStyle(ChromeToolbarButtonStyle())
+                .chromeToolbarButtonStyle()
                 .controlSize(.regular)
                 .help("Settings")
                 .accessibilityLabel("Settings")
@@ -423,6 +497,72 @@ struct BrowserWindow: View {
     }
 
     private enum NavigationAction: String { case back = "Back", forward = "Forward", reload = "Reload" }
+
+    private func toggleSidebar() {
+        if tabLayout == .horizontal { tabLayout = .vertical }
+        else if autoHideSidebar { chromeHover.toggleSidebarFromToolbar() }
+        else { autoHideSidebar = true }
+    }
+
+    private func performNavigation(_ action: NavigationAction) {
+        switch action {
+        case .back: browser.goBack()
+        case .forward: browser.goForward()
+        case .reload:
+            if browser.activeTab?.isLoading == true { browser.stopLoading() }
+            else { browser.reload() }
+        }
+    }
+
+    // SwiftUI retains the toolbar's canonical items and customization palette. Fixed
+    // commands use native views so window resizing doesn't remeasure their hosting views.
+    private var nativeToolbarCommands: [NativeToolbarCommand] {
+        let tab = browser.activeTab
+        let isLoading = tab?.isLoading == true
+        let customizationMenu: @MainActor () -> NSMenu = {
+            NSHostingMenu(rootView: ToolbarContextMenu(customize: {
+                ChromeCustomization.customizeToolbar(in: browser.window)
+            }, browser: browser, window: browser.window))
+        }
+        var commands = [
+            NativeToolbarCommand(identifier: "sidebar", title: "Sidebar", symbol: "sidebar.left",
+                                 help: autoHideSidebar ? "Show Sidebar (hover the left edge); Pin Sidebar (⌘S)" : "Automatically Hide Sidebar (⌘S)",
+                                 action: toggleSidebar, menu: customizationMenu),
+            NativeToolbarCommand(identifier: "layout", title: "Tab Layout",
+                                 symbol: tabLayout == .vertical ? "rectangle.topthird.inset.filled" : "sidebar.left",
+                                 help: tabLayout == .vertical ? "Use Horizontal Tabs (⌥⌘S)" : "Use Vertical Tabs (⌥⌘S)",
+                                 action: { tabLayout = tabLayout.toggled }, menu: customizationMenu),
+            NativeToolbarCommand(identifier: "pinSidebar", title: "Pin Sidebar", symbol: autoHideSidebar ? "pin" : "pin.fill",
+                                 help: autoHideSidebar ? "Pin Sidebar (⌘S)" : "Automatically Hide Sidebar (⌘S)",
+                                 isEnabled: tabLayout == .vertical, action: { autoHideSidebar.toggle() }, menu: customizationMenu),
+            NativeToolbarCommand(identifier: "settings", title: "Settings", symbol: "gearshape",
+                                 action: { openSettings() }, menu: customizationMenu),
+            NativeToolbarCommand(identifier: "newTab", title: "New Tab", symbol: "plus", help: "New Tab (⌘T)",
+                                 action: { browser.addTab() }, menu: customizationMenu)
+        ]
+        for action in [NavigationAction.back, .forward, .reload] {
+            let symbol = switch action {
+            case .back: "chevron.left"
+            case .forward: "chevron.right"
+            case .reload: isLoading ? "xmark" : "arrow.clockwise"
+            }
+            let enabled = switch action {
+            case .back: tab?.canNavigateBack ?? false
+            case .forward: tab?.canGoForward ?? false
+            case .reload: !(tab?.isNewTab ?? true)
+            }
+            let title = action == .reload && isLoading ? "Stop Loading" : action.rawValue
+            commands.append(NativeToolbarCommand(identifier: action.rawValue.lowercased(), title: title, symbol: symbol,
+                                                 help: title, isEnabled: enabled, action: { performNavigation(action) }, menu: {
+                switch action {
+                case .back: NSHostingMenu(rootView: historyMenu(for: Array((browser.activeTab?.backList ?? []).reversed())))
+                case .forward: NSHostingMenu(rootView: historyMenu(for: browser.activeTab?.forwardList ?? []))
+                case .reload: customizationMenu()
+                }
+            }))
+        }
+        return commands
+    }
 
     private func navigationButton(_ action: NavigationAction) -> some View {
         let tab = browser.activeTab
@@ -437,20 +577,13 @@ struct BrowserWindow: View {
         case .forward: !(tab?.canGoForward ?? false)
         case .reload: tab?.isNewTab ?? true
         }
-        return Button {
-            switch action {
-            case .back: browser.goBack()
-            case .forward: browser.goForward()
-            case .reload:
-                if isLoading { browser.stopLoading() } else { browser.reload() }
-            }
-        } label: {
+        return Button { performNavigation(action) } label: {
             Label(action == .reload && isLoading ? "Stop Loading" : action.rawValue, systemImage: symbol)
                 .contentTransition(.symbolEffect(.replace))
         }
-        .labelStyle(.iconOnly)
+        .labelStyle(ChromeToolbarLabelStyle())
         .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .buttonStyle(ChromeToolbarButtonStyle())
+        .chromeToolbarButtonStyle()
         .controlSize(.regular)
         .disabled(isDisabled)
         .help(action == .reload && isLoading ? "Stop Loading" : action.rawValue)
@@ -458,7 +591,7 @@ struct BrowserWindow: View {
             switch action {
             case .back: historyMenu(for: Array((tab?.backList ?? []).reversed()))
             case .forward: historyMenu(for: tab?.forwardList ?? [])
-            case .reload: ChromeCustomizationMenu { ChromeCustomization.customizeToolbar(in: browser.window) }
+            case .reload: ToolbarContextMenu(customize: { ChromeCustomization.customizeToolbar(in: browser.window) }, browser: browser, window: browser.window)
             }
         }
     }
@@ -473,12 +606,16 @@ struct BrowserWindow: View {
                 .frame(width: 14)
             AddressTextField(text: $address,
                              requiresVisibleToolbar: requiresVisibleToolbar,
+                             pageURL: browser.activeTab?.isNewTab == false ? browser.activeTab?.url : nil,
+                             pageTitle: browser.activeTab?.pageTitle ?? "",
                              focusRequest: browser.addressFocusRequest == browser.consumedAddressFocusRequest ? 0 : browser.addressFocusRequest,
                              onFocusApplied: { browser.consumedAddressFocusRequest = $0 },
                              onFocusChange: {
                                  addressIsFocused = $0
                                  chromeHover.addressIsFocused = $0
                              }, onSubmit: {
+                guard BrowserAddress.url(for: address) != nil, let tabID = browser.activeTabID else { return }
+                chromeHover.addressNavigationSubmitted(in: tabID)
                 browser.navigate(to: address)
                 browser.window?.makeFirstResponder(browser.activeTab?.webView)
                 chromeHover.addressIsFocused = false
@@ -493,7 +630,7 @@ struct BrowserWindow: View {
             Capsule()
                 .strokeBorder(addressIsFocused ? accent.opacity(0.7) : Color.clear, lineWidth: 1)
         }
-        .contextMenu { ChromeCustomizationMenu { ChromeCustomization.customizeToolbar(in: browser.window) } }
+        .contextMenu { ToolbarContextMenu(customize: { ChromeCustomization.customizeToolbar(in: browser.window) }, browser: browser, window: browser.window) }
     }
 
     @ViewBuilder
@@ -508,7 +645,7 @@ struct BrowserWindow: View {
             .buttonStyle(ChromeIconButtonStyle(size: 20))
             .help(isBookmarked ? "Remove Bookmark (⌘D)" : "Bookmark This Page (⌘D)")
             .accessibilityLabel(isBookmarked ? "Remove Bookmark" : "Bookmark This Page")
-            .contextMenu { ChromeCustomizationMenu { ChromeCustomization.customizeToolbar(in: browser.window) } }
+            .contextMenu { ToolbarContextMenu(customize: { ChromeCustomization.customizeToolbar(in: browser.window) }, browser: browser, window: browser.window) }
         }
     }
 
@@ -519,6 +656,6 @@ struct BrowserWindow: View {
                 browser.go(to: item)
             }
         }
-        ChromeCustomizationMenu { ChromeCustomization.customizeToolbar(in: browser.window) }
+        if items.isEmpty { Text("No History") }
     }
 }

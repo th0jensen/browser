@@ -29,9 +29,9 @@ struct DownloadsButton: View {
                 .frame(width: 16, height: 16)
             }
         }
-        .labelStyle(.iconOnly)
+        .labelStyle(ChromeToolbarLabelStyle())
         .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
-        .buttonStyle(ChromeToolbarButtonStyle())
+        .chromeToolbarButtonStyle()
         .controlSize(.regular)
         .help("Downloads")
         .accessibilityLabel("Downloads")

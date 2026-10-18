@@ -1,0 +1,120 @@
+{
+  "manifest_version": 3,
+  "name": "Ambient light for YouTube™",
+  "description": "Immerse yourself in YouTube™ videos with ambient light!",
+  "version": "2.38.17.2",
+  "homepage_url": "https://github.com/WesselKroos/youtube-ambilight",
+  "author": "Wessel Kroos",
+  "icons": {
+    "16": "images/icon-16.png",
+    "32": "images/icon-32.png",
+    "128": "images/icon-128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "images/icon-16.png",
+      "24": "images/icon-24.png",
+      "32": "images/icon-32.png"
+    },
+    "default_popup": "options.html"
+  },
+  "background": {
+    "service_worker": "scripts/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "exclude_matches": [
+        "https://www.youtube.com/live_chat*",
+        "https://www.youtube.com/embed/*"
+      ],
+      "js": [
+        "scripts/injected.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "exclude_matches": [
+        "https://www.youtube.com/live_chat*",
+        "https://www.youtube.com/embed/*"
+      ],
+      "js": [
+        "scripts/content.js",
+        "scripts/content-main.js"
+      ],
+      "run_at": "document_start",
+      "css": [
+        "styles/content.css"
+      ],
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://www.youtube.com/embed/*"
+      ],
+      "js": [
+        "scripts/injected.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.youtube.com/embed/*"
+      ],
+      "js": [
+        "scripts/content.js",
+        "scripts/content-main.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start",
+      "css": [
+        "styles/content.css"
+      ],
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://www.youtube.com/live_chat*"
+      ],
+      "exclude_matches": [
+        "https://www.youtube.com/live_chat?is_popout=1*"
+      ],
+      "css": [
+        "styles/live-chat.css"
+      ],
+      "js": [
+        "scripts/live-chat.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "images/noise-1.png",
+        "images/noise-2.png",
+        "images/noise-3.png",
+        "images/donate.svg"
+      ],
+      "matches": [
+        "https://www.youtube.com/*"
+      ]
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  },
+  "permissions": [
+    "storage"
+  ]
+}

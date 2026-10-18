@@ -1,10 +1,8 @@
-#if DEBUG
 import AppKit
 import WebKit
 
 /// WebKit only enables the Web Inspector through Safari's Develop menu, so these hooks use private API.
 /// Every selector is checked first, so the Inspector just stays unavailable if WebKit changes.
-/// App Store review rejects private API, so only debug builds include it.
 @MainActor
 enum WebInspector {
     /// Adds Inspect Element to the page's context menu.
@@ -37,4 +35,3 @@ enum WebInspector {
         return webView.perform(inspectorSelector)?.takeUnretainedValue() as? NSObject
     }
 }
-#endif

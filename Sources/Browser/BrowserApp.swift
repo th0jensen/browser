@@ -3,8 +3,10 @@ import Darwin
 
 @main
 struct BrowserApp: App {
+    @NSApplicationDelegateAdaptor(BrowserApplicationDelegate.self) private var applicationDelegate
     @State private var bookmarks = BookmarkStore()
     @State private var downloads = DownloadManager()
+    @AppStorage(ChromeCustomization.toolbarLabelStyleKey) private var toolbarLabelStyle = ToolbarLabelStyle.iconOnly
 
     init() {
         // Deployment initializes the canonical sandbox before copying an older debug profile into it.
@@ -27,11 +29,23 @@ struct BrowserApp: App {
         }
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
+        .windowToolbarLabelStyle($toolbarLabelStyle)
         .commands {
             ToolbarCommands()
             BrowserCommands(bookmarks: bookmarks)
         }
         Settings { BrowserSettings() }
+    }
+}
+
+private final class BrowserApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Both build variants share a bundle identity. Use this bundle's icon for
+        // the running app rather than a cached icon from the other variant.
+        guard let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
+              let url = Bundle.main.url(forResource: name, withExtension: nil),
+              let icon = NSImage(contentsOf: url) else { return }
+        NSApp.applicationIconImage = icon
     }
 }
 
@@ -74,6 +88,15 @@ private struct BrowserCommands: Commands {
                 .disabled(browser?.activeTab?.isNewTab != false)
         }
         CommandMenu("Tabs") {
+            Button("New Folder…") { browser?.requestNewFolder() }
+            if let browser, !browser.folders.pages.isEmpty {
+                Menu("Saved Folder Pages") {
+                    ForEach(browser.folders.pages) { page in
+                        Button(page.title) { browser.openFolderPage(page) }
+                    }
+                }
+            }
+            Divider()
             Button("Pin Webpage") {
                 if let browser, let tab = browser.activeTab { browser.pin(tab) }
             }
@@ -107,6 +130,8 @@ private struct BrowserCommands: Commands {
         CommandGroup(after: .toolbar) {
             Button("Open Location") { browser?.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
+            Button("Toggle Address Bar") { browser?.toggleAddressFocus() }
+                .keyboardShortcut("g", modifiers: .command)
             Button("Reload Page") { browser?.reload() }
                 .keyboardShortcut("r", modifiers: .command)
             Button("Back") { browser?.goBack() }
@@ -115,8 +140,10 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("]", modifiers: .command)
         }
         CommandGroup(after: .sidebar) {
-            Button(compactToolbar ? "Show Toolbar Permanently" : "Compact Toolbar") { compactToolbar.toggle() }
-                .keyboardShortcut("s", modifiers: .command)
+            Button(compactToolbar ? "Show Toolbar Permanently" : "Automatically Hide Toolbar") {
+                compactToolbar.toggle()
+            }
+                .keyboardShortcut("s", modifiers: [.command, .control])
             Button(tabLayout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs") {
                 tabLayout = tabLayout.toggled
             }
@@ -126,7 +153,7 @@ private struct BrowserCommands: Commands {
                 tabLayout = .vertical
                 autoHideSidebar = !isAutoHiding
             }
-            .keyboardShortcut("s", modifiers: [.command, .control])
+            .keyboardShortcut("s", modifiers: .command)
             Divider()
             Picker("Bookmarks Bar", selection: $bookmarksBarVisibility) {
                 ForEach(BookmarksBarVisibility.allCases) { visibility in
@@ -154,12 +181,10 @@ private struct BrowserCommands: Commands {
                 }
             }
         }
-        #if DEBUG
         CommandMenu("Develop") {
             Button("Show Web Inspector") { browser?.showWebInspector() }
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 .disabled(browser?.activeTab?.isNewTab != false)
         }
-        #endif
     }
 }

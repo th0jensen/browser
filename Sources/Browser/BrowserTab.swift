@@ -13,6 +13,7 @@ final class BrowserTab: NSObject, Identifiable {
     let contentView = NSView()
     var isNewTab = true
     var pinnedPageID: UUID?
+    var folderPageID: UUID?
     /// The tab whose page opened this one, so its links and pop-ups open next to each other.
     @ObservationIgnored var openerID: UUID?
     /// Whether another page's script opened this one, and can still reach it through `window.opener`.
@@ -69,6 +70,7 @@ final class BrowserTab: NSObject, Identifiable {
         faviconHost = url?.host()
         super.init()
         pageDelegate.tab = self
+        updateFavicon()
     }
 
     var isSuspended: Bool {
@@ -93,18 +95,21 @@ final class BrowserTab: NSObject, Identifiable {
         webView.navigationDelegate = pageDelegate
         webView.uiDelegate = pageDelegate
         self.webView = webView
+        PagePaintObserver.shared.install(in: webView, tab: self)
         BrowserExtensions.shared.updateRules(in: webView)
 
         let options: NSKeyValueObservingOptions = isRestoring ? [] : .initial
         observe(webView, \.url, options, updatesHistory: true) { tab, webView in
             tab.thumbnailCapture.invalidate()
             tab.url = tab.loadError?.url ?? webView.url
+            if tab.browser?.activeTabID == tab.id { tab.browser?.updateWindowTitle() }
             BrowserExtensions.shared.didChange(.URL, for: tab)
-            // Same-document navigations don't load, but can still change the icon.
-            if !webView.isLoading { tab.updateFavicon() }
+            // Fetch the host icon during navigation as well as same-document URL changes.
+            tab.updateFavicon()
         }
         observe(webView, \.title, options) {
             $0.pageTitle = $1.title ?? ""
+            if $0.browser?.activeTabID == $0.id { $0.browser?.updateWindowTitle() }
             BrowserExtensions.shared.didChange(.title, for: $0)
         }
         observe(webView, \.isLoading, options, updatesHistory: true) { tab, webView in
@@ -140,6 +145,7 @@ final class BrowserTab: NSObject, Identifiable {
         webView.removeFromSuperview()
         self.webView = nil
         isLoading = false
+        updateFavicon()
     }
 
     /// Recreates a suspended tab's web view with its history and scroll position, or loads its address.
@@ -163,9 +169,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// has no cheap way to ask; their history still restores.
     var canSuspend: Bool {
         guard let webView, !isNewTab, !isLoading, loadError == nil, selectionWaiters.isEmpty else { return false }
-        #if DEBUG
         if WebInspector.isOpen(for: webView) { return false }
-        #endif
         return webView.cameraCaptureState == .none && webView.microphoneCaptureState == .none
     }
 
@@ -215,9 +219,7 @@ final class BrowserTab: NSObject, Identifiable {
         configuration.applicationNameForUserAgent = safariApplicationName
         configuration.preferences.isElementFullscreenEnabled = true
         configuration.preferences.isTextInteractionEnabled = true
-        #if DEBUG
         WebInspector.enableDeveloperExtras(in: configuration)
-        #endif
     }
 
     /// Safari's installed version is stable during a browser session; resolve its bundle once for every tab.
@@ -286,6 +288,7 @@ final class BrowserTab: NSObject, Identifiable {
         }
         extensionOrigin = newContext?.baseURL
         self.url = url
+        updateFavicon()
         pageDelegate.isLoadingFromBrowser = true
         webView?.load(URLRequest(url: url))
     }
@@ -370,7 +373,8 @@ final class BrowserTab: NSObject, Identifiable {
         }
     }
 
-    /// Reads the icon from the loaded page, showing the host's last known icon until then.
+    /// Fetches the site's cached/default icon independently of the page, then
+    /// upgrades to its declared icon when a live document is available.
     private func updateFavicon() {
         faviconTask?.cancel()
         guard let url, let host = url.host(), url.scheme == "http" || url.scheme == "https" else {
@@ -382,7 +386,13 @@ final class BrowserTab: NSObject, Identifiable {
             faviconHost = host
             favicon = FaviconStore.cachedIcon(for: url)
         }
+        let needsSiteIcon = favicon == nil
         faviconTask = Task { [weak self] in
+            if needsSiteIcon, let icon = await FaviconStore.icon(for: url) {
+                guard !Task.isCancelled, self?.url == url else { return }
+                self?.favicon = icon
+            }
+            guard !Task.isCancelled, self?.webView?.isLoading == false else { return }
             // Pages often set their icon from script just after loading or changing their URL.
             try? await Task.sleep(for: .milliseconds(300))
             guard let self, !Task.isCancelled, let webView, !webView.isLoading, webView.url == url else { return }

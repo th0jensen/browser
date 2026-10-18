@@ -24,6 +24,8 @@ targets:
     platform: macOS
     sources:
       - path: Sources/Browser
+      - path: assets
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser
@@ -44,12 +46,24 @@ targets:
           PRODUCT_NAME: Browser-Debug
           PRODUCT_MODULE_NAME: Browser
           INFOPLIST_KEY_CFBundleDisplayName: Browser Debug
+          BROWSER_APP_ICON: Browser_Debug.icns
+          EXCLUDED_SOURCE_FILE_NAMES: Browser_Release.icns
         Release:
           PRODUCT_NAME: Browser
           PRODUCT_MODULE_NAME: Browser
+          BROWSER_APP_ICON: Browser_Release.icns
+          EXCLUDED_SOURCE_FILE_NAMES: Browser_Debug.icns
+          # Keep debug symbols in the dSYM, rather than shipping the linker symbol
+          # table in both architecture slices. Xcode strips before signing.
+          DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_INSTALLED_PRODUCT: YES
+          STRIP_STYLE: non-global
+          COPY_PHASE_STRIP: YES
     info:
       path: DerivedData/Browser-Info.plist
       properties:
+        CFBundleIconFile: $(BROWSER_APP_ICON)
         CFBundleURLTypes:
           - CFBundleURLName: Web URLs
             CFBundleURLSchemes: [http, https]

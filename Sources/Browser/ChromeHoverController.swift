@@ -9,21 +9,43 @@ enum CompactToolbar {
 /// Window-scoped, independent hover regions. Moving the pointer never starts another hide timer.
 @MainActor @Observable
 final class ChromeHoverController {
-    var toolbarIsRevealed = false
+    var toolbarIsRevealed = false {
+        didSet {
+            if toolbarIsRevealed != oldValue {
+                nativeToolbarPresenter?.setToolbarRevealed(toolbarIsRevealed)
+            }
+        }
+    }
     var sidebarIsRevealed = false
     var compactToolbar = false {
-        didSet { if compactToolbar != oldValue { toolbarIsRevealed = false; cancelToolbarHide() } }
+        didSet {
+            if compactToolbar != oldValue {
+                toolbarIsRevealed = false; cancelToolbarHide()
+            }
+        }
     }
     var autoHideSidebar = false {
-        didSet { if autoHideSidebar != oldValue { resetSidebar() } }
+        didSet {
+            if autoHideSidebar != oldValue {
+                resetSidebar()
+            }
+        }
     }
     var verticalTabs = false {
-        didSet { if verticalTabs != oldValue { resetSidebar() } }
+        didSet {
+            if verticalTabs != oldValue {
+                resetSidebar()
+            }
+        }
     }
     var sidebarWidth: CGFloat = BrowserChrome.sidebarWidth
     var headerHeight: CGFloat = 40
     var addressIsFocused = false {
-        didSet { if addressIsFocused { revealToolbar() } else { pointerMoved(to: lastPointer) } }
+        didSet {
+            guard addressIsFocused != oldValue else { return }
+            if addressIsFocused { addressFocusRequested() }
+            else if navigationAwaitingSuccess == nil { dismissToolbarAfterInteraction() }
+        }
     }
     var menuIsTracking = false {
         didSet { if menuIsTracking { stop() } else { pointerMoved(to: lastPointer) } }
@@ -35,7 +57,18 @@ final class ChromeHoverController {
         didSet { if sidebarIsResizing { cancelSidebarHide() } else { pointerMoved(to: lastPointer) } }
     }
     @ObservationIgnored private var lastPointer: CGPoint?
+    @ObservationIgnored var sidebarBoundsProvider: (() -> CGRect?)?
+    @ObservationIgnored private var navigationAwaitingSuccess: UUID?
+    @ObservationIgnored private var toolbarNeedsEdgeExit = false
+    @ObservationIgnored private var addressKeepsSidebarRevealed = false
+    @ObservationIgnored weak var nativeToolbarPresenter: WindowChromeView?
     @ObservationIgnored var canHideToolbar: @MainActor () -> Bool = { true }
+    var folderEditorIsPresented = false {
+        didSet {
+            if folderEditorIsPresented { cancelToolbarHide(); cancelSidebarHide() }
+            else if oldValue { reevaluatePointer() }
+        }
+    }
     private(set) var presentationCount = 0
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
     @ObservationIgnored private var sidebarOpenedFromToolbar = false
@@ -49,12 +82,17 @@ final class ChromeHoverController {
 
     func pointerMoved(to point: CGPoint?) {
         lastPointer = point
-        guard let point else { scheduleToolbarHide(); scheduleSidebarHide(); return }
-        let inHeader = point.y <= headerHeight + BrowserChrome.edgeInset
-        let insideFloatingSidebar = compactToolbar && !toolbarIsRevealed && sidebarIsRevealed
-            && point.x <= sidebarWidth + BrowserChrome.edgeInset && point.y > BrowserChrome.edgeInset
+        guard let point else {
+            toolbarNeedsEdgeExit = false
+            scheduleToolbarHide(); scheduleSidebarHide(); return
+        }
+        let inHeader = point.y >= 0 && point.y <= headerHeight + BrowserChrome.edgeInset
+        if !inHeader { toolbarNeedsEdgeExit = false }
+        let sidebarRegion = sidebarBoundsProvider?() ?? CGRect(x: BrowserChrome.edgeInset, y: BrowserChrome.edgeInset,
+                                                     width: sidebarWidth, height: .greatestFiniteMagnitude)
+        let insideFloatingSidebar = sidebarIsRevealed && sidebarRegion.contains(point)
         if inHeader && !insideFloatingSidebar {
-            if compactToolbar, point.y <= BrowserChrome.edgeInset { revealToolbar() }
+            if compactToolbar, !toolbarNeedsEdgeExit, point.y <= BrowserChrome.edgeInset { revealToolbar() }
             if toolbarIsRevealed { cancelToolbarHide() }
             // The toolbar edge never triggers the sidebar, including at the top-left corner.
             scheduleSidebarHide()
@@ -65,7 +103,7 @@ final class ChromeHoverController {
         sidebarOpenedFromToolbar = false
         if point.x <= 10 {
             revealSidebar()
-        } else if sidebarIsRevealed && point.x <= sidebarWidth + BrowserChrome.edgeInset {
+        } else if insideFloatingSidebar {
             cancelSidebarHide()
         } else {
             scheduleSidebarHide()
@@ -73,6 +111,50 @@ final class ChromeHoverController {
     }
 
     func revealToolbar() { cancelToolbarHide(); if compactToolbar { toolbarIsRevealed = true } }
+    /// Address editing can keep an already visible sidebar open, but never opens
+    /// a hidden sidebar or couples the two hover reveal targets.
+    func addressFocusRequested() {
+        if verticalTabs && autoHideSidebar && sidebarIsRevealed {
+            addressKeepsSidebarRevealed = true
+            cancelSidebarHide()
+        }
+        revealToolbar()
+    }
+    /// Submission holds the editor's reveal until the main document first paints content.
+    func addressNavigationSubmitted(in tabID: UUID) {
+        navigationAwaitingSuccess = tabID
+        revealToolbar()
+    }
+    func navigationSucceeded(in tabID: UUID) {
+        if navigationAwaitingSuccess == tabID { navigationAwaitingSuccess = nil }
+        guard navigationAwaitingSuccess == nil, !addressIsFocused else { return }
+        dismissToolbarAfterInteraction()
+    }
+    func navigationFailed(in tabID: UUID) {
+        if navigationAwaitingSuccess == tabID { navigationAwaitingSuccess = nil }
+        if !addressIsFocused && navigationAwaitingSuccess == nil {
+            addressKeepsSidebarRevealed = false
+            reevaluatePointer()
+        }
+    }
+    func activeTabChanged() { navigationAwaitingSuccess = nil }
+    /// An explicit shortcut dismissal ends editing and its temporary reveal in one action.
+    func dismissAddressFocus() {
+        navigationAwaitingSuccess = nil
+        addressIsFocused = false
+        dismissToolbarAfterInteraction()
+    }
+    func dismissToolbarAfterInteraction() {
+        guard !addressIsFocused, navigationAwaitingSuccess == nil,
+              !menuIsTracking, !customizationIsRunning, !folderEditorIsPresented, presentationCount == 0 else { return }
+        addressKeepsSidebarRevealed = false
+        if compactToolbar {
+            cancelToolbarHide()
+            toolbarNeedsEdgeExit = true
+            toolbarIsRevealed = false
+        }
+        reevaluatePointer()
+    }
     func revealSidebar() { cancelSidebarHide(); sidebarIsRevealed = true }
     func toggleSidebarFromToolbar() {
         if sidebarIsRevealed { resetSidebar() }
@@ -80,7 +162,12 @@ final class ChromeHoverController {
     }
     func cancelToolbarHide() { toolbarHideTask?.cancel(); toolbarHideTask = nil }
     func cancelSidebarHide() { sidebarHideTask?.cancel(); sidebarHideTask = nil }
-    func resetSidebar() { cancelSidebarHide(); sidebarIsRevealed = false; sidebarOpenedFromToolbar = false }
+    func resetSidebar() {
+        cancelSidebarHide()
+        sidebarIsRevealed = false
+        sidebarOpenedFromToolbar = false
+        addressKeepsSidebarRevealed = false
+    }
     func stop() { cancelToolbarHide(); cancelSidebarHide() }
     func beginPresentation() { presentationCount += 1; revealToolbar(); cancelToolbarHide() }
     func endPresentation() {
@@ -91,12 +178,12 @@ final class ChromeHoverController {
 
     func scheduleToolbarHide() {
         guard compactToolbar, toolbarIsRevealed, toolbarHideTask == nil,
-              !addressIsFocused, !menuIsTracking, !customizationIsRunning, presentationCount == 0, canHideToolbar() else { return }
+              !addressIsFocused, navigationAwaitingSuccess == nil, !menuIsTracking, !customizationIsRunning, !folderEditorIsPresented, presentationCount == 0, canHideToolbar() else { return }
         toolbarHideTask = Task { @MainActor [weak self, sleep] in
             do { try await sleep(Self.hideDelay) } catch { return }
             guard let self else { return }
             toolbarHideTask = nil
-            guard !addressIsFocused, !menuIsTracking, !customizationIsRunning, presentationCount == 0, canHideToolbar() else { return }
+            guard !addressIsFocused, navigationAwaitingSuccess == nil, !menuIsTracking, !customizationIsRunning, !folderEditorIsPresented, presentationCount == 0, canHideToolbar() else { return }
             toolbarIsRevealed = false
         }
     }
@@ -104,13 +191,13 @@ final class ChromeHoverController {
     func reevaluatePointer() { pointerMoved(to: lastPointer) }
 
     func scheduleSidebarHide() {
-        guard sidebarIsRevealed, sidebarHideTask == nil, !sidebarOpenedFromToolbar,
-              !menuIsTracking, !sidebarIsResizing else { return }
+        guard sidebarIsRevealed, sidebarHideTask == nil, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed,
+              !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing else { return }
         sidebarHideTask = Task { @MainActor [weak self, sleep] in
             do { try await sleep(Self.hideDelay) } catch { return }
             guard let self else { return }
             sidebarHideTask = nil
-            guard !menuIsTracking, !sidebarIsResizing, !sidebarOpenedFromToolbar else { return }
+            guard !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed else { return }
             sidebarIsRevealed = false
         }
     }

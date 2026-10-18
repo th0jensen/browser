@@ -62,6 +62,25 @@ final class ChromeHoverTests: XCTestCase {
         XCTAssertFalse(controller.toolbarIsRevealed, "The left edge must not reveal the toolbar")
     }
 
+    func testFolderPopoverKeepsItsSidebarOpenWithoutRevealingTheToolbar() async {
+        let (controller, clock) = fixture()
+        defer { controller.stop() }
+        controller.revealSidebar()
+        controller.folderEditorIsPresented = true
+        controller.pointerMoved(to: outside)
+        await clock.advance(by: .seconds(1))
+        XCTAssertTrue(controller.sidebarIsRevealed)
+        XCTAssertFalse(controller.toolbarIsRevealed)
+
+        controller.revealToolbar()
+        controller.pointerMoved(to: outside)
+        await clock.advance(by: .seconds(1))
+        XCTAssertTrue(controller.toolbarIsRevealed)
+        controller.folderEditorIsPresented = false
+        await requests(2, on: clock)
+        await expire(controller, clock: clock, toolbar: true, sidebar: true)
+    }
+
     func testRepeatedMovementDoesNotPostponeEither120MillisecondHide() async {
         let (controller, clock) = fixture()
         defer { controller.stop() }
@@ -115,8 +134,9 @@ final class ChromeHoverTests: XCTestCase {
         XCTAssertEqual(pending, 0)
 
         controller.addressIsFocused = false
-        await requests(1, on: clock)
-        await expire(controller, clock: clock, toolbar: true)
+        XCTAssertFalse(controller.toolbarIsRevealed, "Losing address focus must dismiss editing chrome immediately")
+        let afterFocusLoss = await clock.pendingCount
+        XCTAssertEqual(afterFocusLoss, 0)
     }
 
     func testFocusAcquiredDuringHideCancelsTheOldDeadline() async {
@@ -130,8 +150,11 @@ final class ChromeHoverTests: XCTestCase {
         await clock.advance(by: .milliseconds(120))
         XCTAssertTrue(controller.toolbarIsRevealed)
         controller.addressIsFocused = false
-        await requests(2, on: clock)
-        await expire(controller, clock: clock, toolbar: true)
+        XCTAssertFalse(controller.toolbarIsRevealed, "The canceled old deadline must not delay focus-loss dismissal")
+        let afterFocusLoss = await clock.pendingCount
+        XCTAssertEqual(afterFocusLoss, 0)
+        await clock.advance(by: .seconds(1))
+        XCTAssertFalse(controller.toolbarIsRevealed)
     }
 
     func testCustomizationRevealsToolbarAndResumesHideWhenItEnds() async {

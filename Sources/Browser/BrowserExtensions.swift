@@ -13,6 +13,8 @@ struct InstalledExtension: Codable, Identifiable {
     var isEnabled = false
     var sourceIdentifier: String?
     var sourceAppName: String?
+    var sourceAppPath: String?
+    var ruleCount: Int?
 }
 
 /// Owns extension resources and one controller shared by every window, tab and restored web view.
@@ -28,6 +30,8 @@ final class BrowserExtensions: NSObject {
     var lastError: String?
     private(set) var isBusy = false
     private(set) var actionRevision = 0
+    private(set) var activeRuleCounts: [UUID: Int] = [:]
+    @ObservationIgnored private var blockerIcons: [String: NSImage] = [:]
     @ObservationIgnored private var contexts: [UUID: WKWebExtensionContext] = [:]
     @ObservationIgnored private var ruleLists: [UUID: WKContentRuleList] = [:]
     @ObservationIgnored private var windows = NSHashTable<BrowserModel>.weakObjects()
@@ -101,11 +105,21 @@ final class BrowserExtensions: NSObject {
                 let resource = directory.appending(path: item.id.uuidString).appending(path: item.filename)
                 return Bundle(url: resource)?.bundleIdentifier == candidate.identifier
             }) {
-                if installed[index].sourceIdentifier != candidate.identifier || installed[index].sourceAppName != candidate.appName {
+                do {
+                    if candidate.kind == .contentBlocker {
+                        let destination = directory.appending(path: installed[index].id.uuidString).appending(path: installed[index].filename)
+                        let data = try Data(contentsOf: candidate.resource)
+                        if (try? Data(contentsOf: destination)) != data {
+                            try data.write(to: destination, options: .atomic)
+                            try unload(installed[index])
+                        }
+                    }
                     installed[index].sourceIdentifier = candidate.identifier
                     installed[index].sourceAppName = candidate.appName
-                    do { try persist() } catch { lastError = error.localizedDescription }
-                }
+                    installed[index].sourceAppPath = candidate.appURL?.path
+                    installed[index].ruleCount = candidate.ruleCount
+                    try persist()
+                } catch { lastError = "\(candidate.appName): \(error.localizedDescription)" }
                 continue
             }
             do {
@@ -115,11 +129,40 @@ final class BrowserExtensions: NSObject {
                 }
             } catch { lastError = "\(candidate.appName): \(error.localizedDescription)" }
         }
+        // A content blocker has no action of its own. Its companion's declared
+        // toolbar icon can still represent the app without loading that companion.
+        let blockerApps = Set(candidates.filter { $0.kind == .contentBlocker }.map(\.appName))
+        for candidate in candidates where candidate.kind == .webExtension && blockerApps.contains(candidate.appName) {
+            if let webExtension = try? await readWebExtension(at: candidate.resource),
+               let icon = webExtension.actionIcon(for: CGSize(width: 16, height: 16)) {
+                icon.isTemplate = true
+                blockerIcons[candidate.appName] = icon
+                actionRevision += 1
+            }
+        }
     }
 
     var toolbarExtensions: [InstalledExtension] {
         let _ = actionRevision
-        return installed.filter { $0.isEnabled && $0.kind == .webExtension && contexts[$0.id]?.action(for: nil) != nil }
+        var blockerGroups = Set<String>()
+        return installed.filter {
+            if $0.kind == .contentBlocker { return blockerGroups.insert(blockerGroup($0)).inserted }
+            return $0.isEnabled && contexts[$0.id]?.action(for: nil) != nil
+        }
+    }
+
+    private func blockerGroup(_ item: InstalledExtension) -> String { item.sourceAppName ?? item.id.uuidString }
+    func blockers(for item: InstalledExtension) -> [InstalledExtension] {
+        installed.filter { $0.kind == .contentBlocker && blockerGroup($0) == blockerGroup(item) }
+    }
+    func toolbarName(for item: InstalledExtension) -> String { item.kind == .contentBlocker ? item.sourceAppName ?? item.name : item.name }
+    func blockerIcon(for item: InstalledExtension) -> NSImage? {
+        if let icon = blockerIcons[blockerGroup(item)] { return icon }
+        guard let path = installed.first(where: { $0.id == item.id })?.sourceAppPath ?? item.sourceAppPath else { return nil }
+        if let icon = blockerIcons[path] { return icon }
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        blockerIcons[path] = icon
+        return icon
     }
 
     func configure(_ configuration: WKWebViewConfiguration) {
@@ -131,7 +174,10 @@ final class BrowserExtensions: NSObject {
         guard !windows.contains(browser) else { return }
         windows.add(browser)
         controller.didOpenWindow(browser)
-        browser.tabs.forEach { controller.didOpenTab($0) }
+        browser.tabs.forEach {
+            controller.didOpenTab($0)
+            if let webView = $0.webView { updateRules(in: webView) }
+        }
         focus(browser)
     }
 
@@ -213,10 +259,13 @@ final class BrowserExtensions: NSObject {
                         try await importWebExtension(from: bundleURL)
                         imported += 1
                     } else if point == "com.apple.Safari.content-blocker",
-                              let rules = bundle.url(forResource: "blockerList", withExtension: "json")
-                                ?? bundle.url(forResource: "precompiledList", withExtension: "json") {
-                        try await importBlocker(from: rules, name: bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
-                                              ?? bundleURL.deletingPathExtension().lastPathComponent)
+                              let rules = DiscoveredExtension.blockerResource(in: bundle) {
+                        let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? bundleURL.deletingPathExtension().lastPathComponent
+                        let appName = Bundle(url: url)?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? url.deletingPathExtension().lastPathComponent
+                        let discovery = DiscoveredExtension(identifier: bundle.bundleIdentifier ?? bundleURL.lastPathComponent,
+                                                             appName: appName, name: name, kind: .contentBlocker,
+                                                             resource: rules.url, appURL: url, ruleCount: rules.count)
+                        try await importBlocker(from: rules.url, name: name, discovery: discovery)
                         imported += 1
                     }
                 } catch { failures.append("\(bundleURL.lastPathComponent): \(error.localizedDescription)") }
@@ -249,7 +298,8 @@ final class BrowserExtensions: NSObject {
         let item = InstalledExtension(id: id, name: webExtension.displayName ?? url.lastPathComponent,
                                       kind: .webExtension, filename: filename,
                                       needsNativeMessaging: webExtension.requestedPermissions.contains(.nativeMessaging),
-                                      sourceIdentifier: discovery?.identifier, sourceAppName: discovery?.appName)
+                                      sourceIdentifier: discovery?.identifier, sourceAppName: discovery?.appName,
+                                      sourceAppPath: discovery?.appURL?.path)
         try copyResource(url, for: item)
     }
 
@@ -262,7 +312,9 @@ final class BrowserExtensions: NSObject {
         try await WKContentRuleListStore.default().removeContentRuleList(forIdentifier: identifier)
         let item = InstalledExtension(id: id, name: name, kind: .contentBlocker,
                                       filename: "rules.json", needsNativeMessaging: false,
-                                      sourceIdentifier: discovery?.identifier, sourceAppName: discovery?.appName)
+                                      sourceIdentifier: discovery?.identifier, sourceAppName: discovery?.appName,
+                                      sourceAppPath: discovery?.appURL?.path,
+                                      ruleCount: DiscoveredExtension.usableRuleCount(Data(text.utf8)))
         try copyResource(url, for: item)
     }
 
@@ -322,10 +374,16 @@ final class BrowserExtensions: NSObject {
         case .contentBlocker:
             guard ruleLists[item.id] == nil else { return }
             let text = try String(contentsOf: resource, encoding: .utf8)
+            let count = DiscoveredExtension.usableRuleCount(Data(text.utf8)) ?? 0
+            guard count > 0 else {
+                throw ExtensionFailure("This category contains only a placeholder, with no usable blocking rules. Its Safari companion must provide the real list; it is not active in Browser.")
+            }
             let list = try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: item.id.uuidString,
                                                                                        encodedContentRuleList: text)
             guard let list else { throw ExtensionFailure("WebKit did not compile the content-blocker rules.") }
             ruleLists[item.id] = list
+            activeRuleCounts[item.id] = count
+            actionRevision += 1
             for browser in windows.allObjects {
                 for tab in browser.tabs { if let webView = tab.webView { webView.configuration.userContentController.add(list) } }
             }
@@ -339,6 +397,7 @@ final class BrowserExtensions: NSObject {
             contexts[item.id] = nil
         }
         actionRevision += 1
+        activeRuleCounts[item.id] = nil
         if let list = ruleLists.removeValue(forKey: item.id) {
             for browser in windows.allObjects {
                 for tab in browser.tabs { tab.webView?.configuration.userContentController.remove(list) }
