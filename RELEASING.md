@@ -29,7 +29,7 @@ The version comes from the tag, and the build number is the number of commits. A
 
 Sparkle only installs updates signed with the private key that matches the public key in the app. `project.yml` ships with a placeholder, `REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY`, and an empty update feed. Updates stay off until both a real key and an HTTPS feed are configured. The release workflow supplies a feed belonging to the repository running it, so a fork's releases never point at upstream's appcast by default. For a manual Release build, also set `SPARKLE_FEED_URL` to that repository's `releases/latest/download/appcast.xml` HTTPS URL.
 
-Debug builds, unit tests, and isolated QA sessions never start Sparkle, even when a valid key and feed are supplied. Both app variants retain the shared sandbox identity; Debug keeps its `Browser-Debug.app` product name and separate artwork.
+Debug builds, unit tests, and isolated QA sessions never start Sparkle, even when a valid key and feed are supplied. Debug uses its own sandbox identity, `dev.athas.browser.debug`, with the `Browser-Debug.app` product name and separate artwork. Every Debug launch uses disposable session files and nonpersistent website data. Release keeps the normal `dev.athas.browser` profile. `just` and `just qa` copy Debug into `/Applications` and launch it in isolation; `just release` copies and launches Release.
 
 Local `just` builds use ad-hoc signing without hardened runtime so the app can load Sparkle's separately signed framework. Developer ID release archives keep hardened runtime enabled.
 
@@ -64,6 +64,8 @@ WebKit only lets an app use passkeys and security keys on any website if Apple g
 2. Once Apple approves, the entitlement shows up as a managed capability for `dev.athas.browser` in Certificates, Identifiers & Profiles. Turn it on for the App ID.
 3. Create a **Developer ID** provisioning profile for `dev.athas.browser` that includes it, run `base64 -i Browser.provisionprofile | pbcopy`, and save it as `DEVELOPER_ID_PROVISIONING_PROFILE_BASE64`. The release workflow then builds with passkeys.
 4. For the Mac App Store, create a Mac App Store profile too and archive the `BrowserAppStore` scheme with `BROWSER_PASSKEYS=YES`.
+
+`just deploy-signed <team> Debug` uses `dev.athas.browser.debug` and needs its own approved App ID and provisioning profile; the Release profile does not cover Debug.
 
 ## Mac App Store
 

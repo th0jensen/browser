@@ -15,7 +15,7 @@ struct BrowserApp: App {
     @AppStorage(ChromeCustomization.toolbarLabelStyleKey) private var toolbarLabelStyle = ToolbarLabelStyle.iconOnly
 
     init() {
-        // Deployment initializes the canonical sandbox before copying an older debug profile into it.
+        // Legacy migration tooling can prepare a sandbox without opening a window.
         if CommandLine.arguments.contains("--prepare-profile") {
             do { try BrowserProfile.prepare(); exit(0) }
             catch {
@@ -74,8 +74,7 @@ private final class BrowserApplicationDelegate: NSObject, NSApplicationDelegate 
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Both build variants share a bundle identity. Use this bundle's icon for
-        // the running app rather than a cached icon from the other variant.
+        // Use the artwork bundled with this variant for its running app icon.
         guard let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
               let url = Bundle.main.url(forResource: name, withExtension: nil),
               let icon = NSImage(contentsOf: url) else { return }

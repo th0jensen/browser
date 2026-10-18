@@ -58,6 +58,7 @@ targetTemplates:
         PASSKEYS_ENTITLEMENTS_SUFFIX_YES: -Passkeys
       configs:
         Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser.debug
           PRODUCT_NAME: Browser-Debug
           PRODUCT_MODULE_NAME: Browser
           INFOPLIST_KEY_CFBundleDisplayName: Browser Debug

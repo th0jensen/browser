@@ -1,6 +1,6 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Build, install a symlink, and launch a separate debug app.
+# Build, copy into /Applications, and launch the separate Debug app.
 default: deploy
 
 generate:
@@ -10,7 +10,14 @@ build configuration="Debug": generate
     xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration "{{configuration}}" -derivedDataPath DerivedData build CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM= ENABLE_HARDENED_RUNTIME=NO OTHER_CODE_SIGN_FLAGS=--options=0
 
 deploy: (build "Debug")
-    ./scripts/deploy.sh Debug
+    ./scripts/deploy.sh Debug qa
+
+# Use the installed Debug app with a fresh, disposable session for agent QA.
+qa: deploy
+
+# Copy an already-built app without compiling or launching it.
+install configuration="Debug":
+    ./scripts/deploy.sh "{{configuration}}" install
 
 release: (build "Release")
     ./scripts/deploy.sh Release
