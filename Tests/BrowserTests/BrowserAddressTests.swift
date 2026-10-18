@@ -45,3 +45,12 @@ final class BrowserAddressTests: XCTestCase {
         XCTAssertNil(BrowserAddress.url(for: "  "))
     }
 }
+
+extension BrowserAddressTests {
+    func testExplicitLoopbackCallbackPreservesHTTPSchemePortAndQuery() {
+        let callback = "http://127.0.0.1:54321/callback?code=AbC%2B123&state=XyZ"
+        XCTAssertEqual(BrowserAddress.url(for: callback)?.absoluteString, callback)
+        let localhost = "http://localhost:54321/callback?code=AbC"
+        XCTAssertEqual(BrowserAddress.url(for: localhost)?.absoluteString, localhost)
+    }
+}

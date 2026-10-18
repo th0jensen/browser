@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import ImageIO
 import SwiftUI
@@ -38,32 +39,6 @@ struct FaviconCandidate: Equatable, Sendable {
                   isTouchIcon: isTouchIcon)
     }
 
-    /// Scans the `<head>` of a page's HTML for icons, honoring `<base href>`.
-    static func candidates(inHTML html: String, baseURL: URL) -> [FaviconCandidate] {
-        let head = html.range(of: "</head>", options: .caseInsensitive).map { html[..<$0.lowerBound] } ?? html[...]
-        let tag = /<(link|base)\b([^>]*)>/.ignoresCase()
-        let attribute = /([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/
-        var base = baseURL
-        var candidates: [FaviconCandidate] = []
-        for match in head.matches(of: tag) {
-            var attributes: [String: String] = [:]
-            for pair in match.output.2.matches(of: attribute) {
-                let value = pair.output.2 ?? pair.output.3 ?? pair.output.4 ?? ""
-                attributes[pair.output.1.lowercased()] = String(value).replacing("&amp;", with: "&")
-            }
-            if match.output.1.lowercased() == "base" {
-                if let href = attributes["href"], let url = URL(string: href, relativeTo: baseURL) {
-                    base = url.absoluteURL
-                }
-            } else if let candidate = FaviconCandidate(rel: attributes["rel"] ?? "", href: attributes["href"] ?? "",
-                                                       sizes: attributes["sizes"] ?? "",
-                                                       type: attributes["type"] ?? "", baseURL: base) {
-                candidates.append(candidate)
-            }
-        }
-        return candidates
-    }
-
     /// Icon addresses to try, best first, for a 16–32 pt icon on a 2x display, ending with the site's `/favicon.ico`.
     static func ranked(_ candidates: [FaviconCandidate], pageURL: URL) -> [URL] {
         let sorted = candidates.enumerated().sorted { first, second in
@@ -91,6 +66,47 @@ struct FaviconCandidate: Equatable, Sendable {
         if isScalable { return (1, 0) }
         if sizes.isEmpty { return (2, 0) }
         return (3, -(sizes.max() ?? 0))
+    }
+}
+
+/// Incidental icon traffic must not consume a native application's one-shot OAuth listener.
+/// Only the site's conventional icon is probed; arbitrary page URLs can contain single-use actions.
+enum FaviconRequests {
+    static func siteIcon<Value: Sendable>(for pageURL: URL,
+                                         using request: @Sendable (URL) async -> Value?) async -> Value? {
+        guard allowsNetworkRequest(to: pageURL), let iconURL = FaviconCandidate.defaultIconURL(for: pageURL) else { return nil }
+        return await request(iconURL)
+    }
+
+    static func allowsNetworkRequest(to url: URL) -> Bool {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              let rawHost = url.host()?.lowercased() else { return false }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard host != "localhost", !host.hasSuffix(".localhost") else { return false }
+        // inet_aton also recognizes shortened, integer, hexadecimal and octal IPv4 forms.
+        var ipv4 = in_addr()
+        if inet_aton(host, &ipv4) == 1 {
+            let firstByte = UInt32(bigEndian: ipv4.s_addr) >> 24
+            return firstByte != 127 && firstByte != 0
+        }
+        var ipv6 = in6_addr()
+        let address = String(host.split(separator: "%", maxSplits: 1).first ?? "")
+        if inet_pton(AF_INET6, address, &ipv6) == 1 {
+            let bytes = withUnsafeBytes(of: ipv6) { Array($0) }
+            if bytes.dropLast().allSatisfy({ $0 == 0 }), bytes.last == 0 || bytes.last == 1 { return false }
+            let mapped = bytes.prefix(10).allSatisfy { $0 == 0 } && bytes[10] == 255 && bytes[11] == 255
+            if mapped && (bytes[12] == 127 || bytes[12] == 0) { return false }
+        }
+        return !host.isEmpty
+    }
+}
+
+/// Enforce the same boundary for redirects, rather than checking only the initial icon URL.
+final class FaviconRedirectPolicy: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        completionHandler(request.url.map(FaviconRequests.allowsNetworkRequest) == true ? request : nil)
     }
 }
 
@@ -179,7 +195,7 @@ enum FaviconStore {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 8
         configuration.urlCache = nil
-        return URLSession(configuration: configuration)
+        return URLSession(configuration: configuration, delegate: FaviconRedirectPolicy(), delegateQueue: nil)
     }()
 
     /// Forgets the icons kept in memory, and removes the ones saved to disk since `date`.
@@ -212,8 +228,8 @@ enum FaviconStore {
         url?.host().flatMap { icons[$0]?.image }
     }
 
-    /// An icon for a site that isn't open, such as a bookmark: the cached one, the site's `/favicon.ico`,
-    /// or else the best icon its page declares.
+    /// An icon for a site that isn't open: the cached one or its conventional `/favicon.ico`.
+    /// Declared icons are discovered from the live document after it loads.
     static func icon(for url: URL, remember: Bool = true) async -> Image? {
         guard let host = url.host() else { return nil }
         guard remember else {
@@ -236,15 +252,10 @@ enum FaviconStore {
 
     private static func loadSiteIcon(for url: URL, host: String, in cache: FaviconCache?) async -> Icon? {
         if let cache, let icon = await diskIcon(forHost: host, in: cache) { return icon }
-        guard !Task.isCancelled, let fallback = FaviconCandidate.defaultIconURL(for: url) else { return nil }
-        if let icon = await download(fallback, forHost: host, into: cache) { return icon }
-        guard !Task.isCancelled, let (html, pageURL) = await page(at: url) else { return nil }
-        let candidates = FaviconCandidate.candidates(inHTML: html, baseURL: pageURL)
-        for source in FaviconCandidate.ranked(candidates, pageURL: pageURL).prefix(4) where source != fallback {
-            guard !Task.isCancelled else { return nil }
-            if let icon = await download(source, forHost: host, into: cache) { return icon }
+        guard !Task.isCancelled else { return nil }
+        return await FaviconRequests.siteIcon(for: url) { source in
+            await download(source, forHost: host, into: cache)
         }
-        return nil
     }
 
     /// The best of the icons an open page declares, downloaded only when it isn't the one already cached.
@@ -330,18 +341,11 @@ enum FaviconStore {
         return Icon(source: source, image: image)
     }
 
-    /// The start of a page's HTML, which is enough to find the icons in its `<head>`.
-    @concurrent
-    nonisolated private static func page(at url: URL) async -> (String, URL)? {
-        guard let (data, pageURL) = await fetch(url, limit: FaviconData.maxPageBytes,
-                                                accepting: FaviconData.isPageMIMEType) else { return nil }
-        return (String(decoding: data.bytes, as: UTF8.self), pageURL)
-    }
-
     /// Stops reading once the response is larger than `limit`, so a huge or endless file can't fill memory.
     nonisolated private static func fetch(_ url: URL, limit: Int,
                                           accepting isAccepted: (String?) -> Bool) async -> (FaviconData.Read, URL)? {
-        guard let (bytes, response) = try? await session.bytes(from: url) else { return nil }
+        guard url.scheme?.lowercased() == "data" || FaviconRequests.allowsNetworkRequest(to: url),
+              let (bytes, response) = try? await session.bytes(from: url) else { return nil }
         defer { bytes.task.cancel() }
         guard (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) ?? true,
               isAccepted(response.mimeType),
@@ -356,11 +360,10 @@ enum FaviconStore {
     }
 }
 
-/// Limits on the icons and pages read to find a site's icon. Icons are decoded in the app's own process,
+/// Limits on icon downloads. Icons are decoded in the app's own process,
 /// outside WebKit's sandbox, so only small files in a few raster formats are accepted.
 enum FaviconData {
     static let maxIconBytes = 512 * 1024
-    static let maxPageBytes = 1024 * 1024
     /// Icons show at 14–32 pt, so larger images are scaled down as they're decoded.
     static let maxPixelSize = 128
 
@@ -386,10 +389,6 @@ enum FaviconData {
     static func isIconMIMEType(_ mimeType: String?) -> Bool {
         guard let mimeType = mimeType?.lowercased() else { return true }
         return (mimeType.hasPrefix("image/") && mimeType != "image/svg+xml") || mimeType == "application/octet-stream"
-    }
-
-    static func isPageMIMEType(_ mimeType: String?) -> Bool {
-        ["text/html", "application/xhtml+xml"].contains(mimeType?.lowercased())
     }
 
     /// The format a file's first bytes identify, among PNG, ICO, JPEG, GIF, and WebP.
