@@ -64,7 +64,14 @@ final class ToolbarLayoutPersistence {
         }
         let layout = Layout(identifiers: ids)
         saved = layout
-        write(layout)
+        // Keep a native customization transaction in memory. Writing AppStorage
+        // here rebuilds SwiftUI's dynamic extension items in the middle of a drag.
+        if !toolbar.customizationPaletteIsRunning { write(layout) }
+    }
+
+    func finishCustomization() {
+        userIsEditing = false
+        if let saved { write(saved) }
     }
 
     private func write(_ layout: Layout) {
@@ -78,6 +85,16 @@ final class ToolbarLayoutPersistence {
             self.lastReadData = data
             self.binding?.wrappedValue = data
         }
+    }
+
+    /// Give SwiftUI and AppKit the saved order before either creates its item
+    /// list. Applying it afterward leaves SwiftUI's customization order stale.
+    static func prepareNativeConfiguration(identifier: String, data: Data, defaults: UserDefaults = .standard) {
+        let key = "NSToolbar Configuration " + identifier
+        guard defaults.object(forKey: key) == nil,
+              let layout = try? JSONDecoder().decode(Layout.self, from: data),
+              layout.identifiers.contains("address") else { return }
+        defaults.set(["TB Item Identifiers": normalized(layout.identifiers)], forKey: key)
     }
 
     static func legacyData(for layout: TabLayout, defaults: UserDefaults = .standard) -> Data {

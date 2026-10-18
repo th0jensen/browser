@@ -532,7 +532,7 @@ final class WindowChromeView: NSView {
                     guard let self else { return }
                     let running = toolbar.customizationPaletteIsRunning
                     guard running != self.lastCustomizationState else { return }
-                    if !running { self.layoutPersistence.userIsEditing = false }
+                    if !running { self.layoutPersistence.finishCustomization() }
                     self.lastCustomizationState = running
                     DispatchQueue.main.async { [weak self] in self?.onCustomizationChange?(running) }
                     self.scheduleAlignment()
@@ -598,6 +598,9 @@ final class WindowChromeView: NSView {
             if item.paletteLabel != label { item.paletteLabel = label }
         }
         layoutPersistence.update(toolbar: toolbar, binding: savedToolbarConfiguration)
+        // Native customization owns its live item order until Done. Publishing
+        // that order back into SwiftUI while dragging can reconstruct ForEach items.
+        guard !toolbar.customizationPaletteIsRunning else { return }
         let identifiers = toolbar.items.map { $0.itemIdentifier.rawValue }
         guard identifiers != lastToolbarItemIdentifiers else { return }
         lastToolbarItemIdentifiers = identifiers

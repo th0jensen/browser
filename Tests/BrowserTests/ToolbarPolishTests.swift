@@ -16,6 +16,7 @@ final class ToolbarPolishTests: XCTestCase {
         try await extensions.importResources(from: resource)
         let item = try XCTUnwrap(extensions.installed.last)
         let extensionID = NSToolbarItem.Identifier("extension.\(item.id.uuidString)")
+        defaults.set(try JSONSerialization.data(withJSONObject: ["identifiers": [extensionID.rawValue, "back", "forward", "address", "downloads"]]), forKey: "toolbarLayout.vertical")
         defer { extensions.remove(item); try? FileManager.default.removeItem(at: resource); defaults.removePersistentDomain(forName: suite) }
         let browser = BrowserModel(chromePreferences: WindowChromePreferences(defaults: defaults))
         browser.chromePreferences.autoHideToolbar = false
@@ -30,13 +31,30 @@ final class ToolbarPolishTests: XCTestCase {
         try await waitUntil {
             window.toolbar?.delegate is ToolbarCustomizationAdapter && window.toolbar?.identifier.hasSuffix(".vertical") == true
                 && window.toolbar?.items.contains { $0.itemIdentifier.rawValue == "address" } == true
-                && defaults.data(forKey: "toolbarLayout.vertical") != nil
+                && window.toolbar?.itemIdentifiers.first == extensionID
         }
         let toolbar = try XCTUnwrap(window.toolbar)
+        let beforeEditing = defaults.data(forKey: "toolbarLayout.vertical")
         window.runToolbarCustomizationPalette(nil)
         try await waitUntil { toolbar.customizationPaletteIsRunning }
-        toolbar.insertItem(withItemIdentifier: extensionID, at: toolbar.items.count)
-        try await waitUntil { toolbar.itemIdentifiers.last == extensionID }
+        // Use AppKit's own reorder action, which updates its customization
+        // configuration as a drag does, rather than just changing the item array.
+        for expectedIndex in 1..<toolbar.items.count {
+            var view = toolbar.items.first(where: { $0.itemIdentifier == extensionID })?.view
+            var move: NSAccessibilityCustomAction?
+            while let candidate = view, move == nil {
+                move = candidate.accessibilityCustomActions()?.first { $0.name == "Move next" }
+                view = candidate.superview
+            }
+            let action = try XCTUnwrap(move)
+            if let handler = action.handler { XCTAssertTrue(handler()) }
+            else { XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(action.selector), to: action.target, from: action)) }
+            try await waitUntil { toolbar.itemIdentifiers.firstIndex(of: extensionID) == expectedIndex }
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(toolbar.itemIdentifiers.last, extensionID)
+        XCTAssertEqual(defaults.data(forKey: "toolbarLayout.vertical"), beforeEditing,
+                       "Live customization must not feed AppStorage changes back into SwiftUI")
         func doneButton(in view: NSView) -> NSButton? {
             if let button = view as? NSButton, button.title == "Done" { return button }
             return view.subviews.lazy.compactMap { doneButton(in: $0) }.first

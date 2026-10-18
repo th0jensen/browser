@@ -68,6 +68,15 @@ struct BrowserWindow: View {
         self.persistsToolbarLayout = persistsToolbarLayout
     }
 
+    private var nativeToolbarIdentifier: String {
+        let identifier = "\(toolbarPrefix).\(tabLayout.rawValue)"
+        if persistsToolbarLayout {
+            ToolbarLayoutPersistence.prepareNativeConfiguration(identifier: identifier,
+                data: tabLayout == .vertical ? verticalToolbarLayout : horizontalToolbarLayout)
+        }
+        return identifier
+    }
+
     var body: some View {
         // Keep the page host stable while the existing native chrome is shown or hidden.
         HStack(spacing: 0) {
@@ -165,7 +174,7 @@ struct BrowserWindow: View {
         .focusedSceneValue(\.browserModel, browser)
         .navigationTitle(browser.activeTab?.title ?? "Browser")
         .frame(minWidth: 680, minHeight: 440)
-        .toolbar(id: "\(toolbarPrefix).\(tabLayout.rawValue)") { browserToolbar }
+        .toolbar(id: nativeToolbarIdentifier) { browserToolbar }
         .environment(\.chromeHoverController, chromeHover)
         .environment(\.windowChromePreferences, browser.chromePreferences)
         .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
