@@ -37,7 +37,8 @@ def start_run(path, label, derived):
     sources = [p for p in (ROOT / "Sources").rglob("*") if p.is_file()]
     # Keep harness identity separate: baseline and candidate must use the same harness.
     harness = [ROOT / p for p in ("scripts/benchmark.sh", "scripts/benchmark-report.py",
-               "Tests/BrowserTests/BrowserPerformanceTests.swift", "Tests/Performance/colorful.html")]
+               "Tests/BrowserTests/BrowserPerformanceTests.swift", "Tests/Performance/colorful.html",
+               "project.yml", "justfile", "scripts/benchmark-cohort.py")]
     manifest = {"schema": "browser-benchmark-run-v1", "started_at": timestamp(),
                 "label": label, "status": "running", "source_root": str(ROOT),
                 "derived_data": str(Path(derived).resolve()),
