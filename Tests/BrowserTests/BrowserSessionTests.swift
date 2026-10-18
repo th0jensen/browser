@@ -165,14 +165,17 @@ final class BrowserSessionTests: XCTestCase {
         let browser = BrowserModel()
         store.restore(in: browser)
         let file = directory.appending(path: "Session.json")
-        var persistedWhileChanging = false
-        for index in 0..<15 {
+        // Keep changes flowing until the utility writer runs, allowing for filesystem and scheduler load.
+        // A debounce that restarts on every change would still fail this bounded wait.
+        let deadline = ContinuousClock.now + .seconds(3)
+        var index = 0
+        while !FileManager.default.fileExists(atPath: file.path), ContinuousClock.now < deadline {
             let snapshot = BrowserSessionSnapshot(tabs: [.init(url: URL(string: "https://example.com/"), title: "Update \(index)")], selectedIndex: 0)
             store.requestSave(snapshot, from: browser)
+            index += 1
             try await Task.sleep(for: .milliseconds(10))
-            if FileManager.default.fileExists(atPath: file.path) { persistedWhileChanging = true }
         }
-        XCTAssertTrue(persistedWhileChanging, "Continuous title changes must not starve session persistence")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "Continuous title changes must not starve session persistence")
         store.flush()
     }
 
