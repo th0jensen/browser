@@ -61,7 +61,9 @@ final class ToolbarAlignmentView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func scheduleUpdate() {
-        guard !updateIsScheduled, browserWindow?.toolbar?.isVisible == true else { return }
+        // Hidden chrome still needs its sizing constraints prepared when the
+        // sidebar configuration or window size changes, before the next reveal.
+        guard !updateIsScheduled, browserWindow?.toolbar != nil else { return }
         updateIsScheduled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -70,7 +72,7 @@ final class ToolbarAlignmentView: NSView {
                   let item = window.toolbar?.items.first(where: { item in
                       item.itemIdentifier.rawValue == "address" && item.view.map { isDescendant(of: $0) } == true
                   }), let host = item.view,
-                  window.toolbar?.visibleItems?.contains(item) == true else { return }
+                  (window.toolbar?.isVisible == false || window.toolbar?.visibleItems?.contains(item) == true) else { return }
             if sizedHost !== host {
                 [minimumWidth, maximumWidth].compactMap { $0 }.forEach { $0.isActive = false }
                 host.translatesAutoresizingMaskIntoConstraints = false
@@ -83,7 +85,7 @@ final class ToolbarAlignmentView: NSView {
                 maximumWidth = maximum
                 sizedHost = host
             }
-            minimumWidth?.constant = 160
+            if minimumWidth?.constant != 160 { minimumWidth?.constant = 160 }
             let items = window.toolbar?.items ?? []
             let flexibleCount = items.filter { $0.itemIdentifier == .flexibleSpace }.count
             if flexibleCount > 0 {
@@ -98,9 +100,10 @@ final class ToolbarAlignmentView: NSView {
                 } else { leading = BrowserChrome.edgeInset }
                 let gutters = CGFloat(max(0, items.count - 1)) * BrowserChrome.edgeInset
                 let available = max(160, window.frame.width - leading - fixedWidth - gutters - BrowserChrome.edgeInset)
-                maximumWidth?.constant = max(160, available / CGFloat(flexibleCount + 1))
+                let allocation = max(160, available / CGFloat(flexibleCount + 1))
+                if maximumWidth?.constant != allocation { maximumWidth?.constant = allocation }
             } else {
-                maximumWidth?.constant = 100_000
+                if maximumWidth?.constant != 100_000 { maximumWidth?.constant = 100_000 }
             }
         }
     }

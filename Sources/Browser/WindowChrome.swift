@@ -189,7 +189,9 @@ final class WindowChromeView: NSView {
     func setToolbarRevealed(_ revealed: Bool) {
         guard toolbarIsRevealed != revealed else { return }
         toolbarIsRevealed = revealed
-        updateWindowState()
+        guard let window else { return }
+        // Geometry belongs to the chrome configuration, not each hover reveal.
+        applyToolbarVisibility(in: window)
         centerTitlebarControls()
     }
 
@@ -374,7 +376,7 @@ final class WindowChromeView: NSView {
         guard let window else { restoreToolbarOrigin(); return }
         observeWindowControls(in: window)
         guard !window.styleMask.contains(.fullScreen) else { restoreToolbarOrigin(); return }
-        guard window.toolbar?.isVisible == true else { restoreToolbarOrigin(); return }
+        guard window.toolbar?.isVisible == true else { return }
         positionWindowControls(in: window)
         guard let branch = toolbarBranch(in: window) else { return }
         if shiftedToolbar !== branch {
@@ -551,17 +553,25 @@ final class WindowChromeView: NSView {
         // controls leaves AppKit's header background visible without any controls.
         let visible = toolbar.customizationPaletteIsRunning || (!fullscreenOverlay && chromeVisible)
         let visibilityChanged = toolbar.isVisible != visible
+        // Restore the controls' reserved space before AppKit lays out a newly
+        // visible toolbar; otherwise the address field first uses that space.
+        tabContainer.isHidden = fullscreenOverlay || !chromeVisible
+        if !window.styleMask.contains(.fullScreen) {
+            if chromeVisible && visibilityChanged { positionWindowControls(in: window) }
+            for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                if let button = window.standardWindowButton(type), button.isHidden != !chromeVisible {
+                    button.isHidden = !chromeVisible
+                }
+            }
+        }
         if visibilityChanged {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0
                 context.allowsImplicitAnimation = false
                 toolbar.isVisible = visible
-            }
-        }
-        tabContainer.isHidden = fullscreenOverlay || !chromeVisible
-        if !window.styleMask.contains(.fullScreen) {
-            for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
-                window.standardWindowButton(type)?.isHidden = !chromeVisible
+                // AppKit defers its hidden titlebar's native layout. Complete
+                // that pass in this transaction, before the revealed row draws.
+                if visible { window.contentView?.superview?.layoutSubtreeIfNeeded() }
             }
         }
         let didReveal = chromeVisible && !chromeWasVisible

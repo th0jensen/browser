@@ -43,6 +43,33 @@ final class CompactToolbarTests: XCTestCase {
         try assertPageReceivesHitsUnderHiddenChrome(in: fixture)
     }
 
+    func testToolbarRevealRetainsPreparedLayoutAcrossSidebarChanges() async throws {
+        let fixture = try await makeFixture(layout: .vertical)
+        defer { fixture.close() }
+        let window = fixture.window
+        let pageFrame = try await settledPageFrame(in: fixture)
+        for sidebarVisible in [false, true, false] {
+            if sidebarVisible { fixture.hover.revealSidebar() }
+            else { fixture.hover.resetSidebar() }
+            _ = try await settledPageFrame(in: fixture)
+            fixture.hover.revealToolbar()
+            let field = try XCTUnwrap(addressField(in: window))
+            let firstFrame = try frameInWindow(field, window: window)
+            let close = try XCTUnwrap(window.standardWindowButton(.closeButton))
+            let firstControlFrame = try frameInWindow(close, window: window)
+            try await Task.sleep(for: .milliseconds(150))
+            assertEqualFrames(try frameInWindow(field, window: window), firstFrame,
+                              "Revealing prepared chrome must not cause a second layout shift")
+            assertEqualFrames(try frameInWindow(close, window: window), firstControlFrame,
+                              "Traffic lights must reveal in their final position")
+            XCTAssertEqual(fixture.hover.sidebarIsRevealed, sidebarVisible)
+            assertEqualFrames(try await settledPageFrame(in: fixture), pageFrame,
+                              "Toolbar reveal must not resize the page")
+            fixture.hover.toolbarIsRevealed = false
+            try await Task.sleep(for: .milliseconds(150))
+        }
+    }
+
     func testHorizontalTabsAlwaysKeepChromeVisibleDespiteSavedAutoHideChoices() async throws {
         let fixture = try await makeFixture(layout: .horizontal)
         defer { fixture.close() }
