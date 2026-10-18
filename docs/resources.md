@@ -3,18 +3,21 @@
 `scripts/browser-resources.py` measures existing files or running processes. It
 does not launch, terminate, attach a debugger, or alter the app. Run resource
 sampling separately from the latency benchmark: even read-only observers add
-work to the machine. Use the same Release configuration, architecture, signing,
+work to the machine. Use the same optimized Benchmark configuration, architecture, signing,
 machine, fixture, tab state, warmup and sample duration for both revisions.
 
 ## Benchmark timing and reports
 
-The Release XCTest harness uses a visible floating window on all Spaces, closes
+`just benchmark LABEL` uses the Release-optimized `Benchmark` configuration, normal
+DerivedData, and the separate `dev.athas.browser.benchmark` app identity. It does
+not deploy, stop installed browsers, or use their profiles. The XCTest harness
+uses a visible floating window on the MacBook display, closes
 other normal windows in its own host, and records window/screen inventories and
 appearance. The application may remain inactive under macOS cooperative
 activation; native editor ownership is observed inside the benchmark window.
 Apply the same protocol to baseline and candidate.
 
-Each host-only idle state (`new_tab` and `static_color_page`) has a one-second
+Each host-only idle state (`new_tab`, `twenty_blank_tabs`, and `static_color_page`) has a one-second
 quiet period followed by one **30-second** CPU/RSS measurement. Host measurements
 include XCTest and exclude WebKit processes. RSS values are endpoints, not peaks.
 Repeat whole runs to assess variability; one idle window is not a distribution.
@@ -46,7 +49,7 @@ exact definitions, samples, medians, nearest-rank p90 values, and actual idle
 durations are retained in the raw JSON. Page snapshots are fixture-only evidence;
 full application chrome and color QA require separate screenshots.
 
-`scripts/benchmark.sh` creates a unique `Benchmark-<UTC time>-<UUID>` directory
+`just benchmark LABEL` creates a unique `DerivedData/Benchmarks/Benchmark-<UTC time>-<UUID>` directory
 containing `Results.xcresult`, exported attachments, `benchmark.log`, and
 `run.json`. The manifest records source/harness hashes, build exit status, and
 the executable hash observed after the build. A failed build can leave an older
@@ -180,8 +183,9 @@ use](https://developer.apple.com/documentation/xcode/gathering-information-about
 
 ## Chrome reveal latency
 
-`scripts/benchmark.sh LABEL /absolute/derived-data reveal` runs the chrome-only
-comparison. The full benchmark includes the same reveal phase. Apply the same
+`just benchmark LABEL reveal` runs the chrome-only comparison. `just benchmark LABEL full`
+also includes the reveal phase; the default `core` mode measures loading, tab interaction,
+resizing, and idle resources without the reveal animation phase. Apply the same
 passive `ChromePresentationMarker` to the frozen baseline's floating sidebar and
 use identical harness files in both source trees.
 

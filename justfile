@@ -29,3 +29,7 @@ deploy-signed team configuration="Debug": generate
 
 test: generate
     xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration Debug -derivedDataPath DerivedData -destination 'platform=macOS' test CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM= ENABLE_HARDENED_RUNTIME=NO OTHER_CODE_SIGN_FLAGS=--options=0
+
+# Compare isolated Release-optimized workloads without deploying or stopping either installed app.
+benchmark label="candidate" mode="core":
+    ./scripts/benchmark.sh "{{label}}" "{{mode}}"

@@ -7,7 +7,7 @@ import WebKit
 import XCTest
 @testable import Browser
 
-/// Run only with BROWSER_BENCHMARK=1, in Release, using scripts/benchmark.sh.
+/// Opt-in optimized comparison, invoked with just benchmark; keep the harness identical in both runs.
 /// Keep this entire file and colorful.html identical in the baseline and candidate.
 @MainActor
 final class BrowserPerformanceTests: XCTestCase {
@@ -19,14 +19,12 @@ final class BrowserPerformanceTests: XCTestCase {
     private var closedHostWindowCount = 0
     private var outputDirectory: URL!
 
-    func testReleaseBenchmarks() async throws {
+    func testBrowserBenchmarks() async throws {
         guard ProcessInfo.processInfo.environment["BROWSER_BENCHMARK"] == "1" else {
-            throw XCTSkip("Opt-in benchmark: use scripts/benchmark.sh")
+            throw XCTSkip("Opt-in benchmark: use just benchmark")
         }
-        #if DEBUG
-        throw XCTSkip("Performance comparisons require Release configuration")
-        #endif
         XCTAssertTrue(BrowserProfile.isTesting)
+        XCTAssertEqual(Bundle.main.bundleIdentifier, "dev.athas.browser.benchmark")
         XCTAssertFalse(BrowserProfile.websiteDataStore.isPersistent)
         outputDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("BrowserBenchmark-\(ProcessInfo.processInfo.processIdentifier)-\(UUID().uuidString)", isDirectory: true)
@@ -39,9 +37,14 @@ final class BrowserPerformanceTests: XCTestCase {
         defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
         defaults.set(false, forKey: SidebarVisibility.autoHideKey)
         let browser = BrowserModel(sitePermissions: SitePermissions(), chromePreferences: WindowChromePreferences(defaults: defaults))
-        let window = PerformanceWindow(contentRect: NSRect(x: 80, y: 80, width: 1100, height: 760),
+        let screen = try XCTUnwrap(NSScreen.screens.first { screen in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
+            return CGDisplayIsBuiltin(number.uint32Value) != 0
+        }, "Benchmarks require the MacBook display")
+        let window = PerformanceWindow(contentRect: NSRect(x: screen.visibleFrame.midX - 550,
+                                                          y: screen.visibleFrame.midY - 380, width: 1100, height: 760),
                                        styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
-                                       backing: .buffered, defer: false)
+                                       backing: .buffered, defer: false, screen: screen)
         window.titleVisibility = .hidden
         window.tabbingMode = .disallowed
         window.isReleasedWhenClosed = false
@@ -86,6 +89,20 @@ final class BrowserPerformanceTests: XCTestCase {
             }
             resourceWindows.append(try await idleResources(name: "new_tab", seconds: 30))
             try writeResults(status: "running")
+
+            let blankIDsBefore = Set(browser.tabs.map(\.id))
+            let allocationStart = Self.now()
+            for _ in 0..<20 { browser.addTab(focusAddress: false) }
+            appendMetric("twenty_blank_tabs_allocation", definition:
+                "Synchronous model allocation and selection of twenty blank tabs; native focus and rendering excluded.",
+                samples: [(Self.now() - allocationStart) * 1000])
+            metrics[metrics.count - 1]["warmups_discarded"] = 0
+            var blankResources = try await idleResources(name: "twenty_blank_tabs", seconds: 30)
+            blankResources["tab_count"] = browser.tabs.count
+            blankResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
+            resourceWindows.append(blankResources)
+            try writeResults(status: "running")
+            for id in browser.tabs.map(\.id) where !blankIDsBefore.contains(id) { browser.closeTab(id) }
 
             print("BENCHMARK_PHASE=prepare_first")
             let first = try XCTUnwrap(browser.activeTab)
@@ -218,7 +235,9 @@ final class BrowserPerformanceTests: XCTestCase {
             }
             appendMetric("resize_native_frame", definition:
                 "Same resize operations as resize_dom_ack; NSWindow.setContentSize to first WKWebView NSView.frameDidChangeNotification. Native geometry acknowledgement only; no claim about web content paint.", samples: nativeResizeSamples)
-            try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
+            if ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "full" {
+                try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
+            }
             try writeResults(status: "complete")
         } catch {
             try? writeResults(status: "failed: \(error)")
@@ -261,6 +280,7 @@ final class BrowserPerformanceTests: XCTestCase {
     }
 
     private func sample(_ name: String, definition: String, operation: () async throws -> Double) async throws {
+        print("BENCHMARK_PHASE=\(name)")
         var values: [Double] = []
         for index in 0..<(warmups + repetitions) {
             let seconds = try await operation()
@@ -520,7 +540,7 @@ final class BrowserPerformanceTests: XCTestCase {
             "pid": ProcessInfo.processInfo.processIdentifier, "timestamp": ISO8601DateFormatter().string(from: Date()),
             "os": ProcessInfo.processInfo.operatingSystemVersionString,
             "logical_processor_count": ProcessInfo.processInfo.processorCount,
-            "configuration": "Release required; opt-in XCTest host", "warmups": warmups, "repetitions": repetitions,
+            "configuration": "Release optimization; isolated Benchmark XCTest host with testability enabled", "warmups": warmups, "repetitions": repetitions,
             "mode": ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] ?? "full",
             "window_protocol": "Real NSWindow at floating level; canJoinAllSpaces + fullScreenAuxiliary; orderFrontRegardless; initial and pre-load NSWindow.OcclusionState.visible gates. macOS cooperative app activation may remain false. Same visible-window protocol in baseline and candidate.",
             "window_inventory_before_peer_closure": windowInventoryBeforeClosure,

@@ -52,7 +52,7 @@ def finish_run(path, exit_status):
     manifest = json.loads(file.read_text())
     manifest.update({"finished_at": timestamp(), "xcodebuild_exit_status": exit_status,
                      "status": "passed" if exit_status == 0 else "failed"})
-    app = Path(manifest["derived_data"]) / "Build/Products/Release/Browser.app"
+    app = Path(manifest["derived_data"]) / "Build/Products/Benchmark/Browser-Benchmark.app"
     try:
         with (app / "Contents/Info.plist").open("rb") as handle:
             executable_name = plistlib.load(handle)["CFBundleExecutable"]

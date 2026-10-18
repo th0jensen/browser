@@ -14,3 +14,13 @@ Debug and Release have separate sandbox identities (`dev.athas.browser.debug` an
 Keep the Debug QA browser on the laptop’s **Built-in Retina Display**, the user’s chosen QA screen. Do not launch or move it onto LG ULTRAGEAR or iPad. Preserve the placement the user has set on the laptop screen and verify the display after relaunching; use Window → Move to Built-in Retina Display if macOS restores it elsewhere.
 
 Launch ongoing QA with `--qa-profile` only. Avoid `-compactToolbar`, `-tabLayout`, or other UserDefaults command-line overrides: the argument domain takes priority over saved settings and can prevent UI preferences from changing during QA.
+
+# Commit attribution
+
+Include this trailer on commits made with this assistant, recording the model name:
+
+Co-authored-by: Codex (GPT-6) <noreply@openai.com>
+
+Keep benchmark measurements and before/after results in the task thread, not PR descriptions or committed reports.
+
+When optimized benchmarking is explicitly requested, `just benchmark` uses the Release-optimized `Benchmark` configuration and `dev.athas.browser.benchmark` identity in normal DerivedData. It runs only isolated XCTest fixtures, never deployment or profile migration, and must leave the installed browsers running. Ordinary GUI QA continues to use Debug.
