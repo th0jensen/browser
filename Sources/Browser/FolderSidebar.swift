@@ -124,6 +124,9 @@ private struct FolderSidebarRow: View {
             else { browser.openFolderPage(item) }
         }
         .onHover { isHovered = $0 }
+        .onChange(of: browser.tabDrag.isOver(SidebarDragItem.pinned(item.id).payload)) { _, isOver in
+            if isOver { browser.didEnterFolderRowDropTarget(item.id) }
+        }
         .modifier(TabDragSource(controller: browser.tabDrag, payload: "browser-folder:\(item.id.uuidString)",
                                 enabled: browser.renamingSavedPageID == nil, began: {
             browser.chromeHover?.sidebarIsReordering = true

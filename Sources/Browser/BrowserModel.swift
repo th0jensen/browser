@@ -250,6 +250,29 @@ final class BrowserModel: NSObject {
         }
     }
 
+    /// Folder headers and the saved tab rows inside them provide feedback on actual target entry.
+    func didEnterFolderRowDropTarget(_ targetID: UUID) {
+        guard let target = folders.item(targetID),
+              target.kind == .folder || target.parentID.flatMap({ folders.item($0) })?.kind == .folder,
+              let payload = tabDrag.payload, let source = SidebarDragItem(payload) else { return }
+        let parentID = target.kind == .folder ? target.id : target.parentID
+        let url: URL?
+        switch source {
+        case .tab(let id):
+            guard let tab = tab(withID: id), !tab.isNewTab, tab.folderPageID != targetID else { return }
+            url = tab.url
+        case .pinned(let id):
+            guard id != targetID, let page = folders.item(id), page.kind == .page,
+                  folders.canMove(id, to: parentID) else { return }
+            url = page.url
+        case .essential(let id):
+            url = pinnedPages.items.first { $0.id == id }?.url
+        default: return
+        }
+        guard let url, PinnedPageStore.valid(url) else { return }
+        reorderFeedback()
+    }
+
     @discardableResult
     func acceptFolderDrop(_ payload: String, parentID: UUID?, before: UUID? = nil) -> Bool {
         let prefix = "browser-folder:"
@@ -284,7 +307,12 @@ final class BrowserModel: NSObject {
             let siblings = folders.items.filter { $0.parentID == page.parentID }
             guard let from = siblings.firstIndex(where: { $0.id == id }), let to = siblings.firstIndex(where: { $0.id == targetID }),
                   direction > 0 ? to > from : to < from else { return }
-            _ = withAnimation(.snappy(duration: 0.18)) { reorderPinnedItem(id, past: targetID) }
+            // Child-page rows already pulse on entry, including when this crossing moves the row.
+            let usesRowEntryFeedback = page.kind == .page && other.kind == .page
+                && other.parentID.flatMap({ folders.item($0) })?.kind == .folder
+            _ = withAnimation(.snappy(duration: 0.18)) {
+                reorderPinnedItem(id, past: targetID, haptic: !usesRowEntryFeedback)
+            }
         case (.section(let id), .section(let targetID)):
             reorderTemporarySection(id, past: targetID, direction: direction)
         case (.section(let id), .tab(let targetID)):
@@ -352,7 +380,7 @@ final class BrowserModel: NSObject {
     func reorderSavedPage(_ id: UUID, past targetID: UUID) -> Bool { reorderPinnedItem(id, past: targetID) }
 
     @discardableResult
-    func reorderPinnedItem(_ id: UUID, past targetID: UUID) -> Bool {
+    func reorderPinnedItem(_ id: UUID, past targetID: UUID, haptic: Bool = true) -> Bool {
         guard let page = folders.item(id), let target = folders.item(targetID),
               page.parentID == target.parentID, id != targetID else { return false }
         let siblings = folders.items.filter { $0.parentID == page.parentID }
@@ -362,7 +390,7 @@ final class BrowserModel: NSObject {
         let previous = folders.items
         changeFolders { try folders.move(id, to: page.parentID, before: before) }
         guard previous != folders.items else { return false }
-        reorderFeedback()
+        if haptic { reorderFeedback() }
         return true
     }
 

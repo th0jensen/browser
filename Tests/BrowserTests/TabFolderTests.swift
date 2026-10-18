@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import Browser
 
@@ -138,4 +140,160 @@ final class TabFolderTests: XCTestCase {
         XCTAssertTrue(browser.acceptFolderDrop("browser-folder:\(pageID)", parentID: nil))
         XCTAssertNil(store.item(pageID)?.parentID)
     }
+
+    func testFolderHoverFeedbackOccursOnEntryAndReentryButNotWhileLingeringOrExpanding() async throws {
+        let store = TabFolderStore(directory: .temporaryDirectory, enabled: false)
+        let folder = try store.createFolder(title: "Drop here")
+        _ = try store.savePage(url: URL(string: "https://example.com/first")!, title: "First child", in: folder.id)
+        _ = try store.savePage(url: URL(string: "https://example.com/second")!, title: "Second child", in: folder.id)
+        let browser = BrowserModel(folders: store)
+        browser.restoreSession(BrowserSessionSnapshot(tabs: [
+            .init(url: URL(string: "https://example.com/dragged")!, title: "Dragged tab"),
+            .init(url: nil, title: ""),
+        ], selectedIndex: 1))
+        let source = browser.tabs[0].id.uuidString
+        var feedback = 0
+        browser.reorderFeedback = { feedback += 1 }
+        var sidebarFrame: CGRect?
+        let host = NSHostingView(rootView: FolderSidebar(browser: browser, rowHeight: 32)
+            .frame(width: 220, height: 160, alignment: .top)
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { sidebarFrame = $0 })
+        host.sceneBridgingOptions = []
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 220, height: 160),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.orderBack(nil)
+        defer { browser.tabDrag.endGesture(); window.close() }
+        try await waitForFolderHover { sidebarFrame != nil }
+        let targetFrame = try XCTUnwrap(sidebarFrame)
+        let sourceFrame = CGRect(x: targetFrame.minX, y: targetFrame.minY + 125, width: 220, height: 32)
+        browser.tabDrag.register(source, frame: sourceFrame, axis: .vertical)
+        XCTAssertTrue(browser.tabDrag.begin(source, frame: sourceFrame, axis: .vertical,
+                                            crossing: { _, _ in }, completion: { _ in }))
+        let entered = CGSize(width: 0, height: targetFrame.minY + 16 - sourceFrame.midY)
+        browser.tabDrag.update(translation: entered)
+        try await waitForFolderHover { feedback == 1 }
+        let firstChild = CGSize(width: 0, height: entered.height + 32 + BrowserChrome.smallGap)
+        browser.tabDrag.update(translation: firstChild)
+        try await waitForFolderHover { feedback == 2 }
+        let secondChild = CGSize(width: 0, height: firstChild.height + 32 + BrowserChrome.smallGap)
+        browser.tabDrag.update(translation: secondChild)
+        try await waitForFolderHover { feedback == 3 }
+        for offset in [1.0, 2.0, -1.0] {
+            browser.tabDrag.update(translation: CGSize(width: 0, height: secondChild.height + offset))
+            await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        }
+        XCTAssertEqual(feedback, 3, "Pointer motion inside the same child row must stay quiet")
+        browser.tabDrag.update(translation: .zero)
+        try await waitForFolderHover { !browser.tabDrag.isOver(SidebarDragItem.pinned(folder.id).payload) }
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        browser.tabDrag.update(translation: entered)
+        try await waitForFolderHover { feedback == 4 }
+        browser.tabDrag.endGesture()
+        browser.changeFolders { try store.toggleExpanded(folder.id) }
+        browser.changeFolders { try store.toggleExpanded(folder.id) }
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        XCTAssertEqual(feedback, 4, "Folder expansion and collapse are unrelated to drag-hover feedback")
+    }
+
+    func testFolderHoverAcceptsTemporarySavedAndEssentialTabsButRejectsOtherSources() throws {
+        let store = TabFolderStore(directory: .temporaryDirectory, enabled: false)
+        let pins = PinnedPageStore(directory: .temporaryDirectory, enabled: false)
+        let folder = try store.createFolder(title: "Target")
+        let page = try store.savePage(url: URL(string: "https://example.com/saved")!, title: "Saved", in: folder.id)
+        let sibling = try store.savePage(url: URL(string: "https://example.com/sibling")!, title: "Sibling", in: folder.id)
+        let rootPage = try store.savePage(url: URL(string: "https://example.com/root")!, title: "Root page", in: nil)
+        let essential = try pins.pin(url: URL(string: "https://example.com/essential")!, title: "Essential")
+        let browser = BrowserModel(pinnedPages: pins, folders: store)
+        browser.restoreSession(BrowserSessionSnapshot(tabs: [
+            .init(url: URL(string: "https://example.com/temporary")!, title: "Temporary"),
+            .init(url: nil, title: ""),
+        ], selectedIndex: 1))
+        var feedback = 0
+        browser.reorderFeedback = { feedback += 1 }
+        let frame = CGRect(x: 0, y: 0, width: 200, height: 32)
+        let validSources = [browser.tabs[0].id.uuidString, SidebarDragItem.pinned(page.id).payload,
+                            SidebarDragItem.essential(essential.id).payload]
+        for source in validSources {
+            XCTAssertTrue(browser.tabDrag.begin(source, frame: frame, axis: .vertical,
+                                                crossing: { _, _ in }, completion: { _ in }))
+            browser.didEnterFolderRowDropTarget(folder.id)
+            browser.didEnterFolderRowDropTarget(sibling.id)
+            browser.didEnterFolderRowDropTarget(rootPage.id)
+            browser.tabDrag.endGesture()
+        }
+        XCTAssertEqual(feedback, 6, "Saved tabs can hover over their folder and sibling rows, but root pages retain reorder feedback")
+        let invalidSources = [browser.tabs[1].id.uuidString, SidebarDragItem.pinned(folder.id).payload,
+                              SidebarDragItem.essential(UUID()).payload, SidebarDragItem.section(UUID()).payload, "foreign"]
+        for source in invalidSources {
+            XCTAssertTrue(browser.tabDrag.begin(source, frame: frame, axis: .vertical,
+                                                crossing: { _, _ in }, completion: { _ in }))
+            browser.didEnterFolderRowDropTarget(folder.id)
+            browser.didEnterFolderRowDropTarget(page.id)
+            browser.tabDrag.endGesture()
+        }
+        XCTAssertEqual(feedback, 6)
+        XCTAssertEqual(store.item(page.id)?.parentID, folder.id, "Hover must not move or materialize saved pages")
+        XCTAssertEqual(browser.tabs.count, 2)
+    }
+
+    func testSavedChildNativeReorderPulsesOncePerRowWithoutDuplicateCrossingFeedback() async throws {
+        let store = TabFolderStore(directory: .temporaryDirectory, enabled: false)
+        let folder = try store.createFolder(title: "Saved")
+        let pages = try (0..<3).map {
+            try store.savePage(url: URL(string: "https://example.com/child/\($0)")!, title: "Child \($0)", in: folder.id)
+        }
+        let browser = BrowserModel(folders: store)
+        browser.tabDrag.canSplit = { _, _ in false } // Isolate row reordering from its independent split targets.
+        var feedback = 0
+        browser.reorderFeedback = { feedback += 1 }
+        var sidebarFrame: CGRect?
+        let host = NSHostingView(rootView: FolderSidebar(browser: browser, rowHeight: 32)
+            .frame(width: 220, height: 200, alignment: .top)
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { sidebarFrame = $0 })
+        host.sceneBridgingOptions = []
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 220, height: 200),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.orderBack(nil)
+        defer { browser.tabDrag.endGesture(); window.close() }
+        try await waitForFolderHover { sidebarFrame != nil }
+        let frame = try XCTUnwrap(sidebarFrame)
+        let rowSpacing = 32 + BrowserChrome.smallGap
+        let sourceFrame = CGRect(x: frame.minX + 14, y: frame.minY + rowSpacing, width: 206, height: 32)
+        let source = SidebarDragItem.pinned(pages[0].id).payload
+        browser.tabDrag.register(source, frame: sourceFrame, axis: .vertical)
+        XCTAssertTrue(browser.tabDrag.begin(source, frame: sourceFrame, axis: .vertical,
+            crossing: { target, direction in browser.crossDraggedTab(source, past: target, direction: direction) },
+            completion: { _ in }))
+        // Jump straight past a child's midpoint so native crossing reorders before SwiftUI processes onChange.
+        browser.tabDrag.update(translation: CGSize(width: 0, height: rowSpacing + 1))
+        try await waitForFolderHover { feedback == 1 && store.pages.map(\.id) == [pages[1].id, pages[0].id, pages[2].id] }
+        for offset in [1.0, 2.0, 3.0] {
+            browser.tabDrag.update(translation: CGSize(width: 0, height: rowSpacing + offset))
+            await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        }
+        XCTAssertEqual(feedback, 1, "The native crossing and row entry describe the same haptic event")
+        browser.tabDrag.update(translation: CGSize(width: 0, height: rowSpacing * 2 + 1))
+        try await waitForFolderHover { feedback == 2 && store.pages.map(\.id) == [pages[1].id, pages[2].id, pages[0].id] }
+        browser.tabDrag.endGesture()
+        XCTAssertTrue(browser.reorderSavedPage(pages[0].id, past: pages[1].id))
+        XCTAssertEqual(feedback, 3, "Direct saved-page reorder callers keep their existing feedback")
+    }
+
+    private func waitForFolderHover(_ condition: @MainActor () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Folder hover state did not update")
+                throw FolderHoverTestError.timedOut
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
 }
+
+private enum FolderHoverTestError: Error { case timedOut }
