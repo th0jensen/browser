@@ -1,27 +1,19 @@
 import SwiftUI
 
 struct IntelligenceSettings: View {
-    @State private var windowSettingsTarget = WindowChromeSettingsTarget.shared
+    @AppStorage(BrowserIntelligence.showsTidyTabsKey) private var showsTidyTabs = true
     @AppStorage(BrowserIntelligence.tidyTabTitlesKey) private var tidyTabTitles = false
     @AppStorage(BrowserIntelligence.tidyDownloadsKey) private var tidyDownloads = false
     @AppStorage(BrowserIntelligence.fiveSecondPreviewsKey) private var fiveSecondPreviews = false
 
-    private var browser: BrowserModel? { windowSettingsTarget.browser }
-    private var isTidyingTabs: Bool { browser?.isTidyingTabs == true }
-    private var canTidyTabs: Bool {
-        browser?.canTidyTabs == true && BrowserIntelligence.unavailableReason == nil
-    }
-
     var body: some View {
         Form {
-            Section {
-                Button(isTidyingTabs ? "Cancel Tidy Tabs" : "Tidy Tabs") {
-                    if isTidyingTabs { browser?.cancelTidyingTabs() }
-                    else { browser?.tidyTemporaryTabs() }
+            Section("Sidebar") {
+                Toggle(isOn: $showsTidyTabs) {
+                    Text("Show Tidy Tabs in the sidebar")
+                    Text("Show the Tidy Tabs button when there are seven or more temporary tabs, or when tabs are already grouped.")
                 }
-                .disabled(!isTidyingTabs && !canTidyTabs)
-            } footer: {
-                Text("Group temporary tabs by topic in the current browser window. Available with seven or more temporary web tabs. You can also choose Tabs → Tidy Tabs.")
+                .accessibilityLabel("Show Tidy Tabs in the sidebar")
             }
 
             Section("Automatic Features") {

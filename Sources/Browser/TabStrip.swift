@@ -32,6 +32,7 @@ struct TabStrip: View {
     var usesNativeHoverPopover = false
     var floating = false
     @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
+    @AppStorage(BrowserIntelligence.showsTidyTabsKey) private var showsTidyTabs = true
 
     @State private var hoveredTabID: UUID?
     @State private var suppressedHoverCardTabID: UUID?
@@ -205,8 +206,8 @@ struct TabStrip: View {
     }
 
     private var showsTidyDivider: Bool {
-        browser.regularTabs.count > 6 || browser.isTidyingTabs
-            || browser.regularTabs.contains { $0.temporarySection != nil }
+        showsTidyTabs && (browser.regularTabs.count > 6 || browser.isTidyingTabs
+            || browser.regularTabs.contains { $0.temporarySection != nil })
     }
 
     private var sidebarDividerHeight: CGFloat {
