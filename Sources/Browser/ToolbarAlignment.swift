@@ -84,6 +84,24 @@ final class ToolbarAlignmentView: NSView {
                 sizedHost = host
             }
             minimumWidth?.constant = 160
+            let items = window.toolbar?.items ?? []
+            let flexibleCount = items.filter { $0.itemIdentifier == .flexibleSpace }.count
+            if flexibleCount > 0 {
+                let fixedWidth = items.filter { $0 !== item && $0.itemIdentifier != .flexibleSpace }.reduce(CGFloat.zero) { width, item in
+                    width + (item.itemIdentifier == .space ? 20 : (item.view?.fittingSize.width ?? 24))
+                }
+                // A flexible item may precede the address field. Its allocated
+                // position cannot be used as an input to its own next allocation.
+                let leading: CGFloat
+                if window.toolbarStyle != .expanded, let zoom = window.standardWindowButton(.zoomButton) {
+                    leading = zoom.convert(zoom.bounds, to: nil).maxX + BrowserChrome.edgeInset
+                } else { leading = BrowserChrome.edgeInset }
+                let gutters = CGFloat(max(0, items.count - 1)) * BrowserChrome.edgeInset
+                let available = max(160, window.frame.width - leading - fixedWidth - gutters - BrowserChrome.edgeInset)
+                maximumWidth?.constant = max(160, available / CGFloat(flexibleCount + 1))
+            } else {
+                maximumWidth?.constant = 100_000
+            }
         }
     }
 }

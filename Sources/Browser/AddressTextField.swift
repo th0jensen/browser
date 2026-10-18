@@ -6,6 +6,7 @@ struct AddressTextField: NSViewRepresentable {
     @Environment(\.chromeRegionIsVisible) private var chromeRegionIsVisible
     @Binding var text: String
     var requiresVisibleToolbar = true
+    var browserWindow: NSWindow?
     var pageURL: URL?
     var pageTitle = ""
     let focusRequest: Int
@@ -17,13 +18,14 @@ struct AddressTextField: NSViewRepresentable {
 
     func makeNSView(context: Context) -> AddressField {
         let field = AddressField()
+        field.browserWindow = browserWindow
         field.requiresVisibleToolbar = requiresVisibleToolbar
         field.regionIsVisible = chromeRegionIsVisible
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
         field.font = .systemFont(ofSize: 13)
-        field.textColor = .labelColor
+        field.textColor = .textColor
         field.placeholderString = "Search or enter address"
         field.usesSingleLineMode = true
         field.lineBreakMode = .byTruncatingMiddle
@@ -41,6 +43,7 @@ struct AddressTextField: NSViewRepresentable {
 
     func updateNSView(_ field: AddressField, context: Context) {
         context.coordinator.parent = self
+        field.browserWindow = browserWindow
         field.requiresVisibleToolbar = requiresVisibleToolbar
         field.regionIsVisible = chromeRegionIsVisible
         field.updatePresentation(text: text, url: pageURL, title: pageTitle)
@@ -59,6 +62,7 @@ struct AddressTextField: NSViewRepresentable {
 }
 
 final class AddressField: NSTextField {
+    weak var browserWindow: NSWindow?
     var requiresVisibleToolbar = true
     var regionIsVisible = true
     var onFocusChange: ((Bool) -> Void)?
@@ -88,15 +92,15 @@ final class AddressField: NSTextField {
         }
         let site = pageURL.host() ?? pageURL.absoluteString
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: font ?? NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.labelColor
+            .font: font ?? NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.textColor
         ]
         let title = NSMutableAttributedString(string: site, attributes: attributes)
         if !pageTitle.isEmpty, pageTitle != site, pageTitle != pageURL.absoluteString {
             title.append(NSAttributedString(string: " / ", attributes: attributes.merging([
-                .foregroundColor: NSColor.labelColor.withAlphaComponent(0.3)
+                .foregroundColor: NSColor.textColor.withAlphaComponent(0.5)
             ]) { _, value in value }))
             title.append(NSAttributedString(string: pageTitle, attributes: attributes.merging([
-                .foregroundColor: NSColor.labelColor.withAlphaComponent(0.45)
+                .foregroundColor: NSColor.textColor.withAlphaComponent(0.72)
             ]) { _, value in value }))
         }
         // The preview is only painted. The real cell and its field editor always
@@ -126,8 +130,8 @@ final class AddressField: NSTextField {
     }
 
     private var canReceiveFocus: Bool {
-        regionIsVisible && !isHiddenOrHasHiddenAncestor
-            && (!requiresVisibleToolbar || window?.toolbar?.isVisible != false)
+        window != nil && regionIsVisible && !isHiddenOrHasHiddenAncestor
+            && (!requiresVisibleToolbar || (browserWindow ?? window)?.toolbar?.isVisible != false)
     }
 
     override var acceptsFirstResponder: Bool { canReceiveFocus && super.acceptsFirstResponder }

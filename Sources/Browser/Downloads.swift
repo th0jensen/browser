@@ -21,6 +21,12 @@ final class DownloadItem: Identifiable {
     /// Negative while the server hasn't said how large the file is.
     fileprivate(set) var totalBytes: Int64 = -1
     fileprivate(set) var destinationURL: URL?
+    fileprivate(set) var originalName: String?
+    fileprivate(set) var namingError: String?
+    fileprivate(set) var isNaming = false
+    @ObservationIgnored fileprivate var sourceTitle = ""
+    @ObservationIgnored fileprivate var sourceURL: URL?
+    @ObservationIgnored fileprivate var namingTask: Task<Void, Never>?
     @ObservationIgnored fileprivate let download: WKDownload
     @ObservationIgnored fileprivate var progressObservation: NSKeyValueObservation?
     /// Asks whether a download the page started on its own may go ahead, or `nil` when the user started it.
@@ -38,9 +44,20 @@ final class DownloadItem: Identifiable {
 final class DownloadManager: NSObject, WKDownloadDelegate {
     private(set) var items: [DownloadItem] = []
     @ObservationIgnored let directory: URL
+    @ObservationIgnored private let shouldTidyDownloads: @MainActor () -> Bool
+    @ObservationIgnored private let suggestName: @Sendable (String, String, URL?) async throws -> String
 
-    init(directory: URL = .downloadsDirectory) {
+    init(directory: URL = .downloadsDirectory,
+         shouldTidyDownloads: @escaping @MainActor () -> Bool = {
+             !BrowserProfile.isTesting && UserDefaults.standard.bool(forKey: BrowserIntelligence.downloadsKey)
+                 && BrowserIntelligence.unavailableReason == nil
+         },
+         suggestName: @escaping @Sendable (String, String, URL?) async throws -> String = {
+             try await LocalIntelligence.shared.downloadName(filename: $0, sourceTitle: $1, sourceURL: $2)
+         }) {
         self.directory = directory
+        self.shouldTidyDownloads = shouldTidyDownloads
+        self.suggestName = suggestName
     }
 
     var isDownloading: Bool {
@@ -56,8 +73,11 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
 
     /// Pass a confirmation for a download the user didn't start. It's asked before anything is saved,
     /// and the download disappears if it's refused.
-    func track(_ download: WKDownload, confirmation: (@MainActor () async -> Bool)? = nil) {
+    func track(_ download: WKDownload, sourceTitle: String = "", sourceURL: URL? = nil, confirmation: (@MainActor () async -> Bool)? = nil) {
         let item = DownloadItem(download: download)
+        if shouldTidyDownloads() { Task { await LocalIntelligence.shared.prepare(.download) } }
+        item.sourceTitle = sourceTitle
+        item.sourceURL = sourceURL
         item.confirmation = confirmation
         download.delegate = self
         item.progressObservation = download.progress.observe(\.fractionCompleted) { [weak item] progress, _ in
@@ -92,6 +112,7 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
     }
 
     func clearFinished() {
+        items.filter { $0.state != .downloading }.forEach { $0.namingTask?.cancel() }
         items.removeAll { $0.state != .downloading }
     }
 
@@ -147,6 +168,7 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         item.progress = 1
         if let url = item.destinationURL {
             quarantine(url, from: download.originalRequest?.url)
+            tidyDownload(item)
         }
     }
 
@@ -155,6 +177,59 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         item.state = .failed
         // Without resume support, a partial file is of no use.
         if let url = item.destinationURL { try? FileManager.default.removeItem(at: url) }
+    }
+
+    private func tidyDownload(_ item: DownloadItem) {
+        guard shouldTidyDownloads(), let originalURL = item.destinationURL else { return }
+        let originalName = item.name
+        let suggest = suggestName
+        item.isNaming = true
+        item.namingTask = Task { [weak self, weak item] in
+            defer { item?.namingTask = nil; item?.isNaming = false }
+            do {
+                let stem = try await suggest(originalName, item?.sourceTitle ?? "", item?.sourceURL)
+                guard let self, let item, !Task.isCancelled, item.state == .finished,
+                      item.destinationURL == originalURL, self.items.contains(where: { $0 === item }),
+                      self.shouldTidyDownloads() else { return }
+                let name = Self.tidyFilename(stem: stem, original: originalName)
+                guard name.caseInsensitiveCompare(originalName) != .orderedSame else { return }
+                try self.renameDownloadedFile(item, to: name)
+                item.originalName = originalName
+            } catch is CancellationError { }
+            catch { item?.namingError = "Kept the original filename. " + error.localizedDescription }
+        }
+    }
+
+    func undoTidyName(_ item: DownloadItem) {
+        guard item.state == .finished, let original = item.originalName else { return }
+        do {
+            try renameDownloadedFile(item, to: original)
+            item.originalName = nil
+            item.namingError = nil
+        } catch { item.namingError = error.localizedDescription }
+    }
+
+    private func renameDownloadedFile(_ item: DownloadItem, to name: String) throws {
+        guard let source = item.destinationURL, source.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL else { return }
+        let destination = Self.uniqueURL(for: name, in: directory) { FileManager.default.fileExists(atPath: $0.path) }
+        // moveItem refuses to overwrite an existing file, even if it appeared after
+        // the name check. Moving within the directory preserves quarantine metadata.
+        try FileManager.default.moveItem(at: source, to: destination)
+        item.destinationURL = destination
+        item.name = destination.lastPathComponent
+    }
+
+    nonisolated static func tidyFilename(stem: String, original: String) -> String {
+        let compounds = ["tar.gz", "tar.bz2", "tar.xz", "tar.zst"]
+        let suffix = compounds.first { original.lowercased().hasSuffix("." + $0) }
+            .map { String(original.suffix($0.count)) } ?? (original as NSString).pathExtension
+        var clean = stem.components(separatedBy: CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:\\")))
+            .joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        if !suffix.isEmpty, clean.lowercased().hasSuffix("." + suffix.lowercased()) { clean.removeLast(suffix.count + 1) }
+        clean = String(clean.prefix(100)).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        guard !clean.isEmpty else { return original }
+        return suffix.isEmpty ? clean : clean + "." + suffix
     }
 
     /// Marks the file as downloaded from the web, so Gatekeeper checks it before it's opened.

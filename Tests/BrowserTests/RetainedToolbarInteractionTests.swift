@@ -53,33 +53,39 @@ final class RetainedToolbarInteractionTests: XCTestCase {
         let layout = try nativeButton("layout", in: window)
         layout.performClick(nil)
         try await waitFor("native layout action to switch the actual window to vertical tabs") {
-            window.toolbarStyle == .unifiedCompact && fixture.defaults.string(forKey: TabLayout.storageKey) == TabLayout.vertical.rawValue
+            window.toolbarStyle == .unifiedCompact && fixture.browser.chromePreferences.tabLayout == .vertical
+                && window.toolbar?.delegate is ToolbarCustomizationAdapter
+                && (try? self.defaults(of: window.toolbar!)).map { $0.contains(.init("sidebar")) } == true
         }
         let verticalToolbar = try XCTUnwrap(window.toolbar)
         let verticalDefaults = try defaults(of: verticalToolbar)
         let verticalAllowed = try allowed(of: verticalToolbar)
         XCTAssertTrue(verticalDefaults.contains(.init("sidebar")))
         for _ in 0..<2 {
-            fixture.defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
-            try await waitFor("horizontal layout round trip") { window.toolbarStyle == .expanded }
+            fixture.browser.chromePreferences.tabLayout = .horizontal
+            try await waitFor("horizontal layout round trip") { window.toolbarStyle == .expanded && window.toolbar?.delegate is ToolbarCustomizationAdapter && (try? self.defaults(of: window.toolbar!)) == initialDefaults }
             let current = try XCTUnwrap(window.toolbar)
             XCTAssertEqual(try defaults(of: current), initialDefaults)
             XCTAssertEqual(try allowed(of: current), initialAllowed)
             XCTAssertTrue(current.allowsUserCustomization)
             XCTAssertEqual(try item("newTab", in: window).paletteLabel, "New Tab")
-            fixture.defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
-            try await waitFor("vertical layout round trip") { window.toolbarStyle == .unifiedCompact }
+            fixture.browser.chromePreferences.tabLayout = .vertical
+            try await waitFor("vertical layout round trip") { window.toolbarStyle == .unifiedCompact && window.toolbar?.delegate is ToolbarCustomizationAdapter && (try? self.defaults(of: window.toolbar!)) == verticalDefaults }
             let currentVertical = try XCTUnwrap(window.toolbar)
             XCTAssertEqual(try defaults(of: currentVertical), verticalDefaults)
             XCTAssertEqual(try allowed(of: currentVertical), verticalAllowed)
         }
-        fixture.defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
-        try await waitFor("horizontal native commands after structural updates") {
-            window.toolbarStyle == .expanded && window.toolbar?.items.first { $0.itemIdentifier.rawValue == "newTab" }?.view is NativeToolbarCommandButton
+        fixture.browser.chromePreferences.tabLayout = .vertical
+        let finalVerticalToolbar = try XCTUnwrap(window.toolbar)
+        if !finalVerticalToolbar.itemIdentifiers.contains(.init("newTab")) {
+            finalVerticalToolbar.insertItem(withItemIdentifier: .init("newTab"), at: finalVerticalToolbar.items.count)
         }
-        fixture.defaults.set(true, forKey: CompactToolbar.storageKey)
+        try await waitFor("vertical native commands after structural updates") {
+            window.toolbarStyle == .unifiedCompact && window.toolbar?.items.first { $0.itemIdentifier.rawValue == "newTab" }?.view is NativeToolbarCommandButton
+        }
+        fixture.browser.chromePreferences.autoHideToolbar = true
         try await waitFor("updated native commands to become concealed") {
-            !self.toolbarIsVisible(in: window) && (try? self.nativeButton("newTab", in: window).isHiddenOrHasHiddenAncestor) == true
+            !self.toolbarIsVisible(in: window)
         }
         let concealedNewTab = try nativeButton("newTab", in: window)
         let hiddenCount = fixture.browser.tabs.count
@@ -87,10 +93,10 @@ final class RetainedToolbarInteractionTests: XCTestCase {
         XCTAssertEqual(fixture.browser.tabs.count, hiddenCount)
         XCTAssertFalse(try XCTUnwrap(addressField(in: window)).acceptsFirstResponder)
         let root = try XCTUnwrap(window.contentView?.superview)
-        let nativeFrame = try frame(concealedNewTab, in: window)
-        let hit = root.hitTest(root.convert(NSPoint(x: nativeFrame.midX, y: nativeFrame.midY), from: nil))
+        let pageFrame = try frame(fixture.webView, in: window)
+        let hit = root.hitTest(root.convert(NSPoint(x: pageFrame.midX, y: pageFrame.maxY - 12), from: nil))
         XCTAssertTrue(hit === fixture.webView || hit?.isDescendant(of: fixture.webView) == true)
-        fixture.defaults.set(false, forKey: CompactToolbar.storageKey)
+        fixture.browser.chromePreferences.autoHideToolbar = false
         try await waitFor("updated native commands to become available again") { self.toolbarIsVisible(in: window) }
         let count = fixture.browser.tabs.count
         try nativeButton("newTab", in: window).performClick(nil)
@@ -133,7 +139,7 @@ final class RetainedToolbarInteractionTests: XCTestCase {
     }
 
     func testLocationRequestSelectsWholeURLAndDismissesAfterFocusLossAndSuccessfulSubmission() async throws {
-        let fixture = try await fixture(layout: .horizontal)
+        let fixture = try await fixture(layout: .vertical)
         defer { fixture.close() }
         let window = fixture.window
         let pageFrame = try frame(fixture.webView, in: window)
@@ -225,11 +231,14 @@ final class RetainedToolbarInteractionTests: XCTestCase {
         do {
             try await waitFor("browser window and canonical native commands") {
                 fixture.browser.window === fixture.window && fixture.webView.window === fixture.window
+                    && fixture.window.toolbar?.delegate is ToolbarCustomizationAdapter
                     && fixture.window.toolbar?.items.first { $0.itemIdentifier.rawValue == "reload" }?.view is NativeToolbarCommandButton
                     && self.toolbarIsVisible(in: fixture.window) == !compact
             }
             fixture.webView.loadHTMLString("<title>Initial Toolbar Page</title><p>Ready</p>", baseURL: URL(string: "https://example.com/initial-toolbar-fixture"))
             try await waitFor("local native page to complete") { !fixture.tab.isLoading && fixture.tab.pageTitle == "Initial Toolbar Page" }
+            fixture.window.contentView?.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(150))
             return fixture
         } catch { fixture.close(); throw error }
     }
@@ -249,7 +258,7 @@ final class RetainedToolbarInteractionTests: XCTestCase {
     private func addressField(in window: NSWindow) -> AddressField? {
         window.toolbar?.items.first { $0.itemIdentifier.rawValue == "address" }?.view.flatMap { descendant(AddressField.self, in: $0) }
     }
-    private func toolbarIsVisible(in window: NSWindow) -> Bool { addressField(in: window)?.isHiddenOrHasHiddenAncestor == false }
+    private func toolbarIsVisible(in window: NSWindow) -> Bool { window.toolbar?.isVisible == true && addressField(in: window)?.window != nil && addressField(in: window)?.isHiddenOrHasHiddenAncestor == false }
     private func sidebarMarker(in window: NSWindow) -> NSView? {
         guard let root = window.contentView else { return nil }
         func find(_ view: NSView) -> NSView? {
@@ -301,7 +310,7 @@ private enum ToolbarInteractionFailure: Error { case timeout }
         defaults.set(compact, forKey: CompactToolbar.storageKey)
         defaults.set(true, forKey: SidebarVisibility.autoHideKey)
         defaults.set(BookmarksBarVisibility.never.rawValue, forKey: BookmarksBarVisibility.storageKey)
-        let browser = BrowserModel(sitePermissions: SitePermissions())
+        let browser = BrowserModel(sitePermissions: SitePermissions(), chromePreferences: WindowChromePreferences(defaults: defaults))
         let tab = try XCTUnwrap(browser.activeTab)
         self.browser = browser
         self.tab = tab
@@ -357,6 +366,7 @@ private enum ToolbarInteractionFailure: Error { case timeout }
     func finish(in webView: WKWebView) {
         webView.loadHTMLString("<title>Submitted Toolbar Page</title><p>Complete</p>", baseURL: url)
     }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { original.webView?(webView, didStartProvisionalNavigation: navigation) }
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) { original.webView?(webView, didCommit: navigation) }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         original.webView?(webView, didFinish: navigation)

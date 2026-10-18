@@ -2,8 +2,8 @@ import AppKit
 import WebKit
 
 extension BrowserModel: WKWebExtensionWindow {
-    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { tabs }
-    func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { activeTab }
+    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { tabs + (peek.map { [$0.tab] } ?? []) }
+    func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { peek?.tab ?? activeTab }
     func windowType(for context: WKWebExtensionContext) -> WKWebExtension.WindowType { .normal }
     func isPrivate(for context: WKWebExtensionContext) -> Bool { false }
     func focus(for context: WKWebExtensionContext) async throws {
@@ -14,13 +14,13 @@ extension BrowserModel: WKWebExtensionWindow {
 
 extension BrowserTab: WKWebExtensionTab {
     func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { browser }
-    func indexInWindow(for context: WKWebExtensionContext) -> Int { browser?.tabs.firstIndex(where: { $0.id == id }) ?? 0 }
+    func indexInWindow(for context: WKWebExtensionContext) -> Int { browser?.tabs.firstIndex(where: { $0.id == id }) ?? browser?.tabs.count ?? 0 }
     func parentTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { browser?.tab(withID: openerID) }
     func webView(for context: WKWebExtensionContext) -> WKWebView? { webView }
     func title(for context: WKWebExtensionContext) -> String? { title }
     func url(for context: WKWebExtensionContext) -> URL? { url }
     func isLoadingComplete(for context: WKWebExtensionContext) -> Bool { !isLoading }
-    func isSelected(for context: WKWebExtensionContext) -> Bool { browser?.activeTabID == id }
+    func isSelected(for context: WKWebExtensionContext) -> Bool { (browser?.peek?.tab.id ?? browser?.activeTabID) == id }
     func size(for context: WKWebExtensionContext) -> CGSize { contentView.bounds.size }
     func zoomFactor(for context: WKWebExtensionContext) -> Double { Double(webView?.pageZoom ?? 1) }
     func setZoomFactor(_ zoomFactor: Double, for context: WKWebExtensionContext) async throws { webView?.pageZoom = CGFloat(zoomFactor) }
@@ -31,9 +31,12 @@ extension BrowserTab: WKWebExtensionTab {
     }
     func goBack(for context: WKWebExtensionContext) async throws { goBack() }
     func goForward(for context: WKWebExtensionContext) async throws { webView?.goForward() }
-    func activate(for context: WKWebExtensionContext) async throws { browser?.activeTabID = id }
+    func activate(for context: WKWebExtensionContext) async throws {
+        if browser?.peek?.tab === self { browser?.window?.makeFirstResponder(webView) }
+        else { browser?.activeTabID = id }
+    }
     func setSelected(_ selected: Bool, for context: WKWebExtensionContext) async throws {
-        if selected { browser?.activeTabID = id }
+        if selected { try await activate(for: context) }
     }
     func close(for context: WKWebExtensionContext) async throws { browser?.closeTab(id) }
     func shouldGrantPermissionsOnUserGesture(for context: WKWebExtensionContext) -> Bool { true }

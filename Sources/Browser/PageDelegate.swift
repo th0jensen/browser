@@ -33,6 +33,13 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             browser.openChildTab(of: tab, loading: navigationAction.request, select: false)
             return .cancel
         }
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.targetFrame?.isMainFrame == true,
+           let url = navigationAction.request.url, let tab, let browser = tab.browser,
+           browser.shouldPeek(url, from: tab) {
+            browser.openPeek(from: tab, request: navigationAction.request)
+            return .cancel
+        }
         return .allow
     }
 
@@ -66,7 +73,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
                 await self?.askToAllowDownloads(on: site, in: webView)
             }
         }
-        browser.downloads.track(download, confirmation: isUserStarted ? nil : confirmation)
+        browser.downloads.track(download, sourceTitle: tab.pageTitle, sourceURL: tab.url, confirmation: isUserStarted ? nil : confirmation)
         // A download typed into a new tab leaves no page behind, so show the new tab page again.
         if webView.backForwardList.currentItem == nil { tab.isNewTab = true }
     }
@@ -83,6 +90,8 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        if let tab { tab.browser?.savedTabBeganLoading(tab) }
+        LinkPreviewController.shared.dismiss(for: webView)
         PagePaintObserver.shared.navigationStarted(in: webView)
     }
 
@@ -95,6 +104,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         PagePaintObserver.shared.navigationFinished(in: webView)
+        if let tab { tab.browser?.savedTabFinishedLoading(tab) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -157,6 +167,15 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             popup?.extensionOrigin = tab.extensionOrigin
             return popup?.webView
         }
+        if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url,
+           browser.shouldPeek(url, from: tab) {
+            return browser.openPeek(from: tab, configuration: configuration).webView
+        }
+        if navigationAction.navigationType == .linkActivated, let home = tab.pinnedHomeURL,
+           let url = navigationAction.request.url, PinnedNavigation.isSameSite(url, as: home) {
+            webView.load(navigationAction.request)
+            return nil
+        }
         return browser.openChildTab(of: tab, configuration: configuration, select: true).webView
     }
 
@@ -164,7 +183,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// suspended, and loads again when it's selected.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard let tab else { return }
-        if tab.browser?.activeTabID == tab.id {
+        if tab.browser?.activeTabID == tab.id || tab.browser?.peek?.tab.id == tab.id {
             webView.reload()
         } else {
             tab.suspend()
@@ -173,6 +192,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webViewDidClose(_ webView: WKWebView) {
         guard let tab, let browser = tab.browser else { return }
+        if browser.peek?.tab.id == tab.id { browser.dismissPeek(); return }
         if tab.isPopUp, browser.tabs.count == 1, let window = browser.window {
             window.close()
         } else {

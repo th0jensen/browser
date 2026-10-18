@@ -1,31 +1,51 @@
 import AppKit
 import Foundation
 import Observation
+import SwiftUI
 import WebKit
 
 @MainActor
 @Observable
 final class BrowserModel: NSObject {
     @ObservationIgnored weak var chromeHover: ChromeHoverController?
+    let chromePreferences: WindowChromePreferences
     let downloads: DownloadManager
     let sitePermissions: SitePermissions
     let pinnedPages: PinnedPageStore
     let folders: TabFolderStore
     var folderEditorRequest: FolderEditorRequest?
+    var renamingSavedPageID: UUID?
+    var isTidyingTabs = false
+    var intelligenceError: String?
+    @ObservationIgnored var reorderFeedback: () -> Void = {
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .drawCompleted)
+    }
+    @ObservationIgnored private var tidyTask: Task<Void, Never>?
+    @ObservationIgnored private var titleTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var titleTaskTokens: [UUID: UUID] = [:]
+    private(set) var namingSavedPageIDs: Set<UUID> = []
+    @ObservationIgnored let tabDrag = TabReorderController()
 
     private(set) var tabs: [BrowserTab] = []
+    private(set) var peek: PeekPage?
+    var splits: [SplitTabGroup] = []
     private var closedTabs: [ClosedTab] = []
     var activeTabID: UUID? {
         didSet {
             guard oldValue != activeTabID else { return }
+            dismissPeek()
             if let previousTab = tab(withID: oldValue) {
+                if let view = previousTab.webView { LinkPreviewController.shared.dismiss(for: view) }
                 // Keep a preview of the page being left for background-tab hover cards.
                 previousTab.captureThumbnail(afterScreenUpdates: false, minimumAge: .seconds(2))
                 previousTab.lastActive = .now
             }
             activeTab?.restore()
+            restoreVisibleSplit()
             activeTab?.didBecomeSelected()
-            if let pageID = activeTab?.folderPageID { changeFolders { try folders.reveal(pageID) } }
+            let representedTab = tab(withID: activeSplit?.anchorID) ?? activeTab
+            if let pageID = representedTab?.folderPageID { changeFolders { try folders.reveal(pageID) } }
+            if let section = representedTab?.temporarySection, !section.isExpanded { setTemporarySectionExpanded(section.id, expanded: true) }
             if let activeTab {
                 BrowserExtensions.shared.didActivate(activeTab, previous: tab(withID: oldValue))
             }
@@ -50,7 +70,8 @@ final class BrowserModel: NSObject {
 
     init(downloads: DownloadManager = DownloadManager(), sitePermissions: SitePermissions = .shared,
          configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), pinnedPages: PinnedPageStore? = nil,
-         folders: TabFolderStore? = nil) {
+         folders: TabFolderStore? = nil, chromePreferences: WindowChromePreferences? = nil) {
+        self.chromePreferences = chromePreferences ?? WindowChromePreferences()
         self.downloads = downloads
         self.sitePermissions = sitePermissions
         self.pinnedPages = pinnedPages ?? (BrowserProfile.isTesting
@@ -58,13 +79,21 @@ final class BrowserModel: NSObject {
         self.folders = folders ?? (BrowserProfile.isTesting
             ? TabFolderStore(directory: BrowserProfile.directory, enabled: false) : .shared)
         super.init()
+        tabDrag.canSplit = { [weak self] source, target in self?.canSplitDrag(source, with: target) == true }
         addTab(configuration: configuration)
         suspender = TabSuspender(browser: self)
+    }
+
+    isolated deinit {
+        tidyTask?.cancel()
+        titleTasks.values.forEach { $0.cancel() }
     }
 
     var activeTab: BrowserTab? {
         tab(withID: activeTabID)
     }
+
+    var focusedPage: BrowserTab? { peek?.tab ?? activeTab }
 
     func updateWindowTitle() {
         // WindowGroup titles belong to SwiftUI's navigationTitle. Only the
@@ -105,6 +134,8 @@ final class BrowserModel: NSObject {
                 if let old = tab.folderPageID { try folders.removePage(old) }
                 tab.folderPageID = page.id
                 tab.pinnedPageID = nil
+                tab.temporarySection = nil
+                tidySavedTabTitle(tab)
             }
         }
     }
@@ -115,14 +146,20 @@ final class BrowserModel: NSObject {
     }
 
     func moveToFolder(_ tab: BrowserTab, parentID: UUID?, before: UUID? = nil) {
+        if peek?.tab === tab { expandPeek() }
         changeFolders {
             if let id = tab.folderPageID, folders.item(id) != nil {
                 try folders.move(id, to: parentID, before: before)
             } else if let url = tab.url {
                 let page = try folders.savePage(url: url, title: tab.title, in: parentID)
+                do {
+                    if before != nil { try folders.move(page.id, to: parentID, before: before) }
+                    if let essentialID = tab.pinnedPageID { try pinnedPages.remove(essentialID) }
+                } catch { try? folders.removePage(page.id); throw error }
                 tab.folderPageID = page.id
                 tab.pinnedPageID = nil
-                if before != nil { try folders.move(page.id, to: parentID, before: before) }
+                tab.temporarySection = nil
+                tidySavedTabTitle(tab)
             }
         }
     }
@@ -141,6 +178,7 @@ final class BrowserModel: NSObject {
     }
 
     func moveFolderPageToTemporaryTabs(_ page: TabFolderItem) {
+        if let tab = tabs.first(where: { $0.folderPageID == page.id }) { cancelSavedTitle(for: tab) }
         changeFolders {
             try folders.removePage(page.id)
             if let tab = tabs.first(where: { $0.folderPageID == page.id }) {
@@ -157,9 +195,11 @@ final class BrowserModel: NSObject {
     func acceptFolderDrop(_ payload: String, parentID: UUID?, before: UUID? = nil) -> Bool {
         let prefix = "browser-folder:"
         if payload.hasPrefix(prefix), let id = UUID(uuidString: String(payload.dropFirst(prefix.count))),
-           folders.item(id) != nil, folders.canMove(id, to: parentID) {
+           let moving = folders.item(id), folders.canMove(id, to: parentID) {
+            let previous = folders.items
             changeFolders { try folders.move(id, to: parentID, before: before) }
-            return true
+            if moving.kind == .page, previous != folders.items { reorderFeedback() }
+            return previous != folders.items
         }
         if let id = UUID(uuidString: payload), let tab = tab(withID: id),
            let url = tab.url, PinnedPageStore.valid(url) {
@@ -169,25 +209,148 @@ final class BrowserModel: NSObject {
         return false
     }
 
+    /// Ignore geometry from before an animated move, rather than swapping back.
+    func crossDraggedTab(_ source: String, past target: String, direction: Int) {
+        guard let source = SidebarDragItem(source), let target = SidebarDragItem(target) else { return }
+        switch (source, target) {
+        case (.tab(let id), .tab(let targetID)):
+            guard let from = tabs.firstIndex(where: { $0.id == id }), let to = tabs.firstIndex(where: { $0.id == targetID }),
+                  tabs[from].pinnedPageID == nil, tabs[to].pinnedPageID == nil,
+                  tabs[from].temporarySection?.id == tabs[to].temporarySection?.id,
+                  direction > 0 ? to > from : to < from else { return }
+            _ = withAnimation(.snappy(duration: 0.18)) { moveTab(id, to: to, haptic: true) }
+        case (.pinned(let id), .pinned(let targetID)):
+            guard let page = folders.item(id), let other = folders.item(targetID), page.parentID == other.parentID,
+                  page.kind == .folder || other.kind == .page else { return }
+            let siblings = folders.items.filter { $0.parentID == page.parentID }
+            guard let from = siblings.firstIndex(where: { $0.id == id }), let to = siblings.firstIndex(where: { $0.id == targetID }),
+                  direction > 0 ? to > from : to < from else { return }
+            _ = withAnimation(.snappy(duration: 0.18)) { reorderPinnedItem(id, past: targetID) }
+        case (.section(let id), .section(let targetID)):
+            reorderTemporarySection(id, past: targetID, direction: direction)
+        case (.section(let id), .tab(let targetID)):
+            if let other = regularTabs.first(where: { $0.id == targetID }) {
+                reorderTemporarySection(id, past: other.temporarySection?.id ?? other.id, direction: direction)
+            }
+        default: break
+        }
+    }
+
+    func finishDraggedTab(_ source: String, over target: String?) {
+        if let target, target.hasPrefix(TabReorderController.pageSplitPrefix) {
+            let pieces = target.dropFirst(TabReorderController.pageSplitPrefix.count).split(separator: ":", maxSplits: 1)
+            guard pieces.count == 2, let edge = SplitEdge(rawValue: String(pieces[0])),
+                  canSplitDrag(source, with: String(pieces[1])), let item = SidebarDragItem(source),
+                  let first = dragTab(item), let targetID = UUID(uuidString: String(pieces[1])) else { return }
+            makeSplit(first.id, with: targetID, placement: edge)
+            return
+        }
+        if let target, target.hasPrefix(TabReorderController.splitPrefix) {
+            let destination = String(target.dropFirst(TabReorderController.splitPrefix.count))
+            guard canSplitDrag(source, with: destination), let a = SidebarDragItem(source), let b = SidebarDragItem(destination),
+                  let first = dragTab(a), let second = dragTab(b) else { return }
+            makeSplit(first.id, with: second.id)
+            return
+        }
+        guard let source = SidebarDragItem(source), let rawTarget = target, let target = SidebarDragItem(rawTarget) else { return }
+        switch target {
+        case .essentials, .essential:
+            if let page = pinnedDragPage(source) { pinSavedPageToEssentials(page) }
+            else if let tab = dragTab(source) { pin(tab) }
+        case .pinnedRoot:
+            if case .section(let id) = source { pinTemporarySection(id); return }
+            if case .pinned(let id) = source { _ = acceptFolderDrop(SidebarDragItem.pinned(id).payload, parentID: nil) }
+            else if let tab = dragTab(source) { moveToFolder(tab, parentID: nil) }
+        case .pinned(let targetID):
+            guard let item = folders.item(targetID) else { return }
+            let parent = item.kind == .folder ? item.id : item.parentID
+            if case .section(let id) = source { pinTemporarySection(id, parentID: parent); return }
+            if case .pinned(let id) = source {
+                if let page = folders.item(id), item.kind == .page, page.parentID == item.parentID { return }
+                _ = acceptFolderDrop(SidebarDragItem.pinned(id).payload, parentID: parent, before: item.kind == .page ? item.id : nil)
+            } else if let tab = dragTab(source) { moveToFolder(tab, parentID: parent, before: item.kind == .page ? item.id : nil) }
+        case .temporaryRoot:
+            if let tab = regularizeDragPage(source) {
+                tab.temporarySection = nil
+                BrowserSessionStore.shared.save(self)
+            }
+        case .section(let id):
+            if case .section = source { return }
+            if let tab = regularizeDragPage(source) { _ = moveTemporaryTab(tab.id, toSection: id) }
+        case .tab(let targetID):
+            guard let other = tab(withID: targetID) else { return }
+            if let folderID = other.folderPageID {
+                finishDraggedTab(source.payload, over: SidebarDragItem.pinned(folderID).payload); return
+            }
+            if case .section = source { return }
+            guard let tab = regularizeDragPage(source), tab.id != other.id,
+                  let to = tabs.firstIndex(where: { $0.id == other.id }) else { return }
+            _ = moveTab(tab.id, to: to, haptic: true)
+        }
+    }
+
+    @discardableResult
+    func reorderSavedPage(_ id: UUID, past targetID: UUID) -> Bool { reorderPinnedItem(id, past: targetID) }
+
+    @discardableResult
+    func reorderPinnedItem(_ id: UUID, past targetID: UUID) -> Bool {
+        guard let page = folders.item(id), let target = folders.item(targetID),
+              page.parentID == target.parentID, id != targetID else { return false }
+        let siblings = folders.items.filter { $0.parentID == page.parentID }
+        guard let source = siblings.firstIndex(where: { $0.id == id }),
+              let destination = siblings.firstIndex(where: { $0.id == targetID }) else { return false }
+        let before = destination > source ? (siblings.indices.contains(destination + 1) ? siblings[destination + 1].id : nil) : targetID
+        let previous = folders.items
+        changeFolders { try folders.move(id, to: page.parentID, before: before) }
+        guard previous != folders.items else { return false }
+        reorderFeedback()
+        return true
+    }
+
     func canPin(_ tab: BrowserTab) -> Bool {
         guard let url = tab.url, PinnedPageStore.valid(url) else { return false }
         return pinnedPages.items.count < PinnedPageStore.limit || pinnedPages.items.contains { $0.url == url }
     }
 
     func pin(_ tab: BrowserTab) {
+        if peek?.tab === tab { expandPeek() }
         guard let url = tab.url else { return }
+        pinToEssentials(url: url, title: tab.title, folderPageID: tab.folderPageID, tab: tab)
+    }
+
+    func pinSavedPageToEssentials(_ page: TabFolderItem) {
+        guard page.kind == .page, let url = page.url else { return }
+        pinToEssentials(url: url, title: page.title, folderPageID: page.id,
+                        tab: tabs.first { $0.folderPageID == page.id })
+    }
+
+    private func pinToEssentials(url: URL, title: String, folderPageID: UUID?, tab: BrowserTab?) {
+        if let tab { cancelSavedTitle(for: tab) }
+        let previousIDs = Set(pinnedPages.items.map(\.id))
         do {
-            let page = try pinnedPages.pin(url: url, title: tab.title)
+            let page = try pinnedPages.pin(url: url, title: title)
+            do { if let folderPageID { try folders.removePage(folderPageID) } }
+            catch { if !previousIDs.contains(page.id) { try? pinnedPages.remove(page.id) }; throw error }
             tabs.filter { $0.pinnedPageID == page.id }.forEach { $0.pinnedPageID = nil }
-            tab.pinnedPageID = page.id
+            tab?.folderPageID = nil
+            tab?.temporarySection = nil
+            tab?.pinnedPageID = page.id
+            BrowserSessionStore.shared.save(self)
         } catch { reportPinnedPageError(error) }
     }
 
     func unpin(_ page: PinnedPage) {
-        do {
-            try pinnedPages.remove(page.id)
-            tabs.filter { $0.pinnedPageID == page.id }.forEach { $0.pinnedPageID = nil }
-        } catch { reportPinnedPageError(error) }
+        let existing = tabs.filter { $0.pinnedPageID == page.id }
+        let created = existing.isEmpty ? materializeEssential(page) : nil
+        let retained = existing + (created.map { [$0] } ?? [])
+        retained.forEach { $0.pinnedPageID = nil }
+        // Persist the destination before removing its durable Essential descriptor.
+        BrowserSessionStore.shared.save(self)
+        do { try pinnedPages.remove(page.id) }
+        catch {
+            retained.first?.pinnedPageID = page.id
+            reportPinnedPageError(error)
+        }
     }
 
     private func reportPinnedPageError(_ error: Error) {
@@ -224,16 +387,65 @@ final class BrowserModel: NSObject {
                     ?? folders.pages.first { $0.url == url && !boundFolders.contains($0.id) }
                 if let folderPage, boundFolders.insert(folderPage.id).inserted { tab.folderPageID = folderPage.id }
             }
+            if tab.folderPageID == nil && tab.pinnedPageID == nil { tab.temporarySection = saved.temporarySection }
             return tab
         }
         previous.forEach { BrowserExtensions.shared.didClose($0) }
         tabs.forEach { BrowserExtensions.shared.didOpen($0) }
+        restoreSplits(session.splits ?? [])
         activeTabID = tabs[min(max(0, session.selectedIndex), tabs.count - 1)].id
     }
 
     func tab(withID id: UUID?) -> BrowserTab? {
         guard let id else { return nil }
+        if peek?.tab.id == id { return peek?.tab }
         return tabs.first { $0.id == id }
+    }
+
+    func shouldPeek(_ url: URL, from tab: BrowserTab) -> Bool {
+        guard tab.id == activeTabID, let home = tab.pinnedHomeURL, PinnedNavigation.isWebURL(url),
+              !isExtensionWindow else { return false }
+        let enabled = UserDefaults.standard.object(forKey: PinnedNavigation.peekEnabledKey) as? Bool ?? true
+        return enabled && !PinnedNavigation.isSameSite(url, as: home)
+    }
+
+    /// Kept outside the tab/session list until expanded, with the normal WebKit
+    /// profile, extensions, permissions and navigation delegate.
+    @discardableResult
+    func openPeek(from opener: BrowserTab, request: URLRequest? = nil,
+                  configuration: WKWebViewConfiguration? = nil) -> BrowserTab {
+        dismissPeek()
+        if let view = opener.webView { LinkPreviewController.shared.dismiss(for: view) }
+        let tab = makeTab(configuration: configuration ?? BrowserTab.makeConfiguration())
+        tab.openerID = opener.id
+        tab.isPopUp = configuration != nil
+        tab.isNewTab = false
+        peek = PeekPage(openerID: opener.id, tab: tab)
+        BrowserExtensions.shared.didOpen(tab)
+        BrowserExtensions.shared.didActivate(tab, previous: opener)
+        if let request { tab.webView?.load(request) }
+        return tab
+    }
+
+    func dismissPeek() {
+        guard let previous = peek else { return }
+        peek = nil
+        previous.tab.stopWaitingForSelection()
+        previous.tab.webView?.stopLoading()
+        BrowserExtensions.shared.didClose(previous.tab)
+        if let activeTab { BrowserExtensions.shared.didActivate(activeTab, previous: nil) }
+        window?.makeFirstResponder(activeTab?.webView)
+    }
+
+    /// Adopt the existing web view, preserving its history, forms and load.
+    func expandPeek() {
+        guard let previous = peek else { return }
+        peek = nil
+        let insertion = tabs.firstIndex { $0.id == previous.openerID }.map { $0 + 1 } ?? tabs.count
+        tabs.insert(previous.tab, at: insertion)
+        activeTabID = previous.tab.id
+        previous.tab.didBecomeSelected()
+        BrowserSessionStore.shared.requestSave(self)
     }
 
     private func makeTab(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration()) -> BrowserTab {
@@ -265,22 +477,28 @@ final class BrowserModel: NSObject {
         if tab.isNewTab { requestAddressFocus() }
     }
 
-    func moveTab(_ id: UUID, to destinationIndex: Int) {
+    @discardableResult
+    func moveTab(_ id: UUID, to destinationIndex: Int, haptic: Bool = false) -> Bool {
         guard let sourceIndex = tabs.firstIndex(where: { $0.id == id }),
               tabs.indices.contains(destinationIndex),
-              sourceIndex != destinationIndex else { return }
+              sourceIndex != destinationIndex else { return false }
+        tabs[sourceIndex].temporarySection = tabs[destinationIndex].temporarySection
         tabs.move(fromOffsets: IndexSet(integer: sourceIndex),
                   toOffset: destinationIndex > sourceIndex ? destinationIndex + 1 : destinationIndex)
         BrowserExtensions.shared.controller.didMoveTab(tabs[destinationIndex], from: sourceIndex, in: self)
+        if haptic { reorderFeedback() }
+        return true
     }
 
     func closeOtherTabs(than id: UUID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
-        let closingTabs = tabs.filter { $0.id != id }
+        let retained = Set(split(containing: id)?.tabIDs ?? [id])
+        let closingTabs = tabs.filter { !retained.contains($0.id) }
         for tab in closingTabs {
             rememberClosedTab(tab)
         }
-        tabs.removeAll { $0.id != id }
+        tabs.removeAll { !retained.contains($0.id) }
+        pruneSplits()
         closingTabs.forEach { BrowserExtensions.shared.didClose($0) }
         activeTabID = id
     }
@@ -291,6 +509,7 @@ final class BrowserModel: NSObject {
         closingTabs.forEach(rememberClosedTab)
         let closingIDs = Set(closingTabs.map(\.id))
         tabs.removeAll { closingIDs.contains($0.id) }
+        pruneSplits()
         closingTabs.forEach { BrowserExtensions.shared.didClose($0) }
         if let activeTabID, closingIDs.contains(activeTabID) {
             self.activeTabID = id
@@ -298,14 +517,20 @@ final class BrowserModel: NSObject {
     }
 
     func closeActiveTab() {
+        if peek != nil { dismissPeek(); return }
         guard let activeTabID else { return }
+        if let tab = activeTab, tab.isAwayFromPinnedPage { tab.returnToPinnedPage(); return }
         closeTab(activeTabID)
     }
 
     func closeTab(_ id: UUID) {
+        if peek?.tab.id == id { dismissPeek(); return }
+        if peek?.openerID == id { dismissPeek() }
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let nextPane = split(containing: id)?.tabIDs.first { $0 != id }
         rememberClosedTab(tabs[index])
         let closed = tabs.remove(at: index)
+        pruneSplits()
         BrowserExtensions.shared.didClose(closed)
         if tabs.isEmpty {
             if isExtensionWindow {
@@ -315,12 +540,14 @@ final class BrowserModel: NSObject {
                 addTab()
             }
         } else if activeTabID == id {
-            activeTabID = tabs[min(index, tabs.count - 1)].id
+            activeTabID = nextPane ?? tabs[min(index, tabs.count - 1)].id
         }
     }
 
     /// Remembers a closing tab so it can reopen, and dismisses the panels its page is waiting to show.
     private func rememberClosedTab(_ tab: BrowserTab) {
+        cancelSavedTitle(for: tab)
+        if renamingSavedPageID == tab.folderPageID { renamingSavedPageID = nil }
         tab.stopWaitingForSelection()
         let isBlank = tab.isNewTab || tab.url == nil
         closedTabs.append(ClosedTab(url: isBlank ? nil : tab.url, title: tab.pageTitle,
@@ -367,22 +594,24 @@ final class BrowserModel: NSObject {
     }
 
     func selectTab(at index: Int) {
-        guard tabs.indices.contains(index) else { return }
-        activeTabID = tabs[index].id
+        let visible = tabs.filter { !isSplitCompanion($0) }
+        guard visible.indices.contains(index) else { return }
+        selectRepresentedTab(visible[index])
     }
 
     func selectLastTab() {
-        guard !tabs.isEmpty else { return }
-        selectTab(at: tabs.count - 1)
+        selectTab(at: tabs.filter { !isSplitCompanion($0) }.count - 1)
     }
 
     func switchTab(by offset: Int) {
-        guard let currentIndex = tabs.firstIndex(where: { $0.id == activeTabID }),
-              !tabs.isEmpty else { return }
-        selectTab(at: (currentIndex + offset + tabs.count) % tabs.count)
+        let visible = tabs.filter { !isSplitCompanion($0) }
+        let current = activeSplit?.anchorID ?? activeTabID
+        guard let currentIndex = visible.firstIndex(where: { $0.id == current }), !visible.isEmpty else { return }
+        selectTab(at: (currentIndex + offset % visible.count + visible.count) % visible.count)
     }
 
     func open(_ url: URL, inNewTab: Bool = false) {
+        dismissPeek()
         if inNewTab || activeTab == nil {
             let tab = makeTab()
             tabs.append(tab)
@@ -394,10 +623,12 @@ final class BrowserModel: NSObject {
 
     func navigate(to input: String) {
         guard let url = BrowserAddress.url(for: input) else { return }
+        dismissPeek()
         activeTab?.load(url)
     }
 
     func reload() {
+        if let peek { peek.tab.reload(); return }
         guard let activeTabID else { return }
         reloadTab(activeTabID)
     }
@@ -408,15 +639,15 @@ final class BrowserModel: NSObject {
     }
 
     func stopLoading() {
-        activeTab?.webView?.stopLoading()
+        (peek?.tab ?? activeTab)?.webView?.stopLoading()
     }
 
     func goBack() {
-        activeTab?.goBack()
+        (peek?.tab ?? activeTab)?.goBack()
     }
 
     func goForward() {
-        activeTab?.webView?.goForward()
+        (peek?.tab ?? activeTab)?.webView?.goForward()
     }
 
     func go(to item: WKBackForwardListItem) {
@@ -424,6 +655,7 @@ final class BrowserModel: NSObject {
     }
 
     func requestAddressFocus() {
+        dismissPeek()
         chromeHover?.addressFocusRequested()
         addressFocusRequest += 1
     }
@@ -445,7 +677,7 @@ final class BrowserModel: NSObject {
     }
 
     func showWebInspector() {
-        guard let tab = activeTab, !tab.isNewTab, let webView = tab.webView else { return }
+        guard let tab = focusedPage, !tab.isNewTab, let webView = tab.webView else { return }
         WebInspector.show(for: webView)
     }
 
@@ -458,7 +690,7 @@ final class BrowserModel: NSObject {
             linkedIDs.formUnion([tab.id, openerID])
         }
         return tabs
-            .filter { $0.id != activeTabID && $0.canSuspend && !linkedIDs.contains($0.id) }
+            .filter { !visibleTabIDs.contains($0.id) && $0.canSuspend && !linkedIDs.contains($0.id) }
             .sorted { $0.lastActive < $1.lastActive }
     }
 
@@ -493,5 +725,275 @@ enum BrowserAddress {
         var components = URLComponents(string: "https://www.google.com/search")
         components?.queryItems = [URLQueryItem(name: "q", value: text)]
         return components?.url
+    }
+}
+
+extension BrowserModel {
+    struct TemporaryTabGroup: Identifiable {
+        let id: UUID
+        let section: TemporaryTabSection?
+        var tabs: [BrowserTab]
+    }
+
+    var temporaryTabGroups: [TemporaryTabGroup] {
+        var result: [TemporaryTabGroup] = []
+        var indices: [UUID: Int] = [:]
+        for tab in regularTabs where !isSplitCompanion(tab) {
+            let id = tab.temporarySection?.id ?? tab.id
+            if let index = indices[id] { result[index].tabs.append(tab) }
+            else {
+                indices[id] = result.count
+                result.append(TemporaryTabGroup(id: id, section: tab.temporarySection, tabs: [tab]))
+            }
+        }
+        return result
+    }
+
+    func setTemporarySectionExpanded(_ id: UUID, expanded: Bool) {
+        for tab in regularTabs where tab.temporarySection?.id == id {
+            guard var section = tab.temporarySection, section.isExpanded != expanded else { continue }
+            section.isExpanded = expanded
+            tab.temporarySection = section
+        }
+        BrowserSessionStore.shared.requestSave(self)
+    }
+
+    func removeTemporarySection(_ id: UUID) {
+        regularTabs.filter { $0.temporarySection?.id == id }.forEach { $0.temporarySection = nil }
+        BrowserSessionStore.shared.requestSave(self)
+    }
+
+    @discardableResult
+    func moveTemporaryTab(_ id: UUID, toSection sectionID: UUID) -> Bool {
+        guard let tab = regularTabs.first(where: { $0.id == id }), tab.temporarySection?.id != sectionID,
+              let destination = regularTabs.first(where: { $0.temporarySection?.id == sectionID })?.temporarySection else { return false }
+        let previous = tabs.map(\.id)
+        let groups = temporaryTabGroups
+        tab.temporarySection = destination
+        let order = groups.flatMap { group -> [UUID] in
+            let members = group.tabs.filter { $0.id != id }.map(\.id)
+            return group.section?.id == sectionID ? members + [id] : members
+        }
+        reorderTemporaryTabs(order)
+        if previous != tabs.map(\.id) { reorderFeedback() }
+        return true
+    }
+
+    var canTidyTabs: Bool { regularTabs.filter { !$0.isNewTab && $0.url.map(PinnedPageStore.valid) == true }.count > 6 }
+
+    func tidyTemporaryTabs() {
+        guard canTidyTabs, !isTidyingTabs else { return }
+        if let reason = BrowserIntelligence.unavailableReason { intelligenceError = reason; return }
+        let input = regularTabs.compactMap { tab -> TidyTabInput? in
+            guard !tab.isNewTab, let url = tab.url, PinnedPageStore.valid(url) else { return nil }
+            return TidyTabInput(id: tab.id, title: tab.pageTitle, url: url)
+        }
+        isTidyingTabs = true
+        intelligenceError = nil
+        tidyTask = Task { [weak self] in
+            do {
+                let result = try await LocalIntelligence.shared.tidy(input)
+                try Task.checkCancellation()
+                guard let self else { return }
+                // Do not categorize a tab that navigated or became saved during inference.
+                let eligible = Set(input.filter { item in self.regularTabs.contains { $0.id == item.id && $0.url == item.url } }.map(\.id))
+                self.applyTidyTabs(result, eligible: eligible)
+            } catch is CancellationError { }
+            catch { self?.intelligenceError = "Couldn’t tidy tabs. \(error.localizedDescription)" }
+            self?.isTidyingTabs = false
+            self?.tidyTask = nil
+        }
+    }
+
+    func cancelTidyingTabs() { tidyTask?.cancel() }
+
+    /// Invalid, repeated or vanished IDs cannot remove or duplicate any tab.
+    func applyTidyTabs(_ result: [TidyTabAssignment], eligible: Set<UUID>) {
+        guard !result.isEmpty else { return }
+        let current = Set(regularTabs.map(\.id)).intersection(eligible)
+        var seen = Set<UUID>(), order: [UUID] = []
+        for assignment in result {
+            for id in assignment.tabIDs where current.contains(id) && seen.insert(id).inserted {
+                tab(withID: id)?.temporarySection = assignment.section
+                order.append(id)
+            }
+        }
+        let remaining = regularTabs.filter { !seen.contains($0.id) }
+        remaining.filter { current.contains($0.id) }.forEach { $0.temporarySection = nil }
+        order += remaining.map(\.id)
+        reorderTemporaryTabs(order)
+    }
+
+    private func reorderTemporaryTabs(_ ids: [UUID]) {
+        let temporary = Set(regularTabs.map(\.id))
+        var ordered = ids.compactMap { tab(withID: $0) }.filter { temporary.contains($0.id) }
+        let seen = Set(ordered.map(\.id))
+        ordered += regularTabs.filter { !seen.contains($0.id) }
+        let oldIndices = Dictionary(uniqueKeysWithValues: tabs.enumerated().map { ($0.element.id, $0.offset) })
+        var iterator = ordered.makeIterator()
+        for index in tabs.indices where temporary.contains(tabs[index].id) {
+            if let next = iterator.next() { tabs[index] = next }
+        }
+        for (index, tab) in tabs.enumerated() {
+            if let old = oldIndices[tab.id], old != index {
+                BrowserExtensions.shared.controller.didMoveTab(tab, from: old, in: self)
+            }
+        }
+        BrowserSessionStore.shared.requestSave(self)
+    }
+
+    func removeTemporarySections() {
+        cancelTidyingTabs()
+        regularTabs.forEach { $0.temporarySection = nil }
+        BrowserSessionStore.shared.requestSave(self)
+    }
+
+    func savedTabFinishedLoading(_ tab: BrowserTab) {
+        guard let id = tab.folderPageID, tab.loadError == nil, !isExtensionWindow, !tab.isAwayFromPinnedPage else { return }
+        changeFolders { try folders.updatePageTitle(id, title: tab.pageTitle) }
+        tidySavedTabTitle(tab)
+    }
+
+    func savedTabBeganLoading(_ tab: BrowserTab) {
+        cancelSavedTitle(for: tab)
+        if !BrowserProfile.isTesting, tab.folderPageID != nil,
+           UserDefaults.standard.bool(forKey: BrowserIntelligence.titlesKey) {
+            Task { await LocalIntelligence.shared.prepare(.name) }
+        }
+    }
+
+    private func cancelSavedTitle(for tab: BrowserTab) {
+        titleTasks.removeValue(forKey: tab.id)?.cancel()
+        titleTaskTokens.removeValue(forKey: tab.id)
+        if let id = tab.folderPageID { namingSavedPageIDs.remove(id) }
+    }
+
+    func tidySavedTabTitle(_ tab: BrowserTab) {
+        guard !BrowserProfile.isTesting, UserDefaults.standard.bool(forKey: BrowserIntelligence.titlesKey),
+              !tab.isLoading, !tab.isNewTab, tab.loadError == nil, tab.pinnedPageID == nil,
+              let id = tab.folderPageID, let page = folders.item(id), page.nameSource == nil,
+              let url = tab.url, PinnedPageStore.valid(url), !tab.pageTitle.isEmpty, titleTasks[tab.id] == nil,
+              BrowserIntelligence.unavailableReason == nil else { return }
+        let originalTitle = tab.pageTitle
+        let token = UUID()
+        titleTaskTokens[tab.id] = token
+        namingSavedPageIDs.insert(id)
+        titleTasks[tab.id] = Task { [weak self, weak tab] in
+            defer {
+                if let self, let tab, self.titleTaskTokens[tab.id] == token {
+                    self.titleTasks[tab.id] = nil
+                    self.titleTaskTokens[tab.id] = nil
+                    self.namingSavedPageIDs.remove(id)
+                }
+            }
+            do {
+                let name = try await LocalIntelligence.shared.savedTabName(title: originalTitle, url: url)
+                guard let self, let tab, !Task.isCancelled, self.tabs.contains(where: { $0 === tab }),
+                      tab.folderPageID == id, tab.pinnedPageID == nil, tab.url == url, !tab.isLoading,
+                      UserDefaults.standard.bool(forKey: BrowserIntelligence.titlesKey),
+                      self.folders.item(id)?.nameSource == nil else { return }
+                try self.folders.renamePage(id, title: name, source: .automatic)
+            } catch { /* Automatic naming is optional; keep the page's original title on failure. */ }
+        }
+    }
+
+    func renameSavedPage(_ id: UUID, to title: String) throws {
+        let name = try LocalIntelligence.cleanName(title, limit: 160)
+        if let tab = tabs.first(where: { $0.folderPageID == id }) { cancelSavedTitle(for: tab) }
+        try folders.renamePage(id, title: name, source: .manual)
+    }
+}
+
+extension BrowserModel {
+    var sidebarFolderRows: [TabFolderStore.Row] {
+        let companions = Set(tabs.filter(isSplitCompanion).compactMap(\.folderPageID))
+        if let payload = tabDrag.payload, case .pinned(let id) = SidebarDragItem(payload), folders.item(id)?.kind == .folder {
+            return folders.visibleRows(collapsing: [id]).filter { !companions.contains($0.id) }
+        }
+        return folders.visibleRows.filter { !companions.contains($0.id) }
+    }
+
+    func sectionIsExpanded(_ section: TemporaryTabSection?) -> Bool {
+        guard let section else { return true }
+        return section.isExpanded && tabDrag.payload != SidebarDragItem.section(section.id).payload
+    }
+
+    var canDragToEssentials: Bool {
+        guard let payload = tabDrag.payload, let item = SidebarDragItem(payload) else { return false }
+        switch item {
+        case .tab(let id): return tab(withID: id).map(canPin) ?? false
+        case .pinned(let id):
+            guard let page = folders.item(id), page.kind == .page, let url = page.url else { return false }
+            return pinnedPages.items.count < PinnedPageStore.limit || pinnedPages.items.contains { $0.url == url }
+        case .essential: return true
+        default: return false
+        }
+    }
+
+    private func materializeEssential(_ page: PinnedPage) -> BrowserTab {
+        if let existing = tabs.first(where: { $0.pinnedPageID == page.id }) { return existing }
+        let tab = adopt(BrowserTab(url: page.url, title: page.title, interactionState: nil))
+        tab.pinnedPageID = page.id
+        tabs.append(tab)
+        BrowserExtensions.shared.didOpen(tab)
+        return tab
+    }
+
+    private func pinnedDragPage(_ source: SidebarDragItem) -> TabFolderItem? {
+        if case .pinned(let id) = source, let page = folders.item(id), page.kind == .page { return page }
+        return nil
+    }
+
+    private func dragTab(_ source: SidebarDragItem) -> BrowserTab? {
+        switch source {
+        case .tab(let id): return tab(withID: id)
+        case .essential(let id): return pinnedPages.items.first { $0.id == id }.map(materializeEssential)
+        case .pinned(let id):
+            guard let page = folders.item(id), page.kind == .page, let url = page.url else { return nil }
+            if let existing = tabs.first(where: { $0.folderPageID == id }) { return existing }
+            let tab = adopt(BrowserTab(url: url, title: page.title, interactionState: nil))
+            tab.folderPageID = id
+            tabs.append(tab)
+            BrowserExtensions.shared.didOpen(tab)
+            return tab
+        default: return nil
+        }
+    }
+
+    private func regularizeDragPage(_ source: SidebarDragItem) -> BrowserTab? {
+        guard let tab = dragTab(source) else { return nil }
+        if let essential = pinnedPages.items.first(where: { $0.id == tab.pinnedPageID }) { unpin(essential) }
+        if let page = folders.item(tab.folderPageID) { moveFolderPageToTemporaryTabs(page) }
+        guard tab.pinnedPageID == nil, tab.folderPageID == nil else { return nil }
+        return tab
+    }
+
+    func canPinTemporarySection(_ id: UUID) -> Bool {
+        let members = regularTabs.filter { $0.temporarySection?.id == id }
+        return !members.isEmpty && members.allSatisfy { $0.url.map(PinnedPageStore.valid) == true }
+    }
+
+    func pinTemporarySection(_ id: UUID, parentID: UUID? = nil) {
+        let members = regularTabs.filter { $0.temporarySection?.id == id }
+        guard canPinTemporarySection(id), let section = members.first?.temporarySection else { return }
+        changeFolders {
+            let saved = try folders.pinGroup(title: section.title, symbol: section.symbol, expanded: section.isExpanded,
+                                            parentID: parentID, pages: members.map { (url: $0.url!, title: $0.title) })
+            for (tab, page) in zip(members, saved.pages) {
+                tab.folderPageID = page.id
+                tab.temporarySection = nil
+                tidySavedTabTitle(tab)
+            }
+            BrowserSessionStore.shared.save(self)
+        }
+    }
+
+    private func reorderTemporarySection(_ id: UUID, past targetID: UUID, direction: Int) {
+        var groups = temporaryTabGroups
+        guard let from = groups.firstIndex(where: { $0.id == id }), let to = groups.firstIndex(where: { $0.id == targetID }),
+              direction > 0 ? to > from : to < from else { return }
+        groups.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        reorderTemporaryTabs(groups.flatMap { $0.tabs.map(\.id) })
+        reorderFeedback()
     }
 }

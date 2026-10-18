@@ -21,8 +21,8 @@ final class PinnedPageStore {
         case invalidURL, full
         var errorDescription: String? {
             switch self {
-            case .invalidURL: "Only HTTP and HTTPS webpages can be pinned."
-            case .full: "You can pin up to nine webpages. Unpin a page to make room."
+            case .invalidURL: "Only HTTP and HTTPS webpages can be added to Essential Tabs."
+            case .full: "Essential Tabs holds up to nine webpages. Remove an Essential Tab to make room."
             }
         }
     }

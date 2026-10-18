@@ -51,8 +51,10 @@ struct WindowChromeConfigurator: NSViewRepresentable {
     let horizontalTabs: AnyView
     @Binding var isFullScreen: Bool
     var compactToolbar = false
+    var insetRevealedToolbar = false
     var toolbarIsRevealed = true
     var hoverController: ChromeHoverController?
+    var savedToolbarConfiguration: Binding<Data>?
     var nativeCommands: [NativeToolbarCommand] = []
     var toolbarDisplayMode: NSToolbar.DisplayMode? = nil
     var toolbarContextMenu: (@MainActor () -> NSMenu)?
@@ -78,6 +80,8 @@ struct WindowChromeConfigurator: NSViewRepresentable {
         view.onCustomizationChange = onCustomizationChange
         view.onToolbarItemsChange = onToolbarItemsChange
         view.toolbarContextMenu = toolbarContextMenu
+        view.savedToolbarConfiguration = savedToolbarConfiguration
+        view.insetRevealedToolbar = insetRevealedToolbar
         view.setNativeCommands(nativeCommands, displayMode: toolbarDisplayMode)
         hoverController?.nativeToolbarPresenter = view
         view.update(layout: tabLayout, tabs: horizontalTabs, compactToolbar: compactToolbar,
@@ -86,6 +90,7 @@ struct WindowChromeConfigurator: NSViewRepresentable {
 }
 
 final class WindowChromeView: NSView {
+    var insetRevealedToolbar = false
     var onFullScreenChange: ((Bool) -> Void)?
     var onWindowChange: ((NSWindow?) -> Void)?
     var onToolbarRegionHeight: ((CGFloat) -> Void)?
@@ -93,8 +98,15 @@ final class WindowChromeView: NSView {
     var onCustomizationChange: ((Bool) -> Void)?
     var onToolbarItemsChange: (([String]) -> Void)?
     private var observers: [NSObjectProtocol] = []
+    var savedToolbarConfiguration: Binding<Data>?
+    private let layoutPersistence = ToolbarLayoutPersistence()
+    private var customizationAdapter: ToolbarCustomizationAdapter?
+    private weak var customizationToolbar: NSToolbar?
+    private var nativeConfigurationKeys = Set<String>()
     private var tabLayout = TabLayout.horizontal
     private let tabAccessory = NSTitlebarAccessoryViewController()
+    private let trailingAccessory = NSTitlebarAccessoryViewController()
+    private let trailingReservation = NSView(frame: NSRect(x: 0, y: 0, width: BrowserChrome.edgeInset, height: 1))
     private let tabs = TitlebarTabHostingView(rootView: AnyView(EmptyView()))
     private let tabContainer = TitlebarTabContainer()
     private let tabReservation = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: BrowserChrome.tabRowHeight))
@@ -141,6 +153,14 @@ final class WindowChromeView: NSView {
         toolbarContextMenu = nil
         if let contextMenuMonitor { NSEvent.removeMonitor(contextMenuMonitor) }
         contextMenuMonitor = nil
+        if let toolbar = customizationToolbar, toolbar.delegate === customizationAdapter { toolbar.delegate = customizationAdapter?.source }
+        customizationAdapter = nil
+        customizationToolbar = nil
+        for key in nativeConfigurationKeys { UserDefaults.standard.removeObject(forKey: key) }
+        nativeConfigurationKeys.removeAll()
+        if let window, let index = window.titlebarAccessoryViewControllers.firstIndex(of: trailingAccessory) {
+            window.removeTitlebarAccessoryViewController(at: index)
+        }
     }
 
     private func restoreNativeCommands() {
@@ -160,6 +180,7 @@ final class WindowChromeView: NSView {
             let mode = toolbarDisplayMode ?? window?.toolbar?.displayMode ?? .iconOnly
             if let adapter = nativeAdapters[key] { adapter.update(command, displayMode: mode) }
             else { nativeAdapters[key] = NativeToolbarCommandAdapter(item: item, command: command, displayMode: mode) }
+            nativeAdapters[key]?.button.visibilityToolbar = window?.toolbar
         }
     }
 
@@ -293,8 +314,19 @@ final class WindowChromeView: NSView {
         if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
         let style: NSWindow.ToolbarStyle = tabLayout == .horizontal ? .expanded : .unifiedCompact
         if window.toolbarStyle != style { window.toolbarStyle = style }
+        // Reserve the floating row's outer inset through AppKit's layout, so
+        // the address field yields width instead of pushing the last group out.
+        let needsTrailingInset = (insetRevealedToolbar || compactToolbar) && tabLayout == .vertical && !window.styleMask.contains(.fullScreen)
+        if needsTrailingInset {
+            if !window.titlebarAccessoryViewControllers.contains(trailingAccessory) {
+                trailingAccessory.layoutAttribute = .right
+                trailingAccessory.view = trailingReservation
+                window.addTitlebarAccessoryViewController(trailingAccessory)
+            }
+        } else if let index = window.titlebarAccessoryViewControllers.firstIndex(of: trailingAccessory) {
+            window.removeTitlebarAccessoryViewController(at: index)
+        }
         applyToolbarVisibility(in: window)
-        publishToolbarItems(in: window)
         applyNativeCommands()
         if tabLayout == .horizontal && (!compactToolbar || window.toolbar?.isVisible == true) {
             if !window.titlebarAccessoryViewControllers.contains(tabAccessory) {
@@ -351,10 +383,9 @@ final class WindowChromeView: NSView {
             originalToolbarOrigin = branch.bounds.origin
         }
         let offset = tabLayout == .vertical
-            ? BrowserChrome.edgeInset / 2 + (compactToolbar ? BrowserChrome.edgeInset / 2 : 0)
+            ? BrowserChrome.edgeInset / 2 + ((compactToolbar || insetRevealedToolbar) ? BrowserChrome.edgeInset / 2 : 0)
             : BrowserChrome.edgeInset
-        let origin = NSPoint(x: originalToolbarOrigin.x
-                                + (compactToolbar && tabLayout == .vertical ? BrowserChrome.edgeInset : 0),
+        let origin = NSPoint(x: originalToolbarOrigin.x,
                              y: originalToolbarOrigin.y + (branch.isFlipped ? -offset : offset))
         if branch.bounds.origin != origin { branch.setBoundsOrigin(origin) }
 
@@ -381,7 +412,7 @@ final class WindowChromeView: NSView {
         // Horizontal traffic lights belong to the tab row; vertical lights share the navigation row.
         let center = tabLayout == .vertical
             ? (window.frame.height + window.contentLayoutRect.maxY - BrowserChrome.edgeInset) / 2
-                - (compactToolbar ? BrowserChrome.edgeInset / 2 : 0)
+                - ((compactToolbar || insetRevealedToolbar) ? BrowserChrome.edgeInset / 2 : 0)
             : window.frame.height - BrowserChrome.tabRowHeight / 2
         let closeFrame = close.convert(close.bounds, to: nil)
         if windowControlOffsets.isEmpty {
@@ -392,7 +423,7 @@ final class WindowChromeView: NSView {
         }
         // Keep the same left edge when switching layouts, despite their different row heights.
         let leadingInset = BrowserChrome.windowControlsLeadingInset(controlHeight: closeFrame.height)
-            + (compactToolbar && tabLayout == .vertical ? BrowserChrome.edgeInset / 2 : 0)
+            + ((compactToolbar || insetRevealedToolbar) && tabLayout == .vertical ? BrowserChrome.edgeInset / 2 : 0)
         for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
             guard let button = window.standardWindowButton(type), let parent = button.superview,
                   let offset = windowControlOffsets[type] else { continue }
@@ -436,6 +467,18 @@ final class WindowChromeView: NSView {
     }
 
     private func observeToolbar(in window: NSWindow) {
+        if let toolbar = window.toolbar, let delegate = toolbar.delegate {
+            if customizationToolbar !== toolbar {
+                if let old = customizationToolbar, old.delegate === customizationAdapter { old.delegate = customizationAdapter?.source }
+                customizationAdapter = nil
+                customizationToolbar = toolbar
+            }
+            if delegate !== customizationAdapter,
+               delegate.toolbarAllowedItemIdentifiers?(toolbar).contains(where: { $0.rawValue.hasPrefix("divider") }) == true {
+                customizationAdapter = ToolbarCustomizationAdapter(source: delegate)
+                toolbar.delegate = customizationAdapter
+            }
+        }
         guard observedToolbar !== window.toolbar else { return }
         toolbarObservations.removeAll()
         toolbarItemObservers.forEach(NotificationCenter.default.removeObserver)
@@ -443,13 +486,38 @@ final class WindowChromeView: NSView {
         observedToolbar = window.toolbar
         measuredToolbarRegionHeight = nil
         guard let toolbar = window.toolbar else { return }
+        // SwiftUI reads AppKit's live configuration when its toolbar content
+        // changes. Keep that local configuration current; the shared ordered
+        // layout is persisted separately and each window has its own identifier.
+        if savedToolbarConfiguration != nil {
+            toolbar.autosavesConfiguration = true
+            nativeConfigurationKeys.insert("NSToolbar Configuration " + toolbar.identifier)
+        }
         if toolbar.displayMode == .default { toolbar.displayMode = .iconOnly }
         toolbarItemObservers = [NSToolbar.willAddItemNotification, NSToolbar.didRemoveItemNotification].map { name in
             NotificationCenter.default.addObserver(forName: name, object: toolbar, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.scheduleAlignment() }
+                MainActor.assumeIsolated {
+                    if toolbar.customizationPaletteIsRunning || (NSApp.currentEvent?.modifierFlags.contains(.command) == true
+                        && [.leftMouseDown, .leftMouseDragged, .leftMouseUp].contains(NSApp.currentEvent?.type)) {
+                        self?.layoutPersistence.userIsEditing = true
+                    }
+                    self?.scheduleAlignment()
+                }
             }
         }
         toolbarObservations = [
+            toolbar.observe(\.itemIdentifiers) { [weak self] toolbar, _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    // Record the final order while the palette still owns the
+                    // edit. SwiftUI can rebuild its items as Done dismisses it.
+                    if toolbar.customizationPaletteIsRunning {
+                        self.layoutPersistence.capture(toolbar)
+                        self.layoutPersistence.userIsEditing = false
+                    }
+                    self.scheduleAlignment()
+                }
+            },
             toolbar.observe(\.displayMode) { [weak self] _, _ in
                 MainActor.assumeIsolated {
                     self?.measuredToolbarRegionHeight = nil
@@ -464,6 +532,7 @@ final class WindowChromeView: NSView {
                     guard let self else { return }
                     let running = toolbar.customizationPaletteIsRunning
                     guard running != self.lastCustomizationState else { return }
+                    if !running { self.layoutPersistence.userIsEditing = false }
                     self.lastCustomizationState = running
                     DispatchQueue.main.async { [weak self] in self?.onCustomizationChange?(running) }
                     self.scheduleAlignment()
@@ -528,6 +597,7 @@ final class WindowChromeView: NSView {
             if item.label != label { item.label = label }
             if item.paletteLabel != label { item.paletteLabel = label }
         }
+        layoutPersistence.update(toolbar: toolbar, binding: savedToolbarConfiguration)
         let identifiers = toolbar.items.map { $0.itemIdentifier.rawValue }
         guard identifiers != lastToolbarItemIdentifiers else { return }
         lastToolbarItemIdentifiers = identifiers
@@ -537,7 +607,7 @@ final class WindowChromeView: NSView {
     private static let toolbarLabels: [String: String] = [
         "sidebar": "Sidebar", "layout": "Tab Layout", "pinSidebar": "Pin Sidebar",
         "back": "Back", "forward": "Forward", "reload": "Reload", "address": "Address and Search", "folders": "Folders",
-        "downloads": "Downloads", "pins": "Pinned Pages", "settings": "Settings", "newTab": "New Tab",
+        "downloads": "Downloads", "pins": "Essential Tabs", "settings": "Settings", "newTab": "New Tab",
         "divider0": "Divider", "divider1": "Divider", "divider2": "Divider", "divider3": "Divider"
     ]
 

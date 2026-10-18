@@ -38,7 +38,7 @@ struct NewTabView: View {
                 .frame(maxWidth: .infinity)
                 .containerRelativeFrame(.vertical, alignment: .center) { height, _ in height }
             }
-            .scrollIndicators(.never)
+            .modifier(ScrollbarVisibility())
             .scrollBounceBehavior(.basedOnSize)
         }
         .onGeometryChange(for: CGFloat.self, of: \.size.width) { contentWidth = $0 }

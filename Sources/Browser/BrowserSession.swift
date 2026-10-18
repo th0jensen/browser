@@ -7,14 +7,33 @@ struct BrowserSessionSnapshot: Codable, Equatable, Sendable {
         let title: String
         var pinnedPageID: UUID? = nil
         var folderPageID: UUID? = nil
+        var temporarySection: TemporaryTabSection? = nil
+    }
+    struct Split: Codable, Equatable, Sendable {
+        var id: UUID
+        var tabIndices: [Int]
+        var anchorIndex: Int
+        var focusedIndex: Int
+        var orientation: SplitOrientation
+        var weights: [Double]
     }
     let tabs: [Tab]
     let selectedIndex: Int
+    var splits: [Split]? = nil
 
     @MainActor init(browser: BrowserModel) {
         tabs = browser.tabs.map { Tab(url: $0.isNewTab ? nil : $0.url, title: $0.pageTitle,
-                                     pinnedPageID: $0.pinnedPageID, folderPageID: $0.folderPageID) }
+                                     pinnedPageID: $0.pinnedPageID, folderPageID: $0.folderPageID, temporarySection: $0.temporarySection) }
         selectedIndex = browser.tabs.firstIndex { $0.id == browser.activeTabID } ?? 0
+        let indices = Dictionary(uniqueKeysWithValues: browser.tabs.enumerated().map { ($0.element.id, $0.offset) })
+        let groups = browser.splits.compactMap { group -> Split? in
+            guard let anchor = indices[group.anchorID], let focused = indices[group.focusedID] else { return nil }
+            let members = group.tabIDs.compactMap { indices[$0] }
+            guard members.count == group.tabIDs.count, members.count >= 2 else { return nil }
+            return Split(id: group.id, tabIndices: members, anchorIndex: anchor, focusedIndex: focused,
+                         orientation: group.orientation, weights: group.weights)
+        }
+        splits = groups.isEmpty ? nil : groups
     }
 
     init(tabs: [Tab], selectedIndex: Int) {

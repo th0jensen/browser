@@ -73,7 +73,7 @@ final class WindowChromeTests: XCTestCase {
         window.titleVisibility = .hidden
         window.tabbingMode = .disallowed
         window.isReleasedWhenClosed = false
-        let browser = BrowserModel()
+        let browser = BrowserModel(chromePreferences: WindowChromePreferences(defaults: defaults))
         let host = NSHostingController(rootView:
             BrowserWindow(bookmarks: BookmarkStore(), browser: browser).defaultAppStorage(defaults))
         host.sizingOptions = .minSize
@@ -166,9 +166,9 @@ final class WindowChromeTests: XCTestCase {
         browser.requestAddressFocus()
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertTrue(window.firstResponder === nativeField.currentEditor(), "Repeated location requests must restore focus")
-        defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
+        browser.chromePreferences.tabLayout = .vertical
         for autoHide in [false, true] {
-            defaults.set(autoHide, forKey: SidebarVisibility.autoHideKey)
+            browser.chromePreferences.autoHideSidebar = autoHide
             try await Task.sleep(for: .milliseconds(300))
             let currentToolbar = try XCTUnwrap(window.toolbar)
             let item = try XCTUnwrap(currentToolbar.items.first { $0.itemIdentifier.rawValue.contains("address") }?.view)
@@ -193,7 +193,7 @@ final class WindowChromeTests: XCTestCase {
             XCTAssertFalse(window.titlebarAccessoryViewControllers.contains { $0.layoutAttribute == .right })
         }
 
-        defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
+        browser.chromePreferences.tabLayout = .horizontal
         try await Task.sleep(for: .milliseconds(300))
         for type: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
             let button = try XCTUnwrap(window.standardWindowButton(type))

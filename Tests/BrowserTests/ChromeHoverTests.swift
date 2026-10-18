@@ -44,6 +44,20 @@ final class ChromeHoverTests: XCTestCase {
         if sidebar { XCTAssertFalse(controller.sidebarIsRevealed) }
     }
 
+    func testSidebarDragKeepsSidebarOpenWithoutRevealingToolbar() async {
+        let (controller, clock) = fixture()
+        defer { controller.stop() }
+        controller.revealSidebar()
+        controller.sidebarIsReordering = true
+        controller.pointerMoved(to: outside)
+        await clock.advance(by: .seconds(1))
+        XCTAssertTrue(controller.sidebarIsRevealed)
+        XCTAssertFalse(controller.toolbarIsRevealed)
+        controller.sidebarIsReordering = false
+        await requests(1, on: clock)
+        await expire(controller, clock: clock, sidebar: true)
+    }
+
     func testTopAndLeftEdgesRevealImmediatelyAndIndependently() async {
         let (controller, clock) = fixture()
         defer { controller.stop() }

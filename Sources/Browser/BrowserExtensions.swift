@@ -15,6 +15,9 @@ struct InstalledExtension: Codable, Identifiable {
     var sourceAppName: String?
     var sourceAppPath: String?
     var ruleCount: Int?
+    var hasToolbarAction: Bool?
+    var toolbarActionLabel: String?
+    var toolbarIconIsTemplate: Bool?
 }
 
 /// Owns extension resources and one controller shared by every window, tab and restored web view.
@@ -32,6 +35,7 @@ final class BrowserExtensions: NSObject {
     private(set) var actionRevision = 0
     private(set) var activeRuleCounts: [UUID: Int] = [:]
     @ObservationIgnored private var blockerIcons: [String: NSImage] = [:]
+    @ObservationIgnored private var toolbarIcons: [UUID: NSImage] = [:]
     @ObservationIgnored private var contexts: [UUID: WKWebExtensionContext] = [:]
     @ObservationIgnored private var ruleLists: [UUID: WKContentRuleList] = [:]
     @ObservationIgnored private var windows = NSHashTable<BrowserModel>.weakObjects()
@@ -60,6 +64,11 @@ final class BrowserExtensions: NSObject {
             let index = self.directory.appending(path: "extensions.json")
             if FileManager.default.fileExists(atPath: index.path) {
                 installed = try JSONDecoder().decode([InstalledExtension].self, from: Data(contentsOf: index))
+                for item in installed where item.kind == .webExtension {
+                    let icon = NSImage(contentsOf: self.directory.appending(path: item.id.uuidString).appending(path: "toolbar-icon.png"))
+                    icon?.isTemplate = item.toolbarIconIsTemplate ?? false
+                    toolbarIcons[item.id] = icon
+                }
             }
         } catch { lastError = error.localizedDescription }
     }
@@ -147,8 +156,33 @@ final class BrowserExtensions: NSObject {
         var blockerGroups = Set<String>()
         return installed.filter {
             if $0.kind == .contentBlocker { return blockerGroups.insert(blockerGroup($0)).inserted }
-            return $0.isEnabled && contexts[$0.id]?.action(for: nil) != nil
+            return $0.isEnabled && $0.hasToolbarAction != false
         }
+    }
+
+    func toolbarIcon(for item: InstalledExtension) -> NSImage? {
+        if let icon = toolbarIcons[item.id] { return icon }
+        if let path = item.sourceAppPath { return NSWorkspace.shared.icon(forFile: path) }
+        return nil
+    }
+
+    private func cacheToolbarMetadata(_ item: InstalledExtension, extension webExtension: WKWebExtension,
+                                      action: WKWebExtension.Action? = nil) {
+        guard let index = installed.firstIndex(where: { $0.id == item.id }) else { return }
+        let declared = ["action", "browser_action", "page_action"].contains { webExtension.manifest[$0] != nil }
+        let label = action?.label.isEmpty == false ? action?.label : webExtension.displayActionLabel ?? item.name
+        var changed = installed[index].hasToolbarAction != declared || installed[index].toolbarActionLabel != label
+        installed[index].hasToolbarAction = declared
+        installed[index].toolbarActionLabel = label
+        if let icon = action?.icon(for: CGSize(width: 32, height: 32)) ?? webExtension.actionIcon(for: CGSize(width: 32, height: 32)),
+           let tiff = icon.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
+           let png = bitmap.representation(using: .png, properties: [:]) {
+            let file = directory.appending(path: item.id.uuidString).appending(path: "toolbar-icon.png")
+            toolbarIcons[item.id] = icon
+            if installed[index].toolbarIconIsTemplate != icon.isTemplate { installed[index].toolbarIconIsTemplate = icon.isTemplate; changed = true }
+            if (try? Data(contentsOf: file)) != png { try? png.write(to: file, options: .atomic); changed = true }
+        }
+        if changed { try? persist() }
     }
 
     private func blockerGroup(_ item: InstalledExtension) -> String { item.sourceAppName ?? item.id.uuidString }
@@ -301,6 +335,7 @@ final class BrowserExtensions: NSObject {
                                       sourceIdentifier: discovery?.identifier, sourceAppName: discovery?.appName,
                                       sourceAppPath: discovery?.appURL?.path)
         try copyResource(url, for: item)
+        cacheToolbarMetadata(item, extension: webExtension)
     }
 
     private func importBlocker(from url: URL, name: String, discovery: DiscoveredExtension? = nil) async throws {
@@ -370,6 +405,7 @@ final class BrowserExtensions: NSObject {
             for pattern in webExtension.allRequestedMatchPatterns { context.setPermissionStatus(.grantedExplicitly, for: pattern) }
             try controller.load(context)
             contexts[item.id] = context
+            cacheToolbarMetadata(item, extension: webExtension, action: context.action(for: nil))
             actionRevision += 1
         case .contentBlocker:
             guard ruleLists[item.id] == nil else { return }

@@ -16,7 +16,11 @@ struct TabFolderItem: Codable, Equatable, Identifiable {
     var emoji = ""
     var color = FolderColor.primary
     var isExpanded = true
+    var originalTitle: String?
+    var nameSource: SavedTabNameSource?
 }
+
+enum SavedTabNameSource: String, Codable { case manual, automatic, original }
 
 struct FolderEditorRequest: Identifiable {
     let id = UUID()
@@ -65,18 +69,19 @@ final class TabFolderStore {
     }
 
     var visibleRows: [Row] { rows(includeCollapsed: false) }
+    func visibleRows(collapsing ids: Set<UUID>) -> [Row] { rows(includeCollapsed: false, collapsing: ids) }
     var folders: [Row] { rows(includeCollapsed: true).filter { $0.item.kind == .folder } }
     var pages: [TabFolderItem] { items.filter { $0.kind == .page } }
     func item(_ id: UUID?) -> TabFolderItem? { items.first { $0.id == id } }
 
-    private func rows(includeCollapsed: Bool) -> [Row] {
+    private func rows(includeCollapsed: Bool, collapsing: Set<UUID> = []) -> [Row] {
         let children = Dictionary(grouping: items, by: \.parentID)
         var result: [Row] = []
         var visited = Set<UUID>()
         func append(_ parent: UUID?, depth: Int) {
             for item in children[parent] ?? [] where visited.insert(item.id).inserted {
                 result.append(Row(item: item, depth: depth))
-                if item.kind == .folder && (includeCollapsed || item.isExpanded) { append(item.id, depth: depth + 1) }
+                if item.kind == .folder && (includeCollapsed || (item.isExpanded && !collapsing.contains(item.id))) { append(item.id, depth: depth + 1) }
             }
         }
         append(nil, depth: 0)
@@ -116,6 +121,20 @@ final class TabFolderStore {
         expandAncestors(of: parentID, in: &next)
         try commit(next)
         return folder
+    }
+
+    /// Promote a complete temporary group with a single durable write.
+    func pinGroup(title: String, symbol: String, expanded: Bool, parentID: UUID? = nil,
+                  pages: [(url: URL, title: String)]) throws -> (folder: TabFolderItem, pages: [TabFolderItem]) {
+        guard !pages.isEmpty, pages.allSatisfy({ PinnedPageStore.valid($0.url) }) else { throw Failure.invalidPage }
+        let folder = TabFolderItem(id: UUID(), kind: .folder, parentID: parentID, title: clean(title),
+                                   symbol: symbol, isExpanded: expanded)
+        guard canMove(folder.id, to: parentID) else { throw Failure.invalidLocation }
+        let children = pages.map { TabFolderItem(id: UUID(), kind: .page, parentID: folder.id, title: $0.title, url: $0.url) }
+        var next = items + [folder] + children
+        expandAncestors(of: parentID, in: &next)
+        try commit(next)
+        return (folder, children)
     }
 
     func updateFolder(_ id: UUID, title: String, parentID: UUID?, symbol: String, emoji: String, color: FolderColor) throws {
@@ -176,6 +195,31 @@ final class TabFolderStore {
         let index = items.prefix { $0.id != id }.filter { $0.parentID != id }.count
         var next = items.filter { $0.id != id && $0.parentID != id }
         next.insert(contentsOf: children, at: min(index, next.count))
+        try commit(next)
+    }
+
+    func renamePage(_ id: UUID, title: String, source: SavedTabNameSource) throws {
+        guard let index = items.firstIndex(where: { $0.id == id && $0.kind == .page }) else { return }
+        var next = items
+        next[index].originalTitle = next[index].originalTitle ?? next[index].title
+        next[index].title = title
+        next[index].nameSource = source
+        try commit(next)
+    }
+
+    func updatePageTitle(_ id: UUID, title: String) throws {
+        guard !title.isEmpty, let index = items.firstIndex(where: { $0.id == id && $0.kind == .page }) else { return }
+        var next = items
+        next[index].originalTitle = title
+        if next[index].nameSource == nil || next[index].nameSource == .original { next[index].title = title }
+        if next != items { try commit(next) }
+    }
+
+    func resetPageName(_ id: UUID) throws {
+        guard let index = items.firstIndex(where: { $0.id == id && $0.kind == .page }) else { return }
+        var next = items
+        next[index].title = next[index].originalTitle ?? next[index].title
+        next[index].nameSource = .original
         try commit(next)
     }
 

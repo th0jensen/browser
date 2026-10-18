@@ -27,6 +27,7 @@ struct NativeToolbarCommand {
 
 @MainActor
 final class NativeToolbarCommandButton: NSButton {
+    weak var visibilityToolbar: NSToolbar?
     private var command: NativeToolbarCommand
     private(set) var symbol: String?
     private(set) var displayMode = NSToolbar.DisplayMode.iconOnly
@@ -34,6 +35,7 @@ final class NativeToolbarCommandButton: NSButton {
     init(command: NativeToolbarCommand, displayMode: NSToolbar.DisplayMode = .iconOnly) {
         self.command = command
         super.init(frame: NSRect(x: 0, y: 0, width: BrowserChrome.toolbarHeight, height: BrowserChrome.toolbarHeight))
+        cell = CenteredToolbarButtonCell()
         setButtonType(.momentaryPushIn)
         bezelStyle = .accessoryBarAction
         isBordered = true
@@ -50,6 +52,7 @@ final class NativeToolbarCommandButton: NSButton {
         let sizeChanged = title != command.title || self.displayMode != displayMode
         self.displayMode = displayMode
         self.command = command
+        (cell as? CenteredToolbarButtonCell)?.horizontalOffset = command.identifier == "back" ? 2 : command.identifier == "forward" ? -2 : 0
         let commandID = NSUserInterfaceItemIdentifier(command.identifier)
         if identifier != commandID { identifier = commandID }
         if title != command.title {
@@ -87,7 +90,7 @@ final class NativeToolbarCommandButton: NSButton {
     }
     override var fittingSize: NSSize { intrinsicContentSize }
     override func accessibilityPerformPress() -> Bool {
-        guard isEnabled, !isHiddenOrHasHiddenAncestor else { return false }
+        guard isEnabled, window != nil, visibilityToolbar?.isVisible != false, !isHiddenOrHasHiddenAncestor else { return false }
         performClick(nil)
         return true
     }
@@ -119,5 +122,36 @@ final class NativeToolbarCommandAdapter {
 
     func restore() {
         if item.view === button { item.view = originalView }
+    }
+}
+
+/// AppKit's accessory cell rounds the image canvas and applies baseline offsets.
+/// Center the symbol's alignment bounds instead, consistently across glyphs.
+@MainActor
+final class CenteredToolbarButtonCell: NSButtonCell {
+    var horizontalOffset: CGFloat = 0
+    override func imageRect(forBounds bounds: NSRect) -> NSRect {
+        guard imagePosition == .imageOnly, let image else { return super.imageRect(forBounds: bounds) }
+        let alignment = image.alignmentRect
+        let centerY = controlView?.isFlipped == true ? image.size.height - alignment.midY : alignment.midY
+        return NSRect(x: bounds.midX + horizontalOffset - alignment.midX, y: bounds.midY - centerY,
+                      width: image.size.width, height: image.size.height)
+    }
+
+    override func drawImage(_ image: NSImage, withFrame frame: NSRect, in controlView: NSView) {
+        // Accessory cells calculate their drawing frame internally, bypassing
+        // imageRect(forBounds:). Keep the native tint and disabled rendering.
+        guard imagePosition == .imageOnly else {
+            super.drawImage(image, withFrame: frame, in: controlView)
+            return
+        }
+        let alignment = image.alignmentRect
+        let scaleX = frame.width / image.size.width
+        let scaleY = frame.height / image.size.height
+        let centerY = controlView.isFlipped ? image.size.height - alignment.midY : alignment.midY
+        let centered = NSRect(x: controlView.bounds.midX + horizontalOffset - alignment.midX * scaleX,
+                              y: controlView.bounds.midY - centerY * scaleY,
+                              width: frame.width, height: frame.height)
+        super.drawImage(image, withFrame: centered, in: controlView)
     }
 }

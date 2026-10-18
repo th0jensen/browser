@@ -14,6 +14,7 @@ final class BrowserTab: NSObject, Identifiable {
     var isNewTab = true
     var pinnedPageID: UUID?
     var folderPageID: UUID?
+    var temporarySection: TemporaryTabSection?
     /// The tab whose page opened this one, so its links and pop-ups open next to each other.
     @ObservationIgnored var openerID: UUID?
     /// Whether another page's script opened this one, and can still reach it through `window.opener`.
@@ -96,6 +97,8 @@ final class BrowserTab: NSObject, Identifiable {
         webView.uiDelegate = pageDelegate
         self.webView = webView
         PagePaintObserver.shared.install(in: webView, tab: self)
+        PageAppearance.shared.install(in: webView)
+        LinkPreviewController.shared.install(in: webView, tab: self)
         BrowserExtensions.shared.updateRules(in: webView)
 
         let options: NSKeyValueObservingOptions = isRestoring ? [] : .initial
@@ -139,6 +142,7 @@ final class BrowserTab: NSObject, Identifiable {
         thumbnailCapture.invalidate(cancelCapture: true)
         pendingThumbnail = nil
         faviconTask?.cancel()
+        LinkPreviewController.shared.dismiss(for: webView)
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
@@ -177,7 +181,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// Returns `false` if the tab is closed or suspended first.
     func waitUntilSelected() async -> Bool {
         guard let browser else { return false }
-        if browser.activeTabID == id { return true }
+        if browser.activeTabID == id || browser.peek?.tab.id == id { return true }
         return await withCheckedContinuation { selectionWaiters.append($0) }
     }
 
@@ -256,6 +260,7 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     var title: String {
+        if let page = browser?.folders.item(folderPageID) { return page.title }
         if !pageTitle.isEmpty { return pageTitle }
         return url?.host() ?? "New Tab"
     }

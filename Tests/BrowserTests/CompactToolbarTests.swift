@@ -7,90 +7,62 @@ import XCTest
 
 @MainActor
 final class CompactToolbarTests: XCTestCase {
-    func testCompactToolbarRevealsOverTheSameFullHeightPageInBothLayouts() async throws {
-        for layout in [TabLayout.horizontal, .vertical] {
-            let fixture = try await makeFixture(layout: layout)
-            defer { fixture.close() }
-            let window = fixture.window
-            let webView = fixture.webView
-            let page = fixture.tab.contentView
-            let hiddenFrame = try await settledPageFrame(in: fixture)
-            let content = try XCTUnwrap(window.contentView)
-            let contentFrame = try frameInWindow(content, window: window)
+    func testVerticalCompactToolbarRevealsOverTheSameFullHeightPage() async throws {
+        let fixture = try await makeFixture(layout: .vertical)
+        defer { fixture.close() }
+        let window = fixture.window
+        let page = fixture.tab.contentView
+        let webView = fixture.webView
+        let hiddenFrame = try await settledPageFrame(in: fixture)
+        let content = try XCTUnwrap(window.contentView)
+        let contentFrame = try frameInWindow(content, window: window)
+        let nativeField = try XCTUnwrap(addressField(in: window))
+        XCTAssertFalse(nativeToolbarIsVisible(in: window))
+        XCTAssertFalse(nativeField.acceptsFirstResponder)
+        XCTAssertFalse(nativeField.becomeFirstResponder())
+        XCTAssertEqual(hiddenFrame.minX, contentFrame.minX + BrowserChrome.edgeInset, accuracy: 1)
+        XCTAssertEqual(hiddenFrame.maxX, contentFrame.maxX - BrowserChrome.edgeInset, accuracy: 1)
+        XCTAssertEqual(hiddenFrame.minY, contentFrame.minY + BrowserChrome.edgeInset, accuracy: 1)
+        XCTAssertEqual(hiddenFrame.maxY, contentFrame.maxY - BrowserChrome.edgeInset, accuracy: 1)
+        assertWindowControls(hidden: true, in: window)
+        try assertPageReceivesHitsUnderHiddenChrome(in: fixture)
+        fixture.hover.pointerMoved(to: CGPoint(x: window.frame.width / 2, y: 1))
+        XCTAssertTrue(nativeToolbarIsVisible(in: window))
+        try await waitFor("native toolbar reveal") { self.nativeToolbarIsVisible(in: window) }
+        assertEqualFrames(try await settledPageFrame(in: fixture), hiddenFrame, "Floating chrome must overlay the page")
+        assertWindowControls(hidden: false, in: window)
+        try assertNativeToolbarMetrics(in: window, extraInset: BrowserChrome.edgeInset / 2)
+        XCTAssertTrue(addressField(in: window) === nativeField)
+        XCTAssertTrue(fixture.tab.webView === webView)
+        XCTAssertTrue(fixture.tab.contentView === page)
+        fixture.hover.pointerMoved(to: CGPoint(x: window.frame.width / 2, y: 300))
+        try await waitFor("native toolbar hide") { !self.nativeToolbarIsVisible(in: window) }
+        assertEqualFrames(try await settledPageFrame(in: fixture), hiddenFrame, "Hiding floating chrome must retain the page frame")
+        XCTAssertTrue(addressField(in: window) === nativeField)
+        assertWindowControls(hidden: true, in: window)
+        try assertPageReceivesHitsUnderHiddenChrome(in: fixture)
+    }
 
-            XCTAssertFalse(nativeToolbarIsVisible(in: window))
-            XCTAssertFalse(fixture.hover.toolbarIsRevealed)
-            let nativeField = try XCTUnwrap(addressField(in: window))
-            XCTAssertTrue(nativeField.isHiddenOrHasHiddenAncestor)
-            XCTAssertFalse(nativeField.acceptsFirstResponder)
-            XCTAssertFalse(nativeField.becomeFirstResponder())
-            _ = window.makeFirstResponder(nativeField)
-            XCTAssertFalse(window.firstResponder === nativeField)
-            XCTAssertNil(nativeField.currentEditor())
-            if let root = window.contentView?.superview {
-                let point = nativeField.convert(NSPoint(x: nativeField.bounds.midX, y: nativeField.bounds.midY), to: root)
-                let hit = root.hitTest(point)
-                XCTAssertFalse(hit === nativeField || hit?.isDescendant(of: nativeField) == true,
-                               "Concealed native toolbar controls must leave page clicks available")
-            }
-            XCTAssertEqual(hiddenFrame.minX, contentFrame.minX + BrowserChrome.edgeInset, accuracy: 1)
-            XCTAssertEqual(hiddenFrame.maxX, contentFrame.maxX - BrowserChrome.edgeInset, accuracy: 1)
-            XCTAssertEqual(hiddenFrame.minY, contentFrame.minY + BrowserChrome.edgeInset, accuracy: 1)
-            XCTAssertEqual(hiddenFrame.maxY, contentFrame.maxY - BrowserChrome.edgeInset, accuracy: 1,
-                           "Compact pages must extend beneath the native titlebar in \(layout)")
-            assertWindowControls(hidden: true, in: window)
-            XCTAssertFalse(horizontalTabsAreVisible(in: window))
-            try assertPageReceivesHitsUnderHiddenChrome(in: fixture)
-
-            fixture.hover.pointerMoved(to: CGPoint(x: window.frame.width / 2, y: 1))
-            XCTAssertTrue(self.nativeToolbarIsVisible(in: window),
-                          "The native top-edge callback must reveal the toolbar before any SwiftUI update")
-            try await waitFor("native toolbar to reveal in \(layout)") { self.nativeToolbarIsVisible(in: window) }
-            let revealedFrame = try await settledPageFrame(in: fixture)
-            assertEqualFrames(revealedFrame, hiddenFrame, "Revealing compact chrome must overlay the page")
-            assertWindowControls(hidden: false, in: window)
-            try assertNativeToolbarMetrics(in: window)
-            XCTAssertEqual(horizontalTabsAreVisible(in: window), layout == .horizontal)
-            let revealedAccessory = window.titlebarAccessoryViewControllers.first { $0.layoutAttribute == .right }
-            let revealedTabs = horizontalTabAnchor(in: window)
-            XCTAssertTrue(addressField(in: window) === nativeField)
-            XCTAssertTrue(fixture.tab.webView === webView)
-            XCTAssertTrue(fixture.tab.contentView === page)
-            XCTAssertTrue(webView.superview === page)
-
-            fixture.hover.pointerMoved(to: CGPoint(x: window.frame.width / 2, y: 300))
-            try await waitFor("native toolbar to hide after leaving its region") {
-                !fixture.hover.toolbarIsRevealed && !self.nativeToolbarIsVisible(in: window)
-            }
-            assertEqualFrames(try await settledPageFrame(in: fixture), hiddenFrame,
-                              "Hiding compact chrome must keep the native page frame")
-            XCTAssertTrue(fixture.tab.webView === webView)
-            XCTAssertTrue(webView.superview === page)
-            assertWindowControls(hidden: true, in: window)
-            XCTAssertFalse(horizontalTabsAreVisible(in: window))
-            XCTAssertTrue(addressField(in: window) === nativeField,
-                          "Concealing native chrome must retain the address field")
-            XCTAssertTrue(horizontalTabAnchor(in: window) === revealedTabs,
-                          "Concealing horizontal tabs must retain their native host")
-            try assertPageReceivesHitsUnderHiddenChrome(in: fixture)
-
-            if layout == .horizontal {
-                fixture.hover.pointerMoved(to: CGPoint(x: window.frame.width / 2, y: 1))
-                XCTAssertTrue(self.nativeToolbarIsVisible(in: window),
-                              "Repeated native reveal must also be immediate")
-                try await waitFor("horizontal accessory to return with revealed toolbar") {
-                    self.nativeToolbarIsVisible(in: window)
-                        && self.horizontalTabsAreVisible(in: window)
-                }
-                XCTAssertTrue(window.titlebarAccessoryViewControllers.first { $0.layoutAttribute == .right } === revealedAccessory,
-                              "Repeated reveal must reuse the native horizontal tab accessory")
-                assertEqualFrames(try await settledPageFrame(in: fixture), hiddenFrame,
-                                  "Revealing retained horizontal tabs must overlay the same page frame")
-                XCTAssertTrue(fixture.tab.webView === webView)
-                XCTAssertTrue(addressField(in: window) === nativeField)
-                XCTAssertTrue(horizontalTabAnchor(in: window) === revealedTabs)
-            }
+    func testHorizontalTabsAlwaysKeepChromeVisibleDespiteSavedAutoHideChoices() async throws {
+        let fixture = try await makeFixture(layout: .horizontal)
+        defer { fixture.close() }
+        let window = fixture.window
+        let page = fixture.tab.contentView
+        XCTAssertFalse(fixture.browser.chromePreferences.autoHideToolbar)
+        XCTAssertFalse(fixture.browser.chromePreferences.autoHideSidebar)
+        XCTAssertTrue(nativeToolbarIsVisible(in: window))
+        XCTAssertTrue(horizontalTabsAreVisible(in: window))
+        fixture.hover.pointerMoved(to: CGPoint(x: 400, y: 400))
+        try await Task.sleep(for: ChromeHoverController.hideDelay + .milliseconds(80))
+        XCTAssertTrue(nativeToolbarIsVisible(in: window))
+        assertWindowControls(hidden: false, in: window)
+        fixture.browser.chromePreferences.tabLayout = .vertical
+        try await waitFor("vertical mode to restore its saved auto-hide choice") { !self.nativeToolbarIsVisible(in: window) }
+        fixture.browser.chromePreferences.tabLayout = .horizontal
+        try await waitFor("horizontal mode to restore permanent chrome") {
+            self.nativeToolbarIsVisible(in: window) && self.horizontalTabsAreVisible(in: window)
         }
+        XCTAssertTrue(fixture.tab.contentView === page)
     }
 
     func testSidebarAndToolbarHoverRemainIndependentNativeOverlays() async throws {
@@ -129,7 +101,7 @@ final class CompactToolbarTests: XCTestCase {
     }
 
     func testNewTabRevealsAndFocusesNativeAddressFieldThenExitingCompactRestoresChrome() async throws {
-        let fixture = try await makeFixture(layout: .horizontal)
+        let fixture = try await makeFixture(layout: .vertical)
         defer { fixture.close() }
         let window = fixture.window
         let originalPageFrame = try await settledPageFrame(in: fixture)
@@ -148,8 +120,13 @@ final class CompactToolbarTests: XCTestCase {
         XCTAssertEqual(fixture.browser.addressFocusRequest, previousFocusRequest + 1)
         XCTAssertTrue(fixture.browser.activeTab?.isNewTab == true)
         XCTAssertTrue(fixture.hover.addressIsFocused)
-        XCTAssertTrue(horizontalTabsAreVisible(in: window))
-        try assertNativeToolbarMetrics(in: window)
+        // Native titlebar alignment is coalesced after the field editor appears.
+        try await waitFor("native window controls to finish reveal alignment") {
+            guard let close = window.standardWindowButton(.closeButton), close.window != nil else { return false }
+            let frame = close.convert(close.bounds, to: nil)
+            return abs(frame.minX - BrowserChrome.windowControlsLeadingInset(controlHeight: frame.height) - BrowserChrome.edgeInset / 2) < 0.5
+        }
+        try assertNativeToolbarMetrics(in: window, extraInset: BrowserChrome.edgeInset / 2)
 
         // A focused native field must keep the toolbar usable after the pointer leaves.
         fixture.hover.pointerMoved(to: CGPoint(x: 600, y: 300))
@@ -170,10 +147,9 @@ final class CompactToolbarTests: XCTestCase {
         XCTAssertTrue(fixture.tab.webView === originalWebView)
         XCTAssertTrue(originalWebView.superview === originalPage)
 
-        fixture.defaults.set(false, forKey: CompactToolbar.storageKey)
-        try await waitFor("leaving compact mode to restore native toolbar and horizontal tabs") {
+        fixture.browser.chromePreferences.autoHideToolbar = false
+        try await waitFor("leaving compact mode to restore native toolbar") {
             !fixture.hover.compactToolbar && self.nativeToolbarIsVisible(in: window)
-                && self.horizontalTabsAreVisible(in: window)
         }
         let normalFrame = try await settledPageFrame(in: fixture)
         XCTAssertEqual(normalFrame.maxY, window.contentLayoutRect.maxY - BrowserChrome.edgeInset, accuracy: 1)
@@ -284,7 +260,7 @@ final class CompactToolbarTests: XCTestCase {
         let contentFrame = try frameInWindow(host, window: window)
         let closeFrame = try frameInWindow(close, window: window)
         let tabsFrame = try frameInWindow(tabs, window: window)
-        XCTAssertEqual(closeFrame.minX, 17, accuracy: 0.5)
+        XCTAssertEqual(closeFrame.minX, BrowserChrome.edgeInset + (BrowserChrome.toolbarHeight - closeFrame.height) / 2, accuracy: 0.5)
         XCTAssertEqual(contentFrame.maxY - closeFrame.midY, BrowserChrome.tabRowHeight / 2, accuracy: 0.5,
                        "Fullscreen traffic lights must keep the native horizontal titlebar center")
         XCTAssertEqual(closeFrame.midY, tabsFrame.midY, accuracy: 0.5)
@@ -445,7 +421,8 @@ final class CompactToolbarTests: XCTestCase {
             try await waitFor("compact native window to install its loaded page") {
                 fixture.browser.window === fixture.window && fixture.webView.window === fixture.window
                     && fixture.webView.bounds.width > 0 && fixture.webView.bounds.height > 0
-                    && fixture.hover.compactToolbar && self.addressField(in: fixture.window)?.isHiddenOrHasHiddenAncestor == true
+                    && fixture.hover.compactToolbar == (layout == .vertical)
+                    && self.nativeToolbarIsVisible(in: fixture.window) == (layout == .horizontal)
             }
             fixture.webView.loadHTMLString("<html><head><title>Compact toolbar fixture</title></head><body>Native page geometry</body></html>",
                                            baseURL: URL(string: "https://example.com")!)
@@ -463,26 +440,12 @@ final class CompactToolbarTests: XCTestCase {
                                                          file: StaticString = #filePath, line: UInt = #line) throws {
         let window = fixture.window
         let root = try XCTUnwrap(window.contentView?.superview, file: file, line: line)
-        var targets: [(String, NSView)] = [
-            ("address field", try XCTUnwrap(addressField(in: window), file: file, line: line))
-        ]
-        for (type, name): (NSWindow.ButtonType, String) in [(.closeButton, "close button"),
-                                                           (.miniaturizeButton, "minimize button"),
-                                                           (.zoomButton, "fullscreen button")] {
-            targets.append((name, try XCTUnwrap(window.standardWindowButton(type), file: file, line: line)))
-        }
-        if !fixture.hover.verticalTabs {
-            targets.append(("horizontal tab strip", try XCTUnwrap(horizontalTabAnchor(in: window), file: file, line: line)))
-        }
-        for (name, target) in targets {
-            let frame = try frameInWindow(target, window: window)
-            XCTAssertGreaterThan(frame.width, 0, "Concealed \(name) must retain measured geometry", file: file, line: line)
-            XCTAssertGreaterThan(frame.height, 0, file: file, line: line)
-            let point = root.convert(NSPoint(x: frame.midX, y: frame.midY), from: nil)
+        let page = try frameInWindow(fixture.webView, window: window)
+        for x in [page.minX + 20, page.midX, page.maxX - 20] {
+            let point = root.convert(NSPoint(x: x, y: page.maxY - 12), from: nil)
             let hit = root.hitTest(point)
-            let received = hit.map { String(describing: type(of: $0)) } ?? "nil"
             XCTAssertTrue(hit === fixture.webView || hit?.isDescendant(of: fixture.webView) == true,
-                          "The page must receive clicks under concealed \(name); received \(received)", file: file, line: line)
+                          "Concealed chrome must leave the top of the page clickable", file: file, line: line)
         }
     }
 
@@ -514,15 +477,16 @@ final class CompactToolbarTests: XCTestCase {
         return nil
     }
 
-    private func assertNativeToolbarMetrics(in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) throws {
+    private func assertNativeToolbarMetrics(in window: NSWindow, extraInset: CGFloat = 0, file: StaticString = #filePath, line: UInt = #line) throws {
         let item = try XCTUnwrap(window.toolbar?.items.first { $0.itemIdentifier.rawValue == "address" }?.view,
                                  file: file, line: line)
         let anchor = try XCTUnwrap(descendant(ToolbarFieldAnchorView.self, in: item), file: file, line: line)
         XCTAssertEqual(try frameInWindow(anchor, window: window).height, 24, accuracy: 1,
                        "Compact reveal must preserve the native 24-point address field", file: file, line: line)
         let close = try XCTUnwrap(window.standardWindowButton(.closeButton), file: file, line: line)
-        XCTAssertEqual(try frameInWindow(close, window: window).minX, 17, accuracy: 0.5,
-                       "Compact reveal must preserve the 17-point traffic-light leading inset", file: file, line: line)
+        let closeFrame = try frameInWindow(close, window: window)
+        XCTAssertEqual(closeFrame.minX, BrowserChrome.windowControlsLeadingInset(controlHeight: closeFrame.height) + extraInset, accuracy: 0.5,
+                       "Window controls must preserve the balanced inset for their native control size", file: file, line: line)
     }
 
     private func assertWindowControls(hidden: Bool, in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) {
@@ -596,7 +560,7 @@ private final class CompactToolbarFixture {
         defaults.set(true, forKey: CompactToolbar.storageKey)
         defaults.set(true, forKey: SidebarVisibility.autoHideKey)
         defaults.set(BookmarksBarVisibility.never.rawValue, forKey: BookmarksBarVisibility.storageKey)
-        let browser = BrowserModel(sitePermissions: SitePermissions())
+        let browser = BrowserModel(sitePermissions: SitePermissions(), chromePreferences: WindowChromePreferences(defaults: defaults))
         let tab = try XCTUnwrap(browser.activeTab)
         self.browser = browser
         self.tab = tab

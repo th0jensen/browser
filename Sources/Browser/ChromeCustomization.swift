@@ -35,20 +35,22 @@ struct ToolbarContextMenu: View {
     let customize: () -> Void
     var browser: BrowserModel? = nil
     var window: NSWindow? = nil
-    @AppStorage(CompactToolbar.storageKey) private var autoHide = false
-    @AppStorage(TabLayout.storageKey) private var layout = TabLayout.horizontal
+    @Environment(\.windowChromePreferences) private var windowPreferences
+    private var preferences: WindowChromePreferences { browser?.chromePreferences ?? windowPreferences ?? WindowChromeSettingsTarget.shared.preferences }
+    private var layout: TabLayout { preferences.tabLayout }
     @AppStorage(ChromeCustomization.toolbarLabelStyleKey) private var labelStyle = ToolbarLabelStyle.iconOnly
 
     var body: some View {
-        Toggle("Auto-hide Toolbar", isOn: $autoHide)
+        Toggle("Auto-hide Toolbar", isOn: Binding(get: { preferences.autoHideToolbar }, set: { preferences.autoHideToolbar = $0 }))
             .keyboardShortcut("s", modifiers: [.control, .command])
+            .disabled(layout == .horizontal)
         if let browser {
             Button("Focus Address Bar") { browser.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
         }
         Divider()
-        TabLayoutMenu()
-        if layout == .vertical { Menu("Sidebar") { SidebarBehaviorMenu() } }
+        TabLayoutMenu(preferences: preferences)
+        if layout == .vertical { Menu("Sidebar") { SidebarBehaviorMenu().environment(\.windowChromePreferences, preferences) } }
         Menu("Bookmarks") { BookmarksBehaviorMenu() }
         Divider()
         Menu("Toolbar Display") {
@@ -87,11 +89,13 @@ struct ChromeToolbarLabelStyle: LabelStyle {
 }
 
 struct TabLayoutMenu: View {
-    @AppStorage(TabLayout.storageKey) private var layout = TabLayout.horizontal
+    var preferences: WindowChromePreferences? = nil
+    @Environment(\.windowChromePreferences) private var windowPreferences
+    private var target: WindowChromePreferences { preferences ?? windowPreferences ?? WindowChromeSettingsTarget.shared.preferences }
 
     var body: some View {
         Menu("Tab Layout") {
-            Picker("Layout", selection: $layout) {
+            Picker("Layout", selection: Binding(get: { target.tabLayout }, set: { target.tabLayout = $0 })) {
                 Text("Horizontal").tag(TabLayout.horizontal)
                 Text("Vertical").tag(TabLayout.vertical)
             }.pickerStyle(.inline).labelsHidden()
@@ -100,12 +104,14 @@ struct TabLayoutMenu: View {
 }
 
 struct SidebarBehaviorMenu: View {
-    @AppStorage(SidebarVisibility.autoHideKey) private var autoHide = false
+    @Environment(\.windowChromePreferences) private var windowPreferences
+    private var preferences: WindowChromePreferences { windowPreferences ?? WindowChromeSettingsTarget.shared.preferences }
     @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
 
     var body: some View {
-        Toggle("Auto-hide Sidebar", isOn: $autoHide)
+        Toggle("Auto-hide Sidebar", isOn: Binding(get: { preferences.autoHideSidebar }, set: { preferences.autoHideSidebar = $0 }))
             .keyboardShortcut("s", modifiers: .command)
+            .disabled(preferences.tabLayout == .horizontal)
         Toggle("Compact Tab Rows", isOn: $compactTabs)
     }
 }

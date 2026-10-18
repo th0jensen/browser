@@ -56,6 +56,9 @@ final class ChromeHoverController {
     var sidebarIsResizing = false {
         didSet { if sidebarIsResizing { cancelSidebarHide() } else { pointerMoved(to: lastPointer) } }
     }
+    var sidebarIsReordering = false {
+        didSet { if sidebarIsReordering { cancelSidebarHide() } else { reevaluatePointer() } }
+    }
     @ObservationIgnored private var lastPointer: CGPoint?
     @ObservationIgnored var sidebarBoundsProvider: (() -> CGRect?)?
     @ObservationIgnored private var navigationAwaitingSuccess: UUID?
@@ -192,12 +195,12 @@ final class ChromeHoverController {
 
     func scheduleSidebarHide() {
         guard sidebarIsRevealed, sidebarHideTask == nil, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed,
-              !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing else { return }
+              !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarIsReordering else { return }
         sidebarHideTask = Task { @MainActor [weak self, sleep] in
             do { try await sleep(Self.hideDelay) } catch { return }
             guard let self else { return }
             sidebarHideTask = nil
-            guard !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed else { return }
+            guard !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarIsReordering, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed else { return }
             sidebarIsRevealed = false
         }
     }

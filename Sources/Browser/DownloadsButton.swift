@@ -91,14 +91,26 @@ private struct DownloadRow: View {
                 .frame(width: 28, height: 28)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(item.name)
+                Group {
+                    if item.originalName != nil {
+                        Button(item.name) { downloads.undoTidyName(item) }
+                            .buttonStyle(.plain).help("Restore original name: \(item.originalName ?? "")")
+                    } else { Text(item.name) }
+                }
                     .font(.system(size: 12.5, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .modifier(IntelligenceShimmer(active: item.isNaming))
                 if item.state == .downloading {
                     ProgressView(value: item.progress)
                         .progressViewStyle(.linear)
                         .controlSize(.small)
+                }
+                if item.originalName != nil {
+                    Text("Renamed · click name to undo").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                if let error = item.namingError {
+                    Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
                 Text(status)
                     .font(.system(size: 11))
@@ -136,6 +148,7 @@ private struct DownloadRow: View {
                 .disabled(item.state != .finished)
             Button("Show in Finder") { downloads.reveal(item) }
                 .disabled(item.state != .finished)
+            if item.originalName != nil { Button("Restore Original Name") { downloads.undoTidyName(item) } }
             if item.state == .downloading {
                 Divider()
                 Button("Cancel Download") { downloads.cancel(item) }

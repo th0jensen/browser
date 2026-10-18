@@ -22,6 +22,7 @@ struct BrowserApp: App {
     var body: some Scene {
         WindowGroup {
             BrowserWindow(bookmarks: bookmarks, downloads: downloads)
+                .modifier(ScrollbarVisibility())
                 .frame(minWidth: 680, minHeight: 440)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     BrowserSessionStore.shared.flush()
@@ -35,6 +36,7 @@ struct BrowserApp: App {
             BrowserCommands(bookmarks: bookmarks)
         }
         Settings { BrowserSettings() }
+            .windowStyle(.hiddenTitleBar)
     }
 }
 
@@ -64,9 +66,19 @@ private struct BrowserCommands: Commands {
     let bookmarks: BookmarkStore
     @FocusedValue(\.browserModel) private var browser
     @AppStorage(BookmarksBarVisibility.storageKey) private var bookmarksBarVisibility = BookmarksBarVisibility.always
-    @AppStorage(TabLayout.storageKey) private var tabLayout = TabLayout.horizontal
-    @AppStorage(SidebarVisibility.autoHideKey) private var autoHideSidebar = false
-    @AppStorage(CompactToolbar.storageKey) private var compactToolbar = false
+    private var tabLayout: TabLayout {
+        get { chrome.tabLayout }
+        nonmutating set { chrome.tabLayout = newValue }
+    }
+    private var chrome: WindowChromePreferences { browser?.chromePreferences ?? WindowChromeSettingsTarget.shared.preferences }
+    private var autoHideSidebar: Bool {
+        get { chrome.autoHideSidebar }
+        nonmutating set { chrome.autoHideSidebar = newValue }
+    }
+    private var compactToolbar: Bool {
+        get { chrome.autoHideToolbar }
+        nonmutating set { chrome.autoHideToolbar = newValue }
+    }
 
     private var bookmarkableTab: BrowserTab? {
         guard let tab = browser?.activeTab, !tab.isNewTab, tab.url != nil else { return nil }
@@ -79,8 +91,14 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("t", modifiers: .command)
             Button("Reopen Closed Tab") { browser?.reopenClosedTab() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
-            Button("Close Tab") { browser?.closeActiveTab() }
+            Button("Close Tab") {
+                if let browser { browser.closeActiveTab() }
+                else { NSApp.keyWindow?.performClose(nil) }
+            }
                 .keyboardShortcut("w", modifiers: .command)
+            Button("Open Peek in New Tab") { browser?.expandPeek() }
+                .keyboardShortcut("o", modifiers: .command)
+                .disabled(browser?.peek == nil)
         }
         CommandGroup(replacing: .saveItem) {
             Button("Save Webpage As…") { browser?.saveWebpage() }
@@ -88,21 +106,40 @@ private struct BrowserCommands: Commands {
                 .disabled(browser?.activeTab?.isNewTab != false)
         }
         CommandMenu("Tabs") {
+            Button("Add Right Split") {
+                guard let browser, let tab = browser.activeTab else { return }
+                browser.addTab(focusAddress: false)
+                if let newTab = browser.activeTab {
+                    browser.makeSplit(newTab.id, with: tab.id, placement: .right)
+                    browser.activeTabID = newTab.id
+                    browser.requestAddressFocus()
+                }
+            }
+            .keyboardShortcut("+", modifiers: [.command, .shift])
+            .disabled(browser == nil || (browser?.activeSplit?.tabIDs.count ?? 1) >= SplitTabGroup.limit)
+            if let browser, let tab = browser.activeTab, browser.activeSplit != nil {
+                SplitTabMenu(browser: browser, tab: tab)
+            }
+            Divider()
             Button("New Folder…") { browser?.requestNewFolder() }
+            Button(browser?.isTidyingTabs == true ? "Cancel Tidying" : "Tidy Tabs") {
+                if browser?.isTidyingTabs == true { browser?.cancelTidyingTabs() } else { browser?.tidyTemporaryTabs() }
+            }.disabled(browser?.isTidyingTabs != true && (browser?.canTidyTabs != true || BrowserIntelligence.unavailableReason != nil))
+            if browser?.regularTabs.contains(where: { $0.temporarySection != nil }) == true {
+                Button("Remove All Temporary Groups") { browser?.removeTemporarySections() }
+            }
+            Divider()
             if let browser, !browser.folders.pages.isEmpty {
-                Menu("Saved Folder Pages") {
+                Menu("Pinned Tabs") {
                     ForEach(browser.folders.pages) { page in
                         Button(page.title) { browser.openFolderPage(page) }
                     }
                 }
             }
             Divider()
-            Button("Pin Webpage") {
-                if let browser, let tab = browser.activeTab { browser.pin(tab) }
-            }
-            .disabled(browser.flatMap { model in model.activeTab.map { model.canPin($0) } } != true)
+            if let browser, let tab = browser.activeTab { TabPinActions(browser: browser, tab: tab) }
             if let browser, !browser.pinnedPages.items.isEmpty {
-                Menu("Pinned Pages") {
+                Menu("Essential Tabs") {
                     ForEach(browser.pinnedPages.items) { page in
                         Button(page.title) { browser.openPinned(page) }
                     }
@@ -127,6 +164,17 @@ private struct BrowserCommands: Commands {
             Button("Select Last Tab") { browser?.selectLastTab() }
                 .keyboardShortcut("9", modifiers: .command)
         }
+        // Native toggleToolbarShown: only changes NSToolbar.isVisible, which
+        // auto-hide legitimately reconciles on the next layout. Use the shared
+        // preference so View, keyboard, Settings and context menu agree.
+        CommandGroup(replacing: .toolbar) {
+            Button(compactToolbar ? "Show Toolbar" : "Automatically Hide Toolbar") {
+                compactToolbar.toggle()
+            }
+            .disabled(tabLayout == .horizontal)
+            .keyboardShortcut("s", modifiers: [.command, .control])
+            Button("Customize Toolbar…") { ChromeCustomization.customizeToolbar(in: browser?.window) }
+        }
         CommandGroup(after: .toolbar) {
             Button("Open Location") { browser?.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
@@ -140,10 +188,6 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("]", modifiers: .command)
         }
         CommandGroup(after: .sidebar) {
-            Button(compactToolbar ? "Show Toolbar Permanently" : "Automatically Hide Toolbar") {
-                compactToolbar.toggle()
-            }
-                .keyboardShortcut("s", modifiers: [.command, .control])
             Button(tabLayout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs") {
                 tabLayout = tabLayout.toggled
             }
@@ -154,6 +198,7 @@ private struct BrowserCommands: Commands {
                 autoHideSidebar = !isAutoHiding
             }
             .keyboardShortcut("s", modifiers: .command)
+            .disabled(tabLayout == .horizontal)
             Divider()
             Picker("Bookmarks Bar", selection: $bookmarksBarVisibility) {
                 ForEach(BookmarksBarVisibility.allCases) { visibility in

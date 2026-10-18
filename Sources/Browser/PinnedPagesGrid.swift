@@ -13,18 +13,33 @@ struct PinnedPagesGrid: View {
     }
 
     var body: some View {
-        let counts = Self.rowCounts(for: browser.pinnedPages.items.count)
-        VStack(spacing: 8) {
+        let companions = Set(browser.tabs.filter { browser.isSplitCompanion($0) }.compactMap(\.pinnedPageID))
+        let visiblePages = browser.pinnedPages.items.filter { !companions.contains($0.id) }
+        let counts = Self.rowCounts(for: visiblePages.count)
+        VStack(spacing: BrowserChrome.edgeInset) {
+            if counts.isEmpty {
+                Label("Drag a tab here", systemImage: "pin")
+                    .font(.system(size: 11)).foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity).frame(height: Self.tileHeight)
+            }
             ForEach(counts.indices, id: \.self) { row in
                 let start = counts.prefix(row).reduce(0, +)
-                HStack(spacing: 8) {
-                    ForEach(Array(browser.pinnedPages.items.dropFirst(start).prefix(counts[row]))) { page in
-                        PinnedPageTile(page: page, browser: browser)
-                            .frame(maxWidth: .infinity)
+                let pages = Array(visiblePages.dropFirst(start).prefix(counts[row]))
+                HStack(spacing: BrowserChrome.edgeInset) {
+                    ForEach(pages) { page in
+                        PinnedPageTile(page: page, browser: browser).frame(maxWidth: .infinity)
                     }
                 }
+                .zIndex(pages.contains { browser.tabDrag.payload == SidebarDragItem.essential($0.id).payload } ? 100 : 0)
             }
         }
+        .background {
+            RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius)
+                .strokeBorder(browser.canDragToEssentials && browser.tabDrag.isOver(SidebarDragItem.essentials.payload)
+                              ? Color.accentColor.opacity(0.8) : counts.isEmpty ? Color.primary.opacity(0.12) : .clear,
+                              style: StrokeStyle(lineWidth: 1, dash: counts.isEmpty ? [4, 4] : []))
+        }
+        .modifier(TabReorderTarget(controller: browser.tabDrag, payload: SidebarDragItem.essentials.payload, priority: 2))
     }
 }
 
@@ -35,16 +50,16 @@ struct PinnedPagesButton: View {
 
     var body: some View {
         Button { isPresented.toggle() } label: {
-            Label("Pinned Pages", systemImage: "square.grid.3x3")
+            Label("Essential Tabs", systemImage: "square.grid.3x3")
         }
         .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
         .labelStyle(ChromeToolbarLabelStyle())
         .chromeToolbarButtonStyle()
         .controlSize(.regular)
-        .disabled(browser.pinnedPages.items.isEmpty)
-        .help("Pinned Pages")
+        .help("Essential Tabs")
         .popover(isPresented: $isPresented) {
             PinnedPagesGrid(browser: browser).padding(BrowserChrome.edgeInset).frame(width: sidebarWidth)
+                .modifier(SplitDropBadge(controller: browser.tabDrag))
                 .onChange(of: browser.activeTabID) { _, _ in isPresented = false }
         }
         .chromePresentation(isPresented: isPresented, controller: browser.chromeHover)
@@ -58,15 +73,24 @@ private struct PinnedPageTile: View {
     @State private var isHovered = false
 
     var body: some View {
-        let active = browser.activeTab?.pinnedPageID == page.id
+        let tab = browser.tabs.first { $0.pinnedPageID == page.id }
+        let split = tab.flatMap { browser.split(containing: $0.id) }
+        let active = tab.map { browser.splitIsActive($0) } ?? false
         let loaded = browser.tabs.contains {
             ($0.pinnedPageID == page.id || $0.url == page.url) && !$0.isSuspended
         }
-        Button { browser.openPinned(page) } label: {
+        Button {
+            if let tab { browser.selectRepresentedTab(tab) } else { browser.openPinned(page) }
+        } label: {
             Color.clear.frame(height: PinnedPagesGrid.tileHeight)
                 .overlay {
-                    SiteIcon(url: page.url, size: BrowserChrome.pinIconSize)
-                        .opacity(BrowserChrome.tabContentOpacity(active: active, hovered: isHovered, loaded: loaded))
+                    HStack(spacing: 6) {
+                        if let split {
+                            ForEach(split.tabIDs, id: \.self) { id in
+                                SplitSiteIcon(url: browser.tab(withID: id)?.url, size: 16)
+                            }
+                        } else { SiteIcon(url: page.url, size: BrowserChrome.pinIconSize) }
+                    }.opacity(BrowserChrome.tabContentOpacity(active: active, hovered: isHovered, loaded: loaded))
                 }
                 .contentShape(RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous))
         }
@@ -74,17 +98,28 @@ private struct PinnedPageTile: View {
         .glassEffect(active ? .regular.tint(tint.opacity(0.45)).interactive() : .regular.interactive(),
                      in: RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous))
         .help("\(page.title)\n\(page.url.absoluteString)")
-        .accessibilityLabel("Pinned: \(page.title)")
+        .accessibilityLabel("Essential Tab: \(page.title)")
         .accessibilityAddTraits(active ? [.isSelected] : [])
         .onHover { isHovered = $0 }
+        .modifier(TabDragSource(controller: browser.tabDrag, payload: SidebarDragItem.essential(page.id).payload,
+                                began: { browser.chromeHover?.sidebarIsReordering = true }, ended: { target in
+            browser.finishDraggedTab(SidebarDragItem.essential(page.id).payload, over: target)
+            browser.chromeHover?.sidebarIsReordering = false
+        }, crossed: { _, _ in }))
+        .modifier(TabSplitTarget(browser: browser, payload: SidebarDragItem.essential(page.id).payload))
         .contextMenu {
+            if let tab { SplitTabMenu(browser: browser, tab: tab) }
+            if let tab, tab.isAwayFromPinnedPage {
+                Button("Return to Pinned Page", systemImage: "minus") { tab.returnToPinnedPage() }
+            }
             Button("Open in New Tab") { browser.open(page.url, inNewTab: true) }
             Button("Copy Link") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(page.url.absoluteString, forType: .string)
             }
             Divider()
-            Button("Unpin Webpage") { browser.unpin(page) }
+            Button("Pin tab") { browser.finishDraggedTab(SidebarDragItem.essential(page.id).payload, over: SidebarDragItem.pinnedRoot.payload) }
+            Button("Remove from Essential Tabs") { browser.unpin(page) }
         }
         .task(id: page.url) {
             if let brand = WebsiteTint.brand(for: page.url) {
@@ -137,5 +172,24 @@ enum WebsiteTint {
         }
         guard let best = bins.values.max(by: { $0.weight < $1.weight }) else { return nil }
         return Color(red: best.r / best.weight, green: best.g / best.weight, blue: best.b / best.weight)
+    }
+}
+
+/// Normal sidebar pins and Essential grid entries are independent, explicit actions.
+struct TabPinActions: View {
+    let browser: BrowserModel
+    let tab: BrowserTab
+    var body: some View {
+        if let page = browser.folders.item(tab.folderPageID) {
+            Button("Unpin tab") { browser.moveFolderPageToTemporaryTabs(page) }
+        } else {
+            Button("Pin tab") { browser.moveToFolder(tab, parentID: nil) }
+                .disabled(tab.url.map(PinnedPageStore.valid) != true)
+        }
+        if let page = browser.pinnedPages.items.first(where: { $0.id == tab.pinnedPageID }) {
+            Button("Remove from Essential Tabs") { browser.unpin(page) }
+        } else {
+            Button("Add to Essential Tabs") { browser.pin(tab) }.disabled(!browser.canPin(tab))
+        }
     }
 }

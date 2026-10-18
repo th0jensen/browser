@@ -19,25 +19,41 @@ struct SidebarWidthState {
     }
 }
 
-struct SidebarResizeHandle: View {
-    @Binding var width: Double
-    @Binding var isResizing: Bool
-    @State private var initialWidth: Double?
+/// Shared grip and full-size pointer target for sidebar and page dividers.
+struct ChromeResizeHandle: View {
+    let isResizing: Bool
+    var axis: Axis = .horizontal
     @State private var isHovered = false
 
     var body: some View {
         Color.clear
-            .frame(width: 12)
+            .frame(width: axis == .horizontal ? 12 : nil, height: axis == .vertical ? 12 : nil)
             .contentShape(Rectangle())
             .overlay {
-                Capsule().fill(.primary.opacity(isResizing ? 0.8 : (isHovered ? 0.6 : 0.1)))
-                    .frame(width: 1, height: 44)
+                Capsule().fill(.primary.opacity(isResizing ? 0.18 : (isHovered ? 0.32 : 0.24)))
+                    .frame(width: axis == .horizontal ? 2 : 40, height: axis == .horizontal ? 40 : 2)
+                    .allowsHitTesting(false)
             }
             .onHover { hovering in
                 guard isHovered != hovering else { return }
                 isHovered = hovering
-                if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+                if hovering { (axis == .horizontal ? NSCursor.resizeLeftRight : .resizeUpDown).push() } else { NSCursor.pop() }
             }
+            .onDisappear {
+                if isHovered { NSCursor.pop() }
+                isHovered = false
+            }
+    }
+}
+
+struct SidebarResizeHandle: View {
+    @Binding var width: Double
+    @Binding var isResizing: Bool
+    @State private var initialWidth: Double?
+
+    var body: some View {
+        ChromeResizeHandle(isResizing: isResizing)
+            .offset(x: 2)
             .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { value in
                     if initialWidth == nil { initialWidth = width; isResizing = true }
@@ -47,8 +63,6 @@ struct SidebarResizeHandle: View {
                 }
                 .onEnded { _ in initialWidth = nil; isResizing = false })
             .onDisappear {
-                if isHovered { NSCursor.pop() }
-                isHovered = false
                 initialWidth = nil
                 isResizing = false
             }

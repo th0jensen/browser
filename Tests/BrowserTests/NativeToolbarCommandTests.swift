@@ -12,6 +12,10 @@ final class NativeToolbarCommandTests: XCTestCase {
         var actions = 0
         let adapter = NativeToolbarCommandAdapter(item: item, command: .init(identifier: "reload", title: "Reload", symbol: "arrow.clockwise", action: { actions += 1 }))
         XCTAssertTrue(item.view === adapter.button)
+        let buttonWindow = NSWindow(contentRect: .init(x: 0, y: 0, width: 100, height: 100), styleMask: .titled, backing: .buffered, defer: false)
+        buttonWindow.isReleasedWhenClosed = false
+        buttonWindow.contentView = adapter.button
+        defer { buttonWindow.close() }
         XCTAssertEqual(adapter.button.intrinsicContentSize, NSSize(width: 24, height: 24))
         XCTAssertTrue(adapter.button.isBordered)
         XCTAssertEqual(adapter.button.bezelStyle, .accessoryBarAction)
@@ -39,6 +43,17 @@ final class NativeToolbarCommandTests: XCTestCase {
         XCTAssertEqual(actions, 12)
         adapter.restore()
         XCTAssertTrue(item.view === replacementHost)
+    }
+
+    func testSymbolsAreCenteredByTheirAlignmentBounds() throws {
+        for symbol in ["chevron.left", "chevron.right", "arrow.clockwise", "plus", "arrow.down.circle"] {
+            let button = NativeToolbarCommandButton(command: .init(identifier: symbol, title: symbol, symbol: symbol, action: {}))
+            let image = try XCTUnwrap(button.image)
+            let rect = try XCTUnwrap(button.cell).imageRect(forBounds: button.bounds)
+            XCTAssertEqual(rect.minX + image.alignmentRect.midX, button.bounds.midX, accuracy: 0.001, symbol)
+            let centerY = button.isFlipped ? image.size.height - image.alignmentRect.midY : image.alignmentRect.midY
+            XCTAssertEqual(rect.minY + centerY, button.bounds.midY, accuracy: 0.001, symbol)
+        }
     }
 
     func testDisplayModesReserveSpaceForTextAndKeepSymbolsInIconMode() {
@@ -90,7 +105,7 @@ final class NativeToolbarCommandTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
         defaults.set(false, forKey: CompactToolbar.storageKey)
-        let browser = BrowserModel()
+        let browser = BrowserModel(chromePreferences: WindowChromePreferences(defaults: defaults))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
                               styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
@@ -142,7 +157,7 @@ final class NativeToolbarCommandTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
         defaults.set(false, forKey: CompactToolbar.storageKey)
-        let browser = BrowserModel()
+        let browser = BrowserModel(chromePreferences: WindowChromePreferences(defaults: defaults))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
                               styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
@@ -154,7 +169,7 @@ final class NativeToolbarCommandTests: XCTestCase {
         try await waitUntil { window.toolbar?.items.contains { $0.itemIdentifier.rawValue == "newTab" && $0.label == "New Tab" } == true }
         let originalDelegate = window.toolbar?.delegate
         for (identifier, label) in ["layout": "Tab Layout", "back": "Back", "forward": "Forward",
-                                    "reload": "Reload", "newTab": "New Tab", "pins": "Pinned Pages"] {
+                                    "reload": "Reload", "newTab": "New Tab", "pins": "Essential Tabs"] {
             let item = try XCTUnwrap(window.toolbar?.items.first { $0.itemIdentifier.rawValue == identifier })
             XCTAssertEqual(item.label, label, "Toolbar label for \(identifier)")
             XCTAssertEqual(item.paletteLabel, label, "Customization palette label for \(identifier)")
@@ -185,16 +200,22 @@ final class NativeToolbarCommandTests: XCTestCase {
         browser.activeTab?.webView?.loadHTMLString("<title>Toolbar State</title><p>Loaded</p>", baseURL: URL(string: "https://example.invalid"))
         try await waitUntil { reloadButton.isEnabled }
         XCTAssertTrue(reloadItem.view === reloadButton)
-        defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
+        browser.chromePreferences.tabLayout = .vertical
         try await waitUntil { window.toolbarStyle == .unifiedCompact }
-        defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
+        browser.chromePreferences.tabLayout = .horizontal
         try await waitUntil { window.toolbarStyle == .expanded }
-        try await waitUntil { reloadItem.view is NativeToolbarCommandButton }
-        XCTAssertTrue(toolbar.delegate === delegate)
+        try await waitUntil { window.toolbar?.items.first { $0.itemIdentifier.rawValue == "reload" }?.view is NativeToolbarCommandButton }
+        try await waitUntil {
+            window.toolbar?.delegate is ToolbarCustomizationAdapter
+                && window.toolbar?.items.contains { $0.itemIdentifier.rawValue == "layout" } == true
+                && window.toolbar?.items.contains { $0.itemIdentifier.rawValue == "sidebar" } == false
+        }
+        let currentToolbar = try XCTUnwrap(window.toolbar)
+        let currentDelegate = try XCTUnwrap(currentToolbar.delegate)
 
         for (identifier, label) in ["sidebar": "Sidebar", "pinSidebar": "Pin Sidebar"] {
-            XCTAssertFalse(toolbar.items.contains { $0.itemIdentifier.rawValue == identifier })
-            let item = try XCTUnwrap(delegate.toolbar?(toolbar, itemForItemIdentifier: .init(identifier),
+            XCTAssertFalse(currentToolbar.items.contains { $0.itemIdentifier.rawValue == identifier })
+            let item = try XCTUnwrap(currentDelegate.toolbar?(currentToolbar, itemForItemIdentifier: .init(identifier),
                                                       willBeInsertedIntoToolbar: false))
             XCTAssertEqual(item.label, label, "Hidden customization item label for \(identifier)")
             XCTAssertEqual(item.paletteLabel, label, "Hidden customization palette label for \(identifier)")

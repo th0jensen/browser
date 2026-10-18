@@ -38,7 +38,7 @@ final class BrowserPerformanceTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
         defaults.set(false, forKey: SidebarVisibility.autoHideKey)
-        let browser = BrowserModel(sitePermissions: SitePermissions())
+        let browser = BrowserModel(sitePermissions: SitePermissions(), chromePreferences: WindowChromePreferences(defaults: defaults))
         let window = PerformanceWindow(contentRect: NSRect(x: 80, y: 80, width: 1100, height: 760),
                                        styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                                        backing: .buffered, defer: false)
@@ -113,18 +113,18 @@ final class BrowserPerformanceTests: XCTestCase {
             for target in [TabLayout.vertical, .horizontal] {
                 try await sample("layout_to_\(target.rawValue)", definition:
                     "Defaults mutation to requested native tab accessory state and selected native/presentation frames stable (0.25 pt quantization) for three display callbacks. Includes display-frame quantization; does not prove final GPU presentation.") {
-                    defaults.set(target.toggled.rawValue, forKey: TabLayout.storageKey)
+                    browser.chromePreferences.tabLayout = target.toggled
                     try await self.settle(window: window, browser: browser) { Self.layoutInstalled(target.toggled, in: window) }
                     let start = Self.now()
-                    defaults.set(target.rawValue, forKey: TabLayout.storageKey)
+                    browser.chromePreferences.tabLayout = target
                     try await self.settle(window: window, browser: browser) { Self.layoutInstalled(target, in: window) }
                     return Self.now() - start
                 }
             }
-            defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
+            browser.chromePreferences.tabLayout = .vertical
             try await settle(window: window, browser: browser) { Self.layoutInstalled(.vertical, in: window) }
             try await saveScreenshot(webView: XCTUnwrap(first.webView), name: "colorful-vertical-page")
-            defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
+            browser.chromePreferences.tabLayout = .horizontal
             try await settle(window: window, browser: browser) { Self.layoutInstalled(.horizontal, in: window) }
 
             browser.addTab(focusAddress: false)
@@ -323,9 +323,9 @@ final class BrowserPerformanceTests: XCTestCase {
     private func benchmarkChromeReveal(window: NSWindow, browser: BrowserModel, defaults: UserDefaults) async throws {
         print("BENCHMARK_PHASE=chrome_reveal")
         window.makeFirstResponder(nil)
-        defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
-        defaults.set(true, forKey: SidebarVisibility.autoHideKey)
-        defaults.set(true, forKey: CompactToolbar.storageKey)
+        browser.chromePreferences.tabLayout = .vertical
+        browser.chromePreferences.autoHideSidebar = true
+        browser.chromePreferences.autoHideToolbar = true
         window.setContentSize(NSSize(width: 1100, height: 760))
         try await settle(window: window, browser: browser) { Self.layoutInstalled(.vertical, in: window) }
         let root = try XCTUnwrap(window.contentView)

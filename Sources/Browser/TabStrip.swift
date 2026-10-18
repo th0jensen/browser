@@ -35,7 +35,7 @@ struct TabStrip: View {
 
     @State private var hoveredTabID: UUID?
     @State private var suppressedHoverCardTabID: UUID?
-    @State private var draggedTabID: UUID?
+    @State private var sidebarViewport: CGRect?
 
     private let spacing: CGFloat = 4
     private let maxTabWidth: CGFloat = 220
@@ -50,45 +50,68 @@ struct TabStrip: View {
             case .vertical: sidebar
             }
         }
+        .modifier(SplitDropBadge(controller: browser.tabDrag))
         .task(id: hoveredTabID) { await updateHoverCard() }
+        .onChange(of: browser.tabDrag.payload) { _, value in if value != nil { hoverCardTabID = nil } }
+        .alert("On-device Intelligence", isPresented: Binding(get: { browser.intelligenceError != nil }, set: { if !$0 { browser.intelligenceError = nil } })) {
+            Button("OK") { browser.intelligenceError = nil }
+        } message: { Text(browser.intelligenceError ?? "") }
     }
 
     private var horizontalStrip: some View {
         GeometryReader { geometry in
-            let regularTabs = browser.unpinnedTabs
-            let count = CGFloat(max(1, regularTabs.count))
+            let regularTabs = browser.unpinnedTabs.filter { !browser.isSplitCompanion($0) }
+            let visibleCount = regularTabs.filter { browser.sectionIsExpanded($0.temporarySection) }.count
+            let count = CGFloat(max(1, visibleCount))
             let availableWidth = max(minTabWidth, geometry.size.width - BrowserChrome.edgeInset
                                      - minDragAreaWidth)
+            let sectionCount = regularTabs.enumerated().filter { index, tab in
+                tab.temporarySection != nil && (index == 0 || regularTabs[index - 1].temporarySection?.id != tab.temporarySection?.id)
+            }.count
+            let headerSpace = CGFloat(sectionCount) * (100 + spacing)
             let tabWidth = min(maxTabWidth,
-                               max(minTabWidth, ((availableWidth - spacing * (count - 1)) / count).rounded(.down)))
-            let tabsWidth = tabWidth * count + spacing * (count - 1)
+                               max(minTabWidth, ((availableWidth - headerSpace - spacing * (count - 1)) / count).rounded(.down)))
+            let isEditing = regularTabs.contains { $0.folderPageID != nil && $0.folderPageID == browser.renamingSavedPageID }
+            let editingExtra = isEditing ? max(0, 160 - tabWidth) : 0
+            let tabsWidth = tabWidth * CGFloat(visibleCount) + spacing * CGFloat(max(0, visibleCount - 1)) + headerSpace + editingExtra
 
             HStack(spacing: spacing) {
                 ScrollViewReader { scrollProxy in
                     ScrollView(.horizontal) {
                         HStack(spacing: spacing) {
                             ForEach(Array(regularTabs.enumerated()), id: \.element.id) { index, tab in
-                                tabItem(for: tab, at: index,
-                                        nextTab: regularTabs.indices.contains(index + 1) ? regularTabs[index + 1] : nil,
-                                        width: tabWidth)
-                                    .id(tab.id)
+                                if let section = tab.temporarySection,
+                                   index == 0 || regularTabs[index - 1].temporarySection?.id != section.id {
+                                    TemporarySectionRow(browser: browser, section: section, height: BrowserChrome.tabHeight,
+                                                        horizontal: true)
+                                        .frame(width: 100).id(section.id)
+                                }
+                                if browser.sectionIsExpanded(tab.temporarySection) {
+                                    tabItem(for: tab, at: index,
+                                            nextTab: regularTabs.indices.contains(index + 1) ? regularTabs[index + 1] : nil,
+                                            width: tab.folderPageID != nil && tab.folderPageID == browser.renamingSavedPageID ? max(160, tabWidth) : tabWidth)
+                                        .id(tab.id)
+                                }
                             }
                         }
                         .frame(height: BrowserChrome.tabRowHeight)
                     }
-                    .scrollIndicators(.never)
+                    .modifier(ScrollbarVisibility())
                     .scrollDisabled(tabsWidth <= availableWidth)
                     .onAppear {
-                        if tabsWidth > availableWidth, let id = browser.activeTabID { scrollProxy.scrollTo(id) }
+                        if tabsWidth > availableWidth, let id = browser.activeSplit?.anchorID ?? browser.activeTabID { scrollProxy.scrollTo(id) }
                     }
                     .onChange(of: geometry.size.width) { _, _ in
                         // Fitting tabs are already visible. Scrolling them on every window-size update
                         // adds a second scroll/layout transaction to the native resize path.
-                        if tabsWidth > availableWidth, let id = browser.activeTabID { scrollProxy.scrollTo(id) }
+                        if tabsWidth > availableWidth, let id = browser.activeSplit?.anchorID ?? browser.activeTabID { scrollProxy.scrollTo(id) }
+                    }
+                    .onChange(of: browser.renamingSavedPageID) { _, pageID in
+                        if let pageID, let tab = regularTabs.first(where: { $0.folderPageID == pageID }) { scrollProxy.scrollTo(tab.id) }
                     }
                     .onChange(of: browser.activeTabID) { _, activeTabID in
                         guard tabsWidth > availableWidth, let activeTabID else { return }
-                        scrollProxy.scrollTo(activeTabID)
+                        scrollProxy.scrollTo(browser.activeSplit?.anchorID ?? activeTabID)
                     }
                 }
                 .frame(width: min(tabsWidth, availableWidth))
@@ -110,38 +133,57 @@ struct TabStrip: View {
         GeometryReader { geometry in
             let rowHeight = compactTabs ? BrowserChrome.sidebarTabHeight : 42
             let regularTabs = browser.regularTabs
-            let count = regularTabs.count + browser.folders.visibleRows.count
+            let groups = browser.temporaryTabGroups
+            let count = browser.sidebarFolderRows.count + groups.reduce(0) { count, group in
+                count + (group.section == nil ? 0 : 1) + (browser.sectionIsExpanded(group.section) ? group.tabs.count : 0)
+            }
             let tabsHeight = CGFloat(count) * rowHeight + CGFloat(max(0, count - 1)) * BrowserChrome.smallGap
-            let folderSpacing = browser.folders.items.isEmpty ? 0 : BrowserChrome.edgeInset + BrowserChrome.smallGap
-            let pinRows = CGFloat((browser.pinnedPages.items.count + 2) / 3)
-            let pinHeight = pinRows == 0 ? 0 : pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset
-            let newTabFits = tabsHeight + folderSpacing + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
+            let pinRows = CGFloat(max(1, (browser.pinnedPages.items.count + 2) / 3))
+            let pinHeight = pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset
+            let dropGapHeight = sidebarDividerHeight + BrowserChrome.smallGap * 3
+            let newTabFits = dropGapHeight + tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
 
             VStack(spacing: BrowserChrome.edgeInset) {
-                if !browser.pinnedPages.items.isEmpty {
-                    PinnedPagesGrid(browser: browser)
-                        .padding(.horizontal, BrowserChrome.edgeInset)
-                }
+                PinnedPagesGrid(browser: browser)
+                    .padding(.horizontal, BrowserChrome.edgeInset)
+                    .zIndex(browser.tabDrag.payload?.hasPrefix("browser-essential:") == true ? 200 : 0)
                 ScrollViewReader { scrollProxy in
                     ScrollView(.vertical) {
                         VStack(spacing: BrowserChrome.smallGap) {
+                            sidebarDropGap(.pinnedRoot)
                             if !browser.folders.items.isEmpty {
-                                FolderSidebar(browser: browser, rowHeight: rowHeight, onDropAccepted: { draggedTabID = nil })
+                                FolderSidebar(browser: browser, rowHeight: rowHeight, onDropAccepted: { hoverCardTabID = nil },
+                                              rootDropTargetInSpacing: true)
+                                    .zIndex(browser.tabDrag.payload?.hasPrefix("browser-folder:") == true ? 100 : 0)
                             }
-                            ForEach(Array(regularTabs.enumerated()), id: \.element.id) { index, tab in
-                                tabItem(for: tab, at: index, width: nil).id(tab.id)
+                            sidebarDivider
+                            ForEach(groups) { group in
+                                if let section = group.section {
+                                    TemporarySectionRow(browser: browser, section: section, height: rowHeight,
+                                                        horizontal: false).id(section.id)
+                                }
+                                if browser.sectionIsExpanded(group.section) {
+                                    ForEach(group.tabs) { tab in
+                                        tabItem(for: tab, at: regularTabs.firstIndex { $0.id == tab.id } ?? 0, width: nil)
+                                            .padding(.leading, group.section == nil ? 0 : 14).id(tab.id)
+                                    }
+                                }
                             }
                             if newTabFits { newTabRow(height: rowHeight) }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .environment(\.tabReorderViewport, sidebarViewport)
                         .padding(.horizontal, BrowserChrome.edgeInset)
 
                         .padding(.bottom, newTabFits ? BrowserChrome.edgeInset : 0)
                     }
-                    .scrollIndicators(.never)
+                    .modifier(ScrollbarVisibility())
+                    .scrollClipDisabled(browser.tabDrag.payload != nil)
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { sidebarViewport = $0 }
                     .onChange(of: browser.activeTabID) { _, activeTabID in
                         guard let activeTabID else { return }
-                        withAnimation(.easeOut(duration: 0.2)) { scrollProxy.scrollTo(browser.activeTab?.folderPageID ?? activeTabID) }
+                        let representedTab = browser.tab(withID: browser.activeSplit?.anchorID ?? activeTabID)
+                        withAnimation(.easeOut(duration: 0.2)) { scrollProxy.scrollTo(representedTab?.folderPageID ?? representedTab?.id ?? activeTabID) }
                     }
                 }
                 if !newTabFits {
@@ -153,6 +195,59 @@ struct TabStrip: View {
             .contextMenu { stripMenu }
         }
         .padding(.top, BrowserChrome.edgeInset)
+    }
+
+    private func sidebarDropGap(_ item: SidebarDragItem) -> some View {
+        RoundedRectangle(cornerRadius: BrowserChrome.smallGap / 2)
+            .fill(browser.tabDrag.isOver(item.payload) ? Color.accentColor.opacity(0.5) : .clear)
+            .frame(height: BrowserChrome.smallGap)
+            .modifier(TabReorderTarget(controller: browser.tabDrag, payload: item.payload, priority: 2))
+    }
+
+    private var showsTidyDivider: Bool {
+        browser.regularTabs.count > 6 || browser.isTidyingTabs
+            || browser.regularTabs.contains { $0.temporarySection != nil }
+    }
+
+    private var sidebarDividerHeight: CGFloat {
+        showsTidyDivider ? 32 : BrowserChrome.smallGap + BrowserChrome.edgeInset * 2
+    }
+
+    private var sidebarDivider: some View {
+        Group {
+            if showsTidyDivider {
+                tidyButton
+            } else {
+                Rectangle().fill(Color.primary.opacity(0.16)).frame(height: 1)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: sidebarDividerHeight)
+        .background(browser.tabDrag.isOver(SidebarDragItem.temporaryRoot.payload)
+                    ? Color.accentColor.opacity(0.5) : .clear,
+                    in: RoundedRectangle(cornerRadius: BrowserChrome.smallGap / 2))
+        .modifier(TabReorderTarget(controller: browser.tabDrag, payload: SidebarDragItem.temporaryRoot.payload, priority: 2))
+    }
+
+    private var tidyButton: some View {
+        HStack {
+            Button {
+                if browser.isTidyingTabs { browser.cancelTidyingTabs() } else { browser.tidyTemporaryTabs() }
+            } label: {
+                Label("Tidy Tabs", systemImage: "sparkles")
+            }
+            .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            .disabled(!browser.isTidyingTabs && (!browser.canTidyTabs || BrowserIntelligence.unavailableReason != nil))
+            .help(BrowserIntelligence.unavailableReason ?? "Group temporary tabs by topic on this Mac")
+            .accessibilityLabel(browser.isTidyingTabs ? "Cancel Tidying Tabs" : "Tidy Tabs")
+            .onHover { value in if value { Task { await LocalIntelligence.shared.prepare(.tidy) } } }
+            TidyActivityDivider(isLoading: browser.isTidyingTabs)
+        }.frame(maxWidth: .infinity).padding(.leading, BrowserChrome.edgeInset)
+            .contentShape(Rectangle())
+            .contextMenu {
+                Button("Remove All Temporary Groups") { browser.removeTemporarySections() }
+                    .disabled(!browser.regularTabs.contains { $0.temporarySection != nil })
+            }
     }
 
     private func newTabRow(height: CGFloat) -> some View {
@@ -169,16 +264,17 @@ struct TabStrip: View {
         .buttonStyle(NewTabRowButtonStyle())
         .help("New Tab (⌘T)")
         .accessibilityLabel("New Tab")
+        .modifier(TabReorderTarget(controller: browser.tabDrag, payload: "browser-temporary-end"))
     }
 
     private func tabItem(for tab: BrowserTab, at index: Int, nextTab: BrowserTab? = nil, width: CGFloat?) -> some View {
-        let isActive = browser.activeTabID == tab.id
+        let isActive = browser.splitIsActive(tab)
         let isHovered = hoveredTabID == tab.id
         let showsSeparator = layout == .horizontal && nextTab.map { next in
             !isActive && !isHovered && browser.activeTabID != next.id && hoveredTabID != next.id
         } ?? false
 
-        return TabItem(tab: tab,
+        return TabItem(browser: browser, tab: tab,
                        isActive: isActive,
                        isHovered: isHovered,
                        floating: floating,
@@ -187,11 +283,11 @@ struct TabStrip: View {
                        select: {
                            suppressedHoverCardTabID = tab.id
                            hoverCardTabID = nil
-                           browser.activeTabID = tab.id
+                           browser.selectRepresentedTab(tab)
                        },
                        close: {
                            hoverCardTabID = nil
-                           browser.closeTab(tab.id)
+                           browser.closeRepresentedTab(tab)
                        })
             .overlay(alignment: .trailing) {
                 Rectangle()
@@ -208,16 +304,22 @@ struct TabStrip: View {
                     hoveredTabID = nil
                 }
             }
-            .onDrag {
-                draggedTabID = tab.id
+            .modifier(TabDragSource(controller: browser.tabDrag, payload: tab.id.uuidString,
+                                    axis: layout == .vertical ? .vertical : .horizontal,
+                                    enabled: browser.renamingSavedPageID == nil, began: {
                 hoverCardTabID = nil
                 suppressedHoverCardTabID = tab.id
-                return NSItemProvider(object: tab.id.uuidString as NSString)
-            }
-            .onDrop(of: [.text], delegate: TabDropDelegate(targetTabID: tab.id,
-                                                           browser: browser,
-                                                           draggedTabID: $draggedTabID))
+                if layout == .vertical { browser.chromeHover?.sidebarIsReordering = true }
+            }, ended: { target in
+                browser.finishDraggedTab(tab.id.uuidString, over: target)
+                browser.chromeHover?.sidebarIsReordering = false
+            }, crossed: { target, direction in
+                browser.crossDraggedTab(tab.id.uuidString, past: target, direction: direction)
+            }))
+            .modifier(TabSplitTarget(browser: browser, payload: tab.id.uuidString,
+                                     axis: layout == .vertical ? .vertical : .horizontal))
             .contextMenu { tabMenu(for: tab, at: index) }
+            .modifier(TabSavedRename(browser: browser, tab: tab))
             .folderEditorAnchor(.tab(tab.id))
             .popover(isPresented: Binding(get: { usesNativeHoverPopover && hoverCardTabID == tab.id },
                                            set: { if !$0 { hoverCardTabID = nil } }), arrowEdge: .top) {
@@ -227,6 +329,7 @@ struct TabStrip: View {
 
     /// Shows the card after a short delay, then follows the pointer between tabs without waiting again.
     private func updateHoverCard() async {
+        guard browser.tabDrag.payload == nil else { hoverCardTabID = nil; return }
         guard let hoveredTabID else {
             try? await Task.sleep(for: .milliseconds(120))
             guard !Task.isCancelled else { return }
@@ -240,12 +343,13 @@ struct TabStrip: View {
             return
         }
         try? await Task.sleep(for: .milliseconds(550))
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, browser.tabDrag.payload == nil else { return }
         hoverCardTabID = hoveredTabID
     }
 
     @ViewBuilder
     private func tabMenu(for tab: BrowserTab, at index: Int) -> some View {
+        SplitTabMenu(browser: browser, tab: tab)
         Button("Reload") { browser.reloadTab(tab.id) }
             .disabled(tab.isNewTab)
         Button("Duplicate") { browser.duplicateTab(tab.id) }
@@ -256,11 +360,17 @@ struct TabStrip: View {
         }
         .disabled(tab.url == nil)
         Divider()
+        if let page = browser.folders.item(tab.folderPageID) {
+            Button("Rename…") { browser.renamingSavedPageID = page.id }
+            if page.nameSource == .manual || page.nameSource == .automatic {
+                Button("Use Original Title") { browser.changeFolders { try browser.folders.resetPageName(page.id) } }
+            }
+            Divider()
+        }
         FolderMoveMenu(browser: browser, tab: tab)
-        Button("Pin Page") { browser.pin(tab) }
-            .disabled(!browser.canPin(tab))
+        TabPinActions(browser: browser, tab: tab)
         Divider()
-        Button("Close Tab") { browser.closeTab(tab.id) }
+        Button("Close Tab") { browser.closeRepresentedTab(tab) }
         Button("Close Other Tabs") { browser.closeOtherTabs(than: tab.id) }
             .disabled(browser.tabs.count < 2)
         Button(layout == .vertical ? "Close Tabs Below" : "Close Tabs to the Right") { browser.closeTabs(after: tab.id) }
@@ -277,7 +387,14 @@ struct TabStrip: View {
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }
             .disabled(!browser.canReopenClosedTab)
         Divider()
-        TabLayoutMenu()
+        Button(browser.isTidyingTabs ? "Cancel Tidying" : "Tidy Tabs") {
+            if browser.isTidyingTabs { browser.cancelTidyingTabs() } else { browser.tidyTemporaryTabs() }
+        }.disabled(!browser.isTidyingTabs && (!browser.canTidyTabs || BrowserIntelligence.unavailableReason != nil))
+        if browser.regularTabs.contains(where: { $0.temporarySection != nil }) {
+            Button("Remove All Temporary Groups") { browser.removeTemporarySections() }
+        }
+        Divider()
+        TabLayoutMenu(preferences: browser.chromePreferences)
         if layout == .vertical { SidebarBehaviorMenu() }
     }
 }
@@ -295,6 +412,7 @@ private struct NewTabRowButtonStyle: ButtonStyle {
 }
 
 private struct TabItem: View {
+    let browser: BrowserModel
     let tab: BrowserTab
     let isActive: Bool
     let isHovered: Bool
@@ -310,16 +428,17 @@ private struct TabItem: View {
     private var showsCloseButton: Bool { isHovered || (isActive && !isCompact) }
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous)
+        let dragging = browser.tabDrag.payload == tab.id.uuidString
+        let shape = RoundedRectangle(cornerRadius: dragging ? height / 2 : BrowserChrome.contentCornerRadius, style: .continuous)
 
         HStack(spacing: 7) {
-            if !(isCompact && showsCloseButton) {
+            if browser.split(containing: tab.id) == nil && !(isCompact && showsCloseButton) {
                 TabIcon(tab: tab)
             }
             if !isCompact {
                 title
             }
-            if showsCloseButton || (width != nil && !isCompact) {
+            if browser.split(containing: tab.id) == nil && (showsCloseButton || (width != nil && !isCompact)) {
                 closeButton
                     .opacity(showsCloseButton ? 1 : 0)
                     .allowsHitTesting(showsCloseButton)
@@ -327,11 +446,11 @@ private struct TabItem: View {
         }
         .padding(.leading, isCompact ? 0 : BrowserChrome.edgeInset)
         .padding(.trailing, isCompact ? 0 : (width == nil ? BrowserChrome.edgeInset : 4))
-        .opacity(BrowserChrome.tabContentOpacity(active: isActive, hovered: isHovered, loaded: !tab.isSuspended))
+        .opacity(dragging || (tab.folderPageID != nil && browser.renamingSavedPageID == tab.folderPageID) ? 1 : BrowserChrome.tabContentOpacity(active: isActive, hovered: isHovered, loaded: !tab.isSuspended))
         .frame(width: width, height: height)
         .frame(maxWidth: width == nil ? .infinity : nil)
-        .background(shape.fill(isHovered && !isActive ? Color.primary.opacity(0.055) : Color.clear))
-        .modifier(ActiveTabGlass(isActive: isActive, shape: shape))
+        .background(shape.fill(isHovered && !isActive && !dragging ? Color.primary.opacity(0.055) : Color.clear))
+        .modifier(ActiveTabGlass(isActive: isActive || dragging, shape: shape))
         .overlay {
             shape.strokeBorder(Color.primary.opacity(isActive ? 0.07 : 0), lineWidth: 1)
         }
@@ -341,7 +460,15 @@ private struct TabItem: View {
         .accessibilityElement(children: .contain)
     }
 
-    private var title: some View {
+    @ViewBuilder private var title: some View {
+        if let split = browser.split(containing: tab.id) {
+            SplitTabLabel(browser: browser, split: split, showsCloseButtons: isHovered || isActive)
+        } else if let page = browser.folders.item(tab.folderPageID) {
+            SavedTabTitle(browser: browser, page: page, isActive: isActive, fades: true)
+        } else { ordinaryTitle }
+    }
+
+    private var ordinaryTitle: some View {
         // The title lives in an overlay so its natural width never widens the tab.
         Color.clear
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -369,15 +496,7 @@ private struct TabItem: View {
     }
 
     private var closeButton: some View {
-        Button(action: close) {
-            Image(systemName: "xmark")
-                .font(.system(size: 9, weight: .bold))
-                .frame(width: 20, height: 20)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(ChromeCloseButtonStyle())
-        .help("Close Tab (⌘W)")
-        .accessibilityLabel("Close \(tab.title)")
+        TabDismissButton(tab: tab, close: close)
     }
 }
 
@@ -475,33 +594,6 @@ struct ActiveTabGlass: ViewModifier {
     }
 }
 
-private struct TabDropDelegate: DropDelegate {
-    let targetTabID: UUID
-    let browser: BrowserModel
-    @Binding var draggedTabID: UUID?
-
-    func dropEntered(info: DropInfo) {
-        guard let draggedTabID, draggedTabID != targetTabID,
-              let destinationIndex = browser.tabs.firstIndex(where: { $0.id == targetTabID }) else { return }
-        withAnimation(.snappy(duration: 0.2)) {
-            browser.moveTab(draggedTabID, to: destinationIndex)
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        draggedTabID = nil
-        return true
-    }
-
-    func validateDrop(info: DropInfo) -> Bool {
-        draggedTabID != nil
-    }
-}
-
 struct ChromeIconButtonStyle: ButtonStyle {
     var size: CGFloat = 32
     @Environment(\.isEnabled) private var isEnabled
@@ -531,5 +623,14 @@ struct ChromeCloseButtonStyle: ButtonStyle {
                         isHovered ? Color.primary.opacity(0.09) : Color.clear,
                         in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             .onHover { isHovered = $0 }
+    }
+}
+
+private struct TabSavedRename: ViewModifier {
+    let browser: BrowserModel
+    let tab: BrowserTab
+    @ViewBuilder func body(content: Content) -> some View {
+        if let page = browser.folders.item(tab.folderPageID) { content.modifier(SavedTabRename(browser: browser, page: page)) }
+        else { content }
     }
 }

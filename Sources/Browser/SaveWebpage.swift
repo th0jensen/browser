@@ -4,7 +4,7 @@ import WebKit
 
 extension BrowserModel {
     func saveWebpage() {
-        guard let tab = activeTab, !tab.isNewTab, let webView = tab.webView,
+        guard let tab = peek?.tab ?? activeTab, !tab.isNewTab, let webView = tab.webView,
               let window = webView.window else { return }
         let panel = NSSavePanel()
         panel.title = "Save Webpage"

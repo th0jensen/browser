@@ -20,7 +20,7 @@ struct FullscreenToolbarPart: Equatable, Identifiable {
         case .controls(let identifiers): CGFloat(identifiers.count) * 28 + 8
         case .address: 160
         case .space, .flexibleSpace: 20
-        case .divider: 12
+        case .divider: 1
         }
     }
 
@@ -72,13 +72,11 @@ struct FullscreenToolbarRow<Control: View, Address: View>: View {
 
     var body: some View {
         let parts = FullscreenToolbarPart.parts(for: identifiers)
-        let minimumWidth = parts.reduce(0) { $0 + $1.minimumWidth }
-            + CGFloat(max(0, parts.count - 1)) * BrowserChrome.edgeInset
         GeometryReader { geometry in
             ScrollViewReader { proxy in
                 ScrollView(.horizontal) {
                     GlassEffectContainer(spacing: BrowserChrome.edgeInset) {
-                        HStack(spacing: BrowserChrome.edgeInset) {
+                        ToolbarRowLayout(availableWidth: geometry.size.width) {
                             ForEach(parts) { part in
                                 switch part.content {
                                 case .controls(let identifiers):
@@ -95,25 +93,27 @@ struct FullscreenToolbarRow<Control: View, Address: View>: View {
                                     address()
                                         .frame(minWidth: 160, maxWidth: .infinity)
                                         .id("address")
+                                        .layoutValue(key: ToolbarRowRoleKey.self, value: .address)
                                 case .space:
                                     Color.clear.frame(width: 20, height: 1)
+                                        .layoutValue(key: ToolbarRowRoleKey.self, value: .space)
                                         .allowsHitTesting(false)
                                 case .flexibleSpace:
-                                    Spacer(minLength: 20)
+                                    Color.clear.frame(minWidth: 20, minHeight: 1)
+                                        .layoutValue(key: ToolbarRowRoleKey.self, value: .flexibleSpace)
                                 case .divider:
                                     Rectangle().fill(.separator)
                                         .frame(width: 1, height: 20)
-                                        .frame(width: 12)
+                                        .layoutValue(key: ToolbarRowRoleKey.self, value: .divider)
                                         .allowsHitTesting(false)
                                 }
                             }
                         }
-                        .frame(width: labelStyle == .iconOnly ? max(geometry.size.width, minimumWidth) : nil)
-                        .frame(minWidth: max(geometry.size.width, minimumWidth))
+                        .frame(minWidth: geometry.size.width)
                     }
                 }
                 .scrollBounceBehavior(.basedOnSize)
-                .scrollIndicators(.hidden)
+                .modifier(ScrollbarVisibility())
                 .scrollClipDisabled()
                 .onChange(of: focusRequest) { _, request in
                     if request > 0 { proxy.scrollTo("address", anchor: .center) }
@@ -292,6 +292,51 @@ final class FullscreenWindowControlsView: NSView {
             frame.origin = NSPoint(x: leadingInset + (buttonOffsets[type] ?? 0),
                                    y: (bounds.height - frame.height) / 2)
             if button.frame != frame { button.frame = frame }
+        }
+    }
+}
+
+private enum ToolbarRowRole { case control, address, space, flexibleSpace, divider }
+private struct ToolbarRowRoleKey: LayoutValueKey { static let defaultValue = ToolbarRowRole.control }
+
+/// Explicit allocation prevents an expanding address view swallowing flexible
+/// spacing. Dividers have no extra padding; fixed spaces keep their exact width.
+private struct ToolbarRowLayout: Layout {
+    var availableWidth: CGFloat
+    private func gap(before index: Int, subviews: Subviews) -> CGFloat {
+        guard index > 0 else { return 0 }
+        let current = subviews[index][ToolbarRowRoleKey.self]
+        let previous = subviews[index - 1][ToolbarRowRoleKey.self]
+        return (current == .control || current == .address) && (previous == .control || previous == .address) ? BrowserChrome.edgeInset : 0
+    }
+    private func widths(_ proposal: ProposedViewSize, subviews: Subviews) -> [CGFloat] {
+        var widths = subviews.map { subview in
+            switch subview[ToolbarRowRoleKey.self] {
+            case .address: CGFloat(160)
+            case .flexibleSpace, .space: CGFloat(20)
+            case .divider: CGFloat(1)
+            case .control: subview.sizeThatFits(.unspecified).width
+            }
+        }
+        let minimum = widths.reduce(0, +) + subviews.indices.reduce(0) { $0 + gap(before: $1, subviews: subviews) }
+        let expanding = subviews.indices.filter { [.address, .flexibleSpace].contains(subviews[$0][ToolbarRowRoleKey.self]) }
+        let extra = max(0, (proposal.width ?? availableWidth) - minimum) / CGFloat(max(1, expanding.count))
+        for index in expanding { widths[index] += extra }
+        return widths
+    }
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let widths = widths(proposal, subviews: subviews)
+        return CGSize(width: widths.reduce(0, +) + subviews.indices.reduce(0) { $0 + gap(before: $1, subviews: subviews) },
+                      height: subviews.indices.map { subviews[$0].sizeThatFits(.init(width: widths[$0], height: proposal.height)).height }.max() ?? 24)
+    }
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let widths = widths(.init(width: bounds.width, height: bounds.height), subviews: subviews)
+        var x = bounds.minX
+        for index in subviews.indices {
+            x += gap(before: index, subviews: subviews)
+            subviews[index].place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading,
+                                  proposal: .init(width: widths[index], height: bounds.height))
+            x += widths[index]
         }
     }
 }

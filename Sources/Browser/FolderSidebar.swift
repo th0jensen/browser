@@ -8,7 +8,7 @@ struct FolderMoveMenu: View {
 
     var body: some View {
         Menu("Move to Folder") {
-            Button(item == nil ? "Save to Sidebar" : "Sidebar") { move(to: nil) }
+            Button(item == nil ? "Pin tab" : "Pinned Tabs") { move(to: nil) }
                 .disabled(item.map { $0.parentID == nil } ?? false)
             ForEach(browser.folders.folders.filter { row in item.map { browser.folders.canMove($0.id, to: row.id) } ?? true }) { row in
                 Button(browser.folders.path(for: row.item)) { move(to: row.id) }
@@ -37,26 +37,39 @@ struct FolderSidebar: View {
     let browser: BrowserModel
     let rowHeight: CGFloat
     var onDropAccepted: @MainActor @Sendable () -> Void = {}
+    var rootDropTargetInSpacing = false
     @State private var rootIsTargeted = false
 
     var body: some View {
         VStack(spacing: BrowserChrome.smallGap) {
-            ForEach(browser.folders.visibleRows) { row in
+            ForEach(browser.sidebarFolderRows) { row in
                 FolderSidebarRow(browser: browser, row: row, rowHeight: rowHeight, onDropAccepted: onDropAccepted)
                     .padding(.leading, CGFloat(min(row.depth, 8)) * 14)
                     .id(row.id)
             }
-            if !browser.folders.items.isEmpty {
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(rootIsTargeted ? Color.accentColor.opacity(0.5) : .clear)
-                    .frame(height: BrowserChrome.edgeInset)
-                    .contentShape(Rectangle())
-                    .onDrop(of: [.text], delegate: FolderDropDelegate(browser: browser, target: nil,
-                                                                      isTargeted: $rootIsTargeted, didAccept: onDropAccepted))
-                    .help("Drop here to move to the sidebar")
+            if !browser.folders.items.isEmpty && !rootDropTargetInSpacing {
+                rootDropTarget
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(SplitDropBadge(controller: browser.tabDrag, enabled: !rootDropTargetInSpacing))
+        .overlay(alignment: .bottom) {
+            if !browser.folders.items.isEmpty && rootDropTargetInSpacing {
+                // Reuse the gap before the divider without adding uneven space above it.
+                rootDropTarget.offset(y: BrowserChrome.smallGap)
+            }
+        }
+    }
+
+    private var rootDropTarget: some View {
+        RoundedRectangle(cornerRadius: 3)
+            .fill((rootIsTargeted || browser.tabDrag.isOver("browser-pinned-end")) ? Color.accentColor.opacity(0.5) : .clear)
+            .frame(height: BrowserChrome.smallGap)
+            .contentShape(Rectangle())
+            .onDrop(of: [.text], delegate: FolderDropDelegate(browser: browser, target: nil,
+                                                              isTargeted: $rootIsTargeted, didAccept: onDropAccepted))
+            .modifier(TabReorderTarget(controller: browser.tabDrag, payload: "browser-pinned-end"))
+            .help("Drop here to move to the sidebar")
     }
 }
 
@@ -70,8 +83,11 @@ private struct FolderSidebarRow: View {
 
     private var item: TabFolderItem { row.item }
     private var tab: BrowserTab? { browser.tabs.first { $0.folderPageID == item.id } }
-    private var active: Bool { tab.map { browser.activeTabID == $0.id } ?? false }
-    private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius) }
+    private var active: Bool { tab.map { browser.splitIsActive($0) } ?? false }
+    private var expanded: Bool { item.isExpanded && browser.tabDrag.payload != SidebarDragItem.pinned(item.id).payload }
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: browser.tabDrag.payload == "browser-folder:\(item.id.uuidString)" ? rowHeight / 2 : BrowserChrome.contentCornerRadius)
+    }
 
     var body: some View {
         HStack(spacing: 7) {
@@ -80,41 +96,51 @@ private struct FolderSidebarRow: View {
                 Text(item.title).font(.system(size: 12.5, weight: .medium))
                     .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold))
-                    .rotationEffect(.degrees(item.isExpanded ? 90 : 0))
-                    .foregroundStyle(.secondary).opacity(isHovered || !item.isExpanded ? 1 : 0.4)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .foregroundStyle(.secondary).opacity(isHovered || !expanded ? 1 : 0.4)
                     .frame(width: 12)
             } else {
-                if let url = item.url { SiteIcon(url: url, size: 14) }
-                Text(tab?.title ?? item.title).font(.system(size: 12.5, weight: active ? .medium : .regular))
-                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                if isHovered, let tab {
-                    Button { browser.closeTab(tab.id) } label: {
-                        Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).frame(width: 20, height: 20)
-                    }
-                    .buttonStyle(ChromeCloseButtonStyle()).help("Close page; keep it saved in the folder")
-                    .accessibilityLabel("Close \(tab.title)")
+                if let tab, let split = browser.split(containing: tab.id) {
+                    SplitTabLabel(browser: browser, split: split, showsCloseButtons: isHovered || active)
+                } else {
+                    if let url = item.url { SiteIcon(url: url, size: 14) }
+                    SavedTabTitle(browser: browser, page: item, isActive: active)
+                }
+                if isHovered || active, let tab, browser.split(containing: tab.id) == nil {
+                    TabDismissButton(tab: tab) { browser.closeTab(tab.id) }
                 }
             }
         }
         .padding(.horizontal, BrowserChrome.edgeInset)
-        .opacity(item.kind == .folder ? 1 : BrowserChrome.tabContentOpacity(active: active, hovered: isHovered,
+        .opacity(browser.tabDrag.payload == "browser-folder:\(item.id.uuidString)" || item.kind == .folder || browser.renamingSavedPageID == item.id ? 1 : BrowserChrome.tabContentOpacity(active: active, hovered: isHovered,
                                                                           loaded: tab.map { !$0.isSuspended } ?? false))
         .frame(height: rowHeight).frame(maxWidth: .infinity)
-        .background(shape.fill(isTargeted ? Color.accentColor.opacity(0.18) : isHovered ? Color.primary.opacity(0.055) : .clear))
-        .modifier(ActiveTabGlass(isActive: active, shape: shape))
+        .background(shape.fill((isTargeted || browser.tabDrag.isOver("browser-folder:\(item.id.uuidString)")) ? Color.accentColor.opacity(0.18) : isHovered ? Color.primary.opacity(0.055) : .clear))
+        .modifier(ActiveTabGlass(isActive: active || browser.tabDrag.payload == "browser-folder:\(item.id.uuidString)", shape: shape))
         .contentShape(shape)
         .onTapGesture {
             if item.kind == .folder { browser.changeFolders { try browser.folders.toggleExpanded(item.id) } }
+            else if let tab { browser.selectRepresentedTab(tab) }
             else { browser.openFolderPage(item) }
         }
         .onHover { isHovered = $0 }
-        .onDrag { NSItemProvider(object: "browser-folder:\(item.id.uuidString)" as NSString) }
+        .modifier(TabDragSource(controller: browser.tabDrag, payload: "browser-folder:\(item.id.uuidString)",
+                                enabled: browser.renamingSavedPageID == nil, began: {
+            browser.chromeHover?.sidebarIsReordering = true
+        }, ended: { target in
+            browser.finishDraggedTab("browser-folder:\(item.id.uuidString)", over: target)
+            browser.chromeHover?.sidebarIsReordering = false
+        }, crossed: { target, direction in
+            browser.crossDraggedTab("browser-folder:\(item.id.uuidString)", past: target, direction: direction)
+        }))
+        .modifier(TabSplitTarget(browser: browser, payload: "browser-folder:\(item.id.uuidString)", enabled: item.kind == .page))
         .onDrop(of: [.text], delegate: FolderDropDelegate(browser: browser, target: item,
                                                           isTargeted: $isTargeted, didAccept: onDropAccepted))
         .contextMenu { contextMenu }
+        .modifier(SavedPageRenameIfNeeded(browser: browser, page: item))
         .folderEditorAnchor(.folder(item.id))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(item.kind == .folder ? "\(item.title), \(item.isExpanded ? "expanded" : "collapsed") folder" : (tab?.title ?? item.title))
+        .accessibilityLabel(item.kind == .folder ? "\(item.title), \(expanded ? "expanded" : "collapsed") folder" : (tab?.title ?? item.title))
         .accessibilityAddTraits(active ? [.isButton, .isSelected] : .isButton)
         .accessibilityAction {
             if item.kind == .folder { browser.changeFolders { try browser.folders.toggleExpanded(item.id) } }
@@ -140,6 +166,7 @@ private struct FolderSidebarRow: View {
                 browser.changeFolders { try browser.folders.removeFolder(item.id) }
             }
         } else {
+            if let tab { SplitTabMenu(browser: browser, tab: tab) }
             Button("Open") { browser.openFolderPage(item) }
             Button("Open Copy in New Tab") { if let url = item.url { browser.open(url, inNewTab: true) } }
             if let tab { Button("Reload") { browser.reloadTab(tab.id) } }
@@ -147,8 +174,15 @@ private struct FolderSidebarRow: View {
                 if let url = item.url { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(url.absoluteString, forType: .string) }
             }
             Divider()
+            Button("Rename…") { browser.renamingSavedPageID = item.id }
+            if item.nameSource == .manual || item.nameSource == .automatic {
+                Button("Use Original Title") { browser.changeFolders { try browser.folders.resetPageName(item.id) } }
+            }
+            Divider()
             FolderMoveMenu(browser: browser, item: item)
-            Button("Move to Temporary Tabs") { browser.moveFolderPageToTemporaryTabs(item) }
+            Button("Add to Essential Tabs") { browser.pinSavedPageToEssentials(item) }
+                .disabled(browser.pinnedPages.items.count >= PinnedPageStore.limit && !browser.pinnedPages.items.contains { $0.url == item.url })
+            Button("Unpin tab") { browser.moveFolderPageToTemporaryTabs(item) }
             if let tab {
                 Divider()
                 Button("Close Page") { browser.closeTab(tab.id) }
@@ -157,8 +191,8 @@ private struct FolderSidebarRow: View {
     }
 }
 
-/// Use the same native text providers as ordinary tab dragging, with a move
-/// proposal. The immutable payload is decoded before returning to the main actor.
+/// External text drops are separate from live in-sidebar reordering.
+/// Decode the immutable payload before returning to the main actor.
 @MainActor
 private struct FolderDropDelegate: DropDelegate {
     let browser: BrowserModel
@@ -207,5 +241,14 @@ struct FolderToolbarButton: View {
                 }.padding(12).frame(width: 280)
             }
             .chromePresentation(isPresented: isPresented, controller: chromeHover)
+    }
+}
+
+struct SavedPageRenameIfNeeded: ViewModifier {
+    let browser: BrowserModel
+    let page: TabFolderItem
+    @ViewBuilder func body(content: Content) -> some View {
+        if page.kind == .page { content.modifier(SavedTabRename(browser: browser, page: page)) }
+        else { content }
     }
 }

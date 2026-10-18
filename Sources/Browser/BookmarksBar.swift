@@ -26,7 +26,7 @@ struct BookmarksBar: View {
                         }
                     }
                 }
-                .scrollIndicators(.never)
+                .modifier(ScrollbarVisibility())
 
                 Menu {
                     ForEach(bookmarks.bookmarks) { bookmark in

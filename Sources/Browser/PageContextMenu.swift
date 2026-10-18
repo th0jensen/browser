@@ -37,14 +37,21 @@ extension PageDelegate {
             NSPasteboard.general.writeObjects([url as NSURL])
         })
         additions.append(PageContextMenuItem("Save Webpage As…") { [weak browser, weak tab] in
-            guard let browser, let tab, browser.activeTabID == tab.id else { return }
+            guard let browser, let tab, browser.activeTabID == tab.id || browser.peek?.tab.id == tab.id else { return }
             browser.saveWebpage()
         })
-        let pin = browser.pinnedPages.items.first { $0.id == tab.pinnedPageID || $0.url == tab.url }
-        additions.append(PageContextMenuItem(pin == nil ? "Pin Tab" : "Unpin Tab",
-                                            enabled: pin != nil || browser.canPin(tab)) { [weak browser, weak tab] in
+        let saved = browser.folders.item(tab.folderPageID)
+        additions.append(PageContextMenuItem(saved == nil ? "Pin tab" : "Unpin tab",
+                                            enabled: saved != nil || tab.url.map(PinnedPageStore.valid) == true) { [weak browser, weak tab] in
             guard let browser, let tab else { return }
-            if let pin { browser.unpin(pin) }
+            if let saved { browser.moveFolderPageToTemporaryTabs(saved) }
+            else { browser.moveToFolder(tab, parentID: nil) }
+        })
+        let essential = browser.pinnedPages.items.first { $0.id == tab.pinnedPageID }
+        additions.append(PageContextMenuItem(essential == nil ? "Add to Essential Tabs" : "Remove from Essential Tabs",
+                                            enabled: essential != nil || browser.canPin(tab)) { [weak browser, weak tab] in
+            guard let browser, let tab else { return }
+            if let essential { browser.unpin(essential) }
             else { browser.pin(tab) }
         })
 
