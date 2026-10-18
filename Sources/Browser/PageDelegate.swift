@@ -73,7 +73,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
                 await self?.askToAllowDownloads(on: site, in: webView)
             }
         }
-        browser.downloads.track(download, sourceTitle: tab.pageTitle, sourceURL: tab.url, confirmation: isUserStarted ? nil : confirmation)
+        browser.downloads.track(download, in: browser.window, sourceTitle: browser.isPrivate ? "" : tab.pageTitle, sourceURL: browser.isPrivate ? nil : tab.url, allowsIntelligence: !browser.isPrivate, confirmation: isUserStarted ? nil : confirmation)
         // A download typed into a new tab leaves no page behind, so show the new tab page again.
         if webView.backForwardList.currentItem == nil { tab.isNewTab = true }
     }
@@ -99,6 +99,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         isLoadingFromBrowser = false
         dialogs = DialogLimiter()
         tab?.clearLoadError()
+        tab?.didCommitNavigation()
         PagePaintObserver.shared.navigationCommitted(in: webView)
     }
 
@@ -123,8 +124,8 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         tab.showLoadError(loadError, coversPreviousPage: isProvisional && webView.backForwardList.currentItem != nil)
     }
 
-    /// Asks before a page uses the camera or microphone, naming the site that wants them. The answer lasts
-    /// until the app quits.
+    /// Asks before a page uses the camera or microphone, naming the site that wants them. The answer is kept for
+    /// the site, and can be changed in Settings ▸ Site Settings.
     func webView(_ webView: WKWebView, decideMediaCapturePermissionsFor origin: WKSecurityOrigin,
                  initiatedBy frame: WKFrameInfo, type: WKMediaCaptureType) async -> WKPermissionDecision {
         let permissions: Set<SitePermissions.Permission> = switch type {
@@ -261,16 +262,8 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         return response
     }
 
-    /// Shows the panel as a sheet on the page's window. A background tab's panel waits until the tab is selected,
-    /// so a page can't take over the window, and is dismissed if the tab closes first.
     private func present(_ alert: NSAlert, in webView: WKWebView) async -> NSApplication.ModalResponse? {
-        guard let tab, await tab.waitUntilSelected() else { return nil }
-        // The selected tab's page joins the window on SwiftUI's next update.
-        for _ in 0..<20 where webView.window == nil {
-            try? await Task.sleep(for: .milliseconds(25))
-        }
-        guard let window = webView.window else { return nil }
-        return await alert.beginSheetModal(for: window)
+        await tab?.present(alert, in: webView)
     }
 }
 

@@ -5,7 +5,7 @@ extension BrowserModel: WKWebExtensionWindow {
     func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { tabs + (peek.map { [$0.tab] } ?? []) }
     func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { peek?.tab ?? activeTab }
     func windowType(for context: WKWebExtensionContext) -> WKWebExtension.WindowType { .normal }
-    func isPrivate(for context: WKWebExtensionContext) -> Bool { false }
+    func isPrivate(for context: WKWebExtensionContext) -> Bool { isPrivate }
     func focus(for context: WKWebExtensionContext) async throws {
         window?.makeKeyAndOrderFront(nil)
     }
@@ -23,7 +23,7 @@ extension BrowserTab: WKWebExtensionTab {
     func isSelected(for context: WKWebExtensionContext) -> Bool { (browser?.peek?.tab.id ?? browser?.activeTabID) == id }
     func size(for context: WKWebExtensionContext) -> CGSize { contentView.bounds.size }
     func zoomFactor(for context: WKWebExtensionContext) -> Double { Double(webView?.pageZoom ?? 1) }
-    func setZoomFactor(_ zoomFactor: Double, for context: WKWebExtensionContext) async throws { webView?.pageZoom = CGFloat(zoomFactor) }
+    func setZoomFactor(_ zoomFactor: Double, for context: WKWebExtensionContext) async throws { setZoom(zoomFactor) }
     func loadURL(_ url: URL, for context: WKWebExtensionContext) async throws { load(url) }
     func reload(fromOrigin: Bool, for context: WKWebExtensionContext) async throws {
         restore()

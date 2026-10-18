@@ -153,3 +153,36 @@ final class FaviconTests: XCTestCase {
         XCTAssertEqual(FaviconStore.cache.entry(forHost: "favicon-test.invalid")?.source, URL(string: iconURL))
     }
 }
+
+
+extension FaviconTests {
+    func testClearingCacheRejectsWritesFromRequestsStartedBeforeClear() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = FaviconCache(directory: directory)
+        let generation = cache.writeGeneration
+        let entry = FaviconCache.Entry(source: URL(string: "https://example.com/favicon.ico")!, data: Data([1]))
+        cache.save(entry, forHost: "example.com", generation: generation)
+        cache.removeEntries(since: .distantPast)
+        cache.save(entry, forHost: "example.com", generation: generation)
+        XCTAssertNil(cache.entry(forHost: "example.com"))
+        cache.save(entry, forHost: "example.com", generation: cache.writeGeneration)
+        XCTAssertEqual(cache.entry(forHost: "example.com"), entry)
+    }
+
+    func testPrivateDocumentIconDoesNotPopulateSharedMemoryOrDisk() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
+        let originalCache = FaviconStore.cache
+        FaviconStore.cache = FaviconCache(directory: directory)
+        defer {
+            FaviconStore.cache = originalCache
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let page = URL(string: "https://private-\(UUID().uuidString).invalid/")!
+        let icon = FaviconCandidate(url: URL(string: "data:image/png;base64,\(Self.pixelPNG)")!)
+        let image = await FaviconStore.icon(forPage: page, candidates: [icon], remember: false)
+        XCTAssertNotNil(image)
+        XCTAssertNil(FaviconStore.cachedIcon(for: page))
+        XCTAssertNil(FaviconStore.cache.entry(forHost: page.host()!))
+    }
+}

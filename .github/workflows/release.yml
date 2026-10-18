@@ -1,0 +1,231 @@
+# Builds, signs, notarizes, and publishes a release when a version tag like v1.2.0 is pushed. Pushing the tag
+# publishes the release right away, and Sparkle offers it to everyone. See RELEASING.md for the secrets it needs.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.ref_name }}
+      REPOSITORY: ${{ github.repository }}
+      BUILD_DIR: ${{ github.workspace }}/build
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The build number counts every commit, so it needs the full history.
+          fetch-depth: 0
+
+      - name: Check the release settings
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          missing=()
+          for name in CERTIFICATE CERTIFICATE_PASSWORD TEAM_ID API_KEY API_KEY_ID API_ISSUER_ID SPARKLE_PRIVATE_KEY; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing release secrets: ${missing[*]}. See RELEASING.md."
+            exit 1
+          fi
+          # The public key comes from the SPARKLE_PUBLIC_ED_KEY variable, or from project.yml once it's set there.
+          public_key="${SPARKLE_PUBLIC_KEY:-$(awk '/SPARKLE_PUBLIC_ED_KEY:/ { print $2 }' project.yml)}"
+          if [ -z "$public_key" ] || [ "$public_key" = "REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY" ]; then
+            echo "::error::Set Sparkle's public key in project.yml or the SPARKLE_PUBLIC_ED_KEY variable. See RELEASING.md."
+            exit 1
+          fi
+          version="${TAG#v}"
+          {
+            echo "VERSION=$version"
+            echo "BUILD_NUMBER=$(git rev-list --count HEAD)"
+            echo "SPARKLE_PUBLIC_KEY=$public_key"
+            echo "SPARKLE_VERSION=$(awk '/exactVersion:/ { print $2 }' project.yml)"
+            echo "DMG=Browser-$version.dmg"
+          } >> "$GITHUB_ENV"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Test the Debug build
+        run: |
+          xcodegen generate
+          xcodebuild test \
+            -project Browser.xcodeproj \
+            -scheme Browser \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -derivedDataPath "$BUILD_DIR/DebugTests" \
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM= \
+            ENABLE_HARDENED_RUNTIME=NO OTHER_CODE_SIGN_FLAGS=--options=0
+
+      - name: Import the Developer ID certificate
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      # Only once Apple grants the passkey entitlement: a Developer ID provisioning profile that includes it.
+      - name: Install the passkeys provisioning profile
+        env:
+          PROFILE: ${{ secrets.DEVELOPER_ID_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          if [ -z "$PROFILE" ]; then
+            echo "BROWSER_PASSKEYS=NO" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          profile="$RUNNER_TEMP/browser.provisionprofile"
+          echo "$PROFILE" | base64 --decode > "$profile"
+          security cms -D -i "$profile" > "$RUNNER_TEMP/profile.plist"
+          uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
+          name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")"
+          mkdir -p "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          cp "$profile" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$uuid.provisionprofile"
+          {
+            echo "BROWSER_PASSKEYS=YES"
+            echo "PROFILE_NAME=$name"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and sign
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcodegen generate
+          xcodebuild -version
+          profile_settings=()
+          if [ "$BROWSER_PASSKEYS" = YES ]; then
+            profile_settings=(PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME")
+          fi
+          xcodebuild archive \
+            -project Browser.xcodeproj \
+            -scheme Browser \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath "$BUILD_DIR/Browser.xcarchive" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_KEY" \
+            SPARKLE_FEED_URL="https://github.com/$REPOSITORY/releases/latest/download/appcast.xml" \
+            BROWSER_PASSKEYS="$BROWSER_PASSKEYS" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN --timestamp" \
+            "${profile_settings[@]}"
+
+          # Exporting re-signs the app and everything inside it, Sparkle's helpers too, for Developer ID.
+          options="$BUILD_DIR/ExportOptions.plist"
+          /usr/libexec/PlistBuddy -c "Add :method string developer-id" \
+            -c "Add :signingStyle string manual" \
+            -c "Add :signingCertificate string Developer ID Application" \
+            -c "Add :teamID string $TEAM_ID" "$options"
+          if [ "$BROWSER_PASSKEYS" = YES ]; then
+            /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" \
+              -c "Add :provisioningProfiles:dev.athas.browser string $PROFILE_NAME" "$options"
+          fi
+          xcodebuild -exportArchive \
+            -archivePath "$BUILD_DIR/Browser.xcarchive" \
+            -exportPath "$BUILD_DIR/export" \
+            -exportOptionsPlist "$options"
+
+          app="$BUILD_DIR/export/Browser.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --entitlements - "$app"
+          echo "APP=$app" >> "$GITHUB_ENV"
+
+      - name: Notarize and staple the app
+        env:
+          API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --keepParent "$APP" "$BUILD_DIR/Browser.zip"
+          xcrun notarytool submit "$BUILD_DIR/Browser.zip" --wait \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID"
+          xcrun stapler staple "$APP"
+
+      - name: Make, sign, and notarize the disk image
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          staging="$BUILD_DIR/dmg"
+          mkdir -p "$staging" "$BUILD_DIR/release"
+          ditto "$APP" "$staging/Browser.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname Browser -srcfolder "$staging" -fs HFS+ -format UDZO -ov \
+            "$BUILD_DIR/release/$DMG"
+          codesign --sign "Developer ID Application" --keychain "$KEYCHAIN" --timestamp "$BUILD_DIR/release/$DMG"
+          xcrun notarytool submit "$BUILD_DIR/release/$DMG" --wait \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID"
+          xcrun stapler staple "$BUILD_DIR/release/$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose "$BUILD_DIR/release/$DMG"
+
+      - name: Sign the update and update the appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          tools="$RUNNER_TEMP/sparkle"
+          mkdir -p "$tools"
+          curl -fsSL "https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz" \
+            | tar -xJ -C "$tools"
+          # The appcast published with the latest release keeps the earlier versions; the first release has none.
+          curl -fsSL -o "$BUILD_DIR/release/appcast.xml" \
+            "https://github.com/$REPOSITORY/releases/latest/download/appcast.xml" || rm -f "$BUILD_DIR/release/appcast.xml"
+          # Signs the disk image with the EdDSA key and adds it to the appcast.
+          echo "$SPARKLE_PRIVATE_KEY" | "$tools/bin/generate_appcast" --ed-key-file - \
+            --download-url-prefix "https://github.com/$REPOSITORY/releases/download/$TAG/" \
+            --link "https://github.com/$REPOSITORY" \
+            --maximum-versions 0 \
+            --maximum-deltas 0 \
+            "$BUILD_DIR/release"
+          cat "$BUILD_DIR/release/appcast.xml"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$TAG" "$BUILD_DIR/release/$DMG" "$BUILD_DIR/release/appcast.xml" \
+            --repo "$REPOSITORY" --title "Browser $VERSION" --generate-notes --verify-tag "${prerelease[@]}"
+
+      - name: Remove the signing keychain and keys
+        if: always()
+        run: |
+          [ -n "$KEYCHAIN" ] && security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/browser.provisionprofile" "$RUNNER_TEMP/profile.plist"

@@ -9,6 +9,12 @@ struct AddressTextField: NSViewRepresentable {
     var browserWindow: NSWindow?
     var pageURL: URL?
     var pageTitle = ""
+    var completionStart: Int? = nil
+    var suggestions: [AddressSuggestion] = []
+    var selectedSuggestion: Int? = nil
+    var onEdit: ((String) -> Void)? = nil
+    var onCommand: ((SuggestionAddressField.Command) -> Bool)? = nil
+    var onChooseSuggestion: ((AddressSuggestion) -> Void)? = nil
     let focusRequest: Int
     let onFocusApplied: (Int) -> Void
     let onFocusChange: (Bool) -> Void
@@ -38,6 +44,7 @@ struct AddressTextField: NSViewRepresentable {
         field.onFocusChange = { context.coordinator.parent.onFocusChange($0) }
         field.onFocusApplied = { context.coordinator.parent.onFocusApplied($0) }
         field.onEditingStarted = { context.coordinator.parent.text = $0 }
+        field.onEndEditing = { context.coordinator.closeSuggestions() }
         return field
     }
 
@@ -46,18 +53,82 @@ struct AddressTextField: NSViewRepresentable {
         field.browserWindow = browserWindow
         field.requiresVisibleToolbar = requiresVisibleToolbar
         field.regionIsVisible = chromeRegionIsVisible
-        field.updatePresentation(text: text, url: pageURL, title: pageTitle)
+        field.updatePresentation(text: text, url: pageURL, title: pageTitle, completionStart: completionStart)
+        context.coordinator.updateSuggestions(for: field)
         field.requestFocus(focusRequest)
     }
 
+    static func dismantleNSView(_ view: AddressField, coordinator: Coordinator) {
+        coordinator.closeSuggestions()
+    }
+
     @MainActor final class Coordinator: NSObject, NSTextFieldDelegate {
+        private var suggestionPanel: AddressSuggestionPanel?
         var parent: AddressTextField
         init(parent: AddressTextField) { self.parent = parent }
         func controlTextDidChange(_ notification: Notification) {
             guard let field = notification.object as? NSTextField else { return }
-            parent.text = field.stringValue
+            let editedText = field.currentEditor()?.string ?? field.stringValue
+            parent.text = editedText
+            parent.onEdit?(editedText)
         }
-        @objc func submit() { parent.onSubmit() }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            let command: SuggestionAddressField.Command
+            switch commandSelector {
+            case #selector(NSResponder.moveUp(_:)): command = .moveUp
+            case #selector(NSResponder.moveDown(_:)): command = .moveDown
+            case #selector(NSResponder.insertNewline(_:)): command = .submit
+            case #selector(NSResponder.cancelOperation(_:)): command = .cancel
+            default: return false
+            }
+            return parent.onCommand?(command) ?? false
+        }
+
+        func updateSuggestions(for field: AddressField) {
+            guard !parent.suggestions.isEmpty, parent.chromeRegionIsVisible,
+                  !field.isHiddenOrHasHiddenAncestor, let window = field.window,
+                  field.currentEditor() != nil else { closeSuggestions(); return }
+            let panel: AddressSuggestionPanel
+            if let existing = suggestionPanel { panel = existing }
+            else {
+                panel = AddressSuggestionPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+                panel.isOpaque = false
+                panel.backgroundColor = .clear
+                panel.hasShadow = true
+                panel.hidesOnDeactivate = true
+                panel.isReleasedWhenClosed = false
+                suggestionPanel = panel
+            }
+            let content = AddressSuggestionList(suggestions: parent.suggestions, selectedIndex: parent.selectedSuggestion) { [weak self] suggestion in
+                self?.parent.onChooseSuggestion?(suggestion)
+                self?.closeSuggestions()
+            }
+            panel.contentView = NSHostingView(rootView: content)
+            let anchor = window.convertToScreen(field.convert(field.bounds, to: nil))
+            let width = max(300, anchor.width + 70)
+            let height = CGFloat(parent.suggestions.count * 29 + 10)
+            let screen = window.screen?.visibleFrame ?? anchor
+            let x = min(max(anchor.minX - 22, screen.minX), screen.maxX - width)
+            panel.setFrame(NSRect(x: x, y: anchor.minY - height - 8, width: width, height: height), display: true)
+            if panel.parent !== window {
+                panel.parent?.removeChildWindow(panel)
+                window.addChildWindow(panel, ordered: .above)
+            }
+            panel.orderFront(nil)
+        }
+
+        func closeSuggestions() {
+            if let panel = suggestionPanel {
+                panel.parent?.removeChildWindow(panel)
+                panel.orderOut(nil)
+            }
+            suggestionPanel = nil
+        }
+
+        @objc func submit() {
+            if parent.onCommand?(.submit) != true { parent.onSubmit() }
+        }
     }
 }
 
@@ -68,6 +139,7 @@ final class AddressField: NSTextField {
     var onFocusChange: ((Bool) -> Void)?
     var onFocusApplied: ((Int) -> Void)?
     var onEditingStarted: ((String) -> Void)?
+    var onEndEditing: (() -> Void)?
     private var requestedFocus = 0
     private var appliedFocus = 0
     private var editingText = ""
@@ -76,11 +148,19 @@ final class AddressField: NSTextField {
     private var isPresentingEditor = false
     private var previewCell: NSTextFieldCell?
 
-    func updatePresentation(text: String, url: URL?, title: String) {
+    func updatePresentation(text: String, url: URL?, title: String, completionStart: Int? = nil) {
         pageURL = url
         pageTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if currentEditor() != nil { isPresentingEditor = true }
         editingText = isPresentingEditor ? text : (url?.absoluteString ?? text)
-        if stringValue != editingText { stringValue = editingText }
+        if let editor = currentEditor() as? NSTextView, isPresentingEditor {
+            if editor.string != editingText {
+                editor.string = editingText
+                let length = (editingText as NSString).length
+                let start = min(completionStart ?? length, length)
+                editor.selectedRange = NSRange(location: start, length: length - start)
+            }
+        } else if stringValue != editingText { stringValue = editingText }
         if !isPresentingEditor { showPageTitle() }
     }
 
@@ -177,6 +257,7 @@ final class AddressField: NSTextField {
         guard canReceiveFocus else { return false }
         let wasEditing = isPresentingEditor
         prepareForEditing()
+        let textAtFocus = editingText
         let result = super.becomeFirstResponder()
         if result {
             DispatchQueue.main.async { [weak self] in
@@ -184,7 +265,9 @@ final class AddressField: NSTextField {
                 let focused = canReceiveFocus && (window.firstResponder === self || window.firstResponder === currentEditor())
                 // AppKit may establish first responder before delivering the
                 // mouse event. Select after that event's native caret handling.
-                if focused && !wasEditing { currentEditor()?.selectAll(nil) }
+                if focused && !wasEditing && currentEditor()?.string == textAtFocus {
+                    currentEditor()?.selectAll(nil)
+                }
                 onFocusChange?(focused)
             }
         } else {
@@ -197,7 +280,14 @@ final class AddressField: NSTextField {
     override func textDidEndEditing(_ notification: Notification) {
         super.textDidEndEditing(notification)
         isPresentingEditor = false
+        onEndEditing?()
         showPageTitle()
         onFocusChange?(false)
     }
+}
+
+/// Suggestions remain attached to the native toolbar without taking its field editor's focus.
+private final class AddressSuggestionPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }

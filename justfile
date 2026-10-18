@@ -7,7 +7,7 @@ generate:
     xcodegen generate
 
 build configuration="Debug": generate
-    xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration "{{configuration}}" -derivedDataPath DerivedData build CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM=
+    xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration "{{configuration}}" -derivedDataPath DerivedData build CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM= ENABLE_HARDENED_RUNTIME=NO OTHER_CODE_SIGN_FLAGS=--options=0
 
 deploy: (build "Debug")
     ./scripts/deploy.sh Debug
@@ -17,8 +17,8 @@ release: (build "Release")
 
 # Requires a team/provisioning profile approved for Apple's browser passkey entitlement.
 deploy-signed team configuration="Debug": generate
-    xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration "{{configuration}}" -derivedDataPath DerivedData build DEVELOPMENT_TEAM="{{team}}" CODE_SIGN_STYLE=Automatic CODE_SIGN_IDENTITY="Apple Development" CODE_SIGN_ENTITLEMENTS=BrowserPasskeys.entitlements -allowProvisioningUpdates
+    xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration "{{configuration}}" -derivedDataPath DerivedData build DEVELOPMENT_TEAM="{{team}}" CODE_SIGN_STYLE=Automatic CODE_SIGN_IDENTITY="Apple Development" BROWSER_PASSKEYS=YES -allowProvisioningUpdates
     ./scripts/deploy.sh "{{configuration}}"
 
 test: generate
-    xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration Debug -derivedDataPath DerivedData -destination 'platform=macOS' test CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM=
+    xcodebuild -quiet -project Browser.xcodeproj -scheme Browser -configuration Debug -derivedDataPath DerivedData -destination 'platform=macOS' test CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES DEVELOPMENT_TEAM= ENABLE_HARDENED_RUNTIME=NO OTHER_CODE_SIGN_FLAGS=--options=0

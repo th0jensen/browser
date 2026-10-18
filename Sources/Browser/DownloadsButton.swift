@@ -127,7 +127,7 @@ private struct DownloadRow: View {
                 .buttonStyle(ChromeIconButtonStyle(size: 24))
                 .help("Cancel Download")
                 .accessibilityLabel("Cancel \(item.name)")
-            } else if item.state == .finished {
+            } else if item.state == .finished || item.hasRecoverableFile {
                 Button { downloads.reveal(item) } label: {
                     Image(systemName: "magnifyingglass")
                 }
@@ -147,7 +147,7 @@ private struct DownloadRow: View {
             Button("Open") { downloads.open(item) }
                 .disabled(item.state != .finished)
             Button("Show in Finder") { downloads.reveal(item) }
-                .disabled(item.state != .finished)
+                .disabled(item.state != .finished && !item.hasRecoverableFile)
             if item.originalName != nil { Button("Restore Original Name") { downloads.undoTidyName(item) } }
             if item.state == .downloading {
                 Divider()

@@ -1,10 +1,27 @@
 import SwiftUI
 import WebKit
 
+private struct AddressBarFrameKey: PreferenceKey {
+    static let defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = value ?? nextValue()
+    }
+}
+
 struct BrowserWindow: View {
     let bookmarks: BookmarkStore
+    let session: SessionStore?
+    @Environment(BrowsingData.self) private var browsingData: BrowsingData?
+    @Environment(\.openWindow) private var openWindow
     @State private var browser: BrowserModel
     @State private var address = ""
+    /// What the user typed, without the inline completion.
+    @State private var typedAddress = ""
+    @State private var completionStart: Int?
+    @State private var suggestions: [AddressSuggestion] = []
+    @State private var selectedSuggestion: Int?
+    @State private var addressBlurRequest = 0
     @State private var hoverCardTabID: UUID?
     @State private var isFullScreen = false
     @AppStorage("toolbarLayout.vertical") private var verticalToolbarLayout = ToolbarLayoutPersistence.legacyData(for: .vertical)
@@ -36,7 +53,8 @@ struct BrowserWindow: View {
     @AppStorage(ChromeCustomization.widthKey) private var savedSidebarWidth = Double(BrowserChrome.sidebarWidth)
     @AppStorage(ChromeCustomization.bookmarkButtonKey) private var showsBookmarkButton = true
 
-    private let accent = Color(red: 0.38, green: 0.49, blue: 0.54)
+    private let contentBlocker = ContentBlocker.shared
+    private var accent: Color { browser.isPrivate ? Color(red: 0.65, green: 0.48, blue: 0.86) : Color(red: 0.38, green: 0.49, blue: 0.54) }
 
     // The saved width supplies the first layout directly, including a window's injected defaults store.
     // Pointer movement stays in memory; the preference is written once when the drag ends.
@@ -55,14 +73,18 @@ struct BrowserWindow: View {
         if savedSidebarWidth != width { savedSidebarWidth = width }
     }
 
-    init(bookmarks: BookmarkStore, downloads: DownloadManager) {
+    init(bookmarks: BookmarkStore, downloads: DownloadManager, history: HistoryStore? = nil,
+         session: SessionStore? = nil, isPrivate: Bool = false) {
         self.bookmarks = bookmarks
-        _browser = State(initialValue: BrowserModel(downloads: downloads))
+        self.session = session
+        _browser = State(initialValue: isPrivate ? BrowserModel.makePrivate(downloads: downloads)
+            : BrowserModel(downloads: downloads, history: history, passwords: .shared))
         _chromeHover = State(initialValue: ChromeHoverController())
     }
 
     init(bookmarks: BookmarkStore, browser: BrowserModel, chromeHover: ChromeHoverController = ChromeHoverController(), persistsToolbarLayout: Bool = !BrowserProfile.isTesting) {
         self.bookmarks = bookmarks
+        self.session = nil
         _browser = State(initialValue: browser)
         _chromeHover = State(initialValue: chromeHover)
         self.persistsToolbarLayout = persistsToolbarLayout
@@ -84,6 +106,7 @@ struct BrowserWindow: View {
                 TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
                          hoverCardTabID: $hoverCardTabID)
                     .frame(width: sidebarWidth)
+                    .privateChrome(browser.isPrivate)
                     .overlay(alignment: .trailing) {
                         SidebarResizeHandle(width: sidebarWidthBinding, isResizing: $sidebarIsResizing)
                             .offset(x: BrowserChrome.edgeInset)
@@ -99,6 +122,7 @@ struct BrowserWindow: View {
                     TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
                          hoverCardTabID: $hoverCardTabID, floating: true)
                     .frame(width: sidebarWidth)
+                    .privateChrome(browser.isPrivate)
                     .background(ChromePresentationMarker(identifier: "BrowserFloatingSidebarGeometry", onViewAvailable: { view in
                         chromeHover.sidebarBoundsProvider = { [weak view] in view?.regionBounds }
                     }))
@@ -120,10 +144,22 @@ struct BrowserWindow: View {
         }
         .background(ChromePointerObserver(controller: chromeHover))
         .background(BrowserShortcutRouter(browser: browser))
-        .background(SessionPersistenceView(browser: browser))
+        .background(SessionPersistenceView(browser: browser, session: session))
         .modifier(FolderEditorPresentation(browser: browser, controller: chromeHover, verticalTabs: tabLayout == .vertical))
         .overlayPreferenceValue(TabFrameKey.self) { tabFrames in
             hoverCard(tabFrames: tabFrames)
+                .privateChrome(browser.isPrivate)
+        }
+        .sheet(isPresented: $browser.isShowingClearData) {
+            if let browsingData { ClearDataView(data: browsingData) }
+        }
+        .sheet(isPresented: $browser.isShowingHistory) {
+            if let history = browser.history {
+                HistoryView(history: history) { url, inNewTab in
+                    browser.isShowingHistory = false
+                    browser.open(url, inNewTab: inNewTab)
+                }
+            }
         }
         .onChange(of: compactToolbar) { _, value in chromeHover.compactToolbar = value }
         .onChange(of: autoHideSidebar) { _, value in
@@ -152,7 +188,7 @@ struct BrowserWindow: View {
         .onChange(of: toolbarLabelStyle) { _, _ in
             if isFullScreen { chromeHover.headerHeight = defaultHeaderHeight }
         }
-        .background(WindowGlassBackground().ignoresSafeArea())
+        .background(WindowGlassBackground(isDark: browser.isPrivate).ignoresSafeArea())
         .background(WindowChromeConfigurator(tabLayout: tabLayout, horizontalTabs: AnyView(horizontalTabs),
                                              isFullScreen: $isFullScreen, compactToolbar: effectiveCompactToolbar,
                                              insetRevealedToolbar: compactToolbar,
@@ -172,7 +208,7 @@ struct BrowserWindow: View {
                                              }))
         .tint(accent)
         .focusedSceneValue(\.browserModel, browser)
-        .navigationTitle(browser.activeTab?.title ?? "Browser")
+        .navigationTitle(browser.isPrivate ? "Private — \(browser.activeTab?.title ?? "Browser")" : browser.activeTab?.title ?? "Browser")
         .frame(minWidth: 680, minHeight: 440)
         .toolbar(id: nativeToolbarIdentifier) { browserToolbar }
         .environment(\.chromeHoverController, chromeHover)
@@ -180,19 +216,27 @@ struct BrowserWindow: View {
         .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
         .onChange(of: browser.activeTabID) { _, _ in
             chromeHover.activeTabChanged()
+            closeSuggestions()
+            completionStart = nil
             address = browser.activeTab?.url?.absoluteString ?? ""
             if let tab = browser.activeTab, !tab.isNewTab, let webView = tab.webView,
                PagePaintObserver.shared.hasPainted(in: webView) {
                 chromeHover.navigationSucceeded(in: tab.id)
             }
         }
-        .onOpenURL { browser.open($0) }
         .task {
-            await BrowserExtensions.shared.restore()
-            BrowserSessionStore.shared.restore(in: browser)
+            await contentBlocker.prepare()
+            if !browser.isPrivate { await BrowserExtensions.shared.restore() }
+            if let session, !browser.isPrivate, !browser.isExtensionWindow {
+                browser.sessionStore = session
+                for _ in 0..<session.attach(browser) { openWindow(id: BrowserApp.windowID) }
+            }
+            if !browser.isExtensionWindow { ExternalURLRouter.shared.register(browser, openWindow: openWindow) }
             if browser.activeTab?.isNewTab == true { browser.requestAddressFocus() }
         }
         .onDisappear {
+            ExternalURLRouter.shared.unregister(browser)
+            session?.detach(browser)
             persistSidebarWidth()
             chromeHover.stop()
             BrowserExtensions.shared.unregister(browser)
@@ -203,11 +247,19 @@ struct BrowserWindow: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willExitFullScreenNotification)) { notification in
             rememberAddressFocusBeforeFullscreen(notification)
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
+            if let window = notification.object as? NSWindow, browser.window === window {
+                ExternalURLRouter.shared.unregister(browser)
+                session?.detach(browser)
+                browser.cancelTidyingTabs()
+                browser.dismissPeek()
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
             if let window = notification.object as? NSWindow, browser.window === window {
                 WindowChromeSettingsTarget.shared.browser = browser
                 BrowserExtensions.shared.focus(browser)
-                BrowserSessionStore.shared.didFocus(browser)
+                browser.requestSessionSave()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { notification in
@@ -320,7 +372,7 @@ struct BrowserWindow: View {
         case "settings": toolbarComponent(.settings)
         case "newTab": toolbarComponent(.newTab)
         default:
-            if let item = BrowserExtensions.shared.toolbarExtensions.first(where: { "extension.\($0.id.uuidString)" == identifier }) {
+            if !browser.isPrivate, let item = BrowserExtensions.shared.toolbarExtensions.first(where: { "extension.\($0.id.uuidString)" == identifier }) {
                 ExtensionButton(item: item, browser: browser)
             }
         }
@@ -330,7 +382,90 @@ struct BrowserWindow: View {
         TabStrip(browser: browser, layout: .horizontal, isFullScreen: isFullScreen,
                  hoverCardTabID: $hoverCardTabID, usesNativeHoverPopover: true, floating: usesFullscreenToolbarOverlay)
             .frame(maxHeight: .infinity, alignment: .top)
+            .privateChrome(browser.isPrivate)
             .tint(accent)
+    }
+
+    // MARK: Address bar
+
+    private func editAddress(_ text: String) {
+        // Typing more of the text completes it again; deleting doesn't, so the deleted completion stays gone.
+        let isAppending = text.count > typedAddress.count && text.hasPrefix(typedAddress)
+        typedAddress = text
+        selectedSuggestion = nil
+        suggestions = AddressSuggestions.rank(text, pages: browser.history?.pages ?? [],
+                                              bookmarks: bookmarks.bookmarks)
+        if isAppending, let completion = AddressSuggestions.inlineCompletion(of: text, with: suggestions.first) {
+            completionStart = (text as NSString).length
+            address = completion
+        } else {
+            completionStart = nil
+        }
+    }
+
+    private func performAddressCommand(_ command: SuggestionAddressField.Command) -> Bool {
+        switch command {
+        case .moveDown, .moveUp:
+            guard !suggestions.isEmpty else { return false }
+            let offset = command == .moveDown ? 1 : -1
+            let index = (selectedSuggestion ?? -1) + offset
+            completionStart = nil
+            if index < 0 {
+                selectedSuggestion = nil
+                address = typedAddress
+            } else {
+                selectedSuggestion = min(index, suggestions.count - 1)
+                address = suggestions[min(index, suggestions.count - 1)].url.absoluteString
+            }
+            return true
+        case .submit:
+            if let selectedSuggestion, suggestions.indices.contains(selectedSuggestion) {
+                open(suggestions[selectedSuggestion])
+            } else {
+                if let id = browser.activeTabID { chromeHover.addressNavigationSubmitted(in: id) }
+                if completionStart != nil, let completed = AddressSuggestions.completedURL(for: address, with: suggestions.first) {
+                    browser.navigate(to: completed.absoluteString)
+                } else {
+                    browser.navigate(to: address)
+                }
+                finishEditingAddress()
+            }
+            return true
+        case .cancel:
+            if suggestions.isEmpty {
+                address = browser.activeTab?.url?.absoluteString ?? ""
+                typedAddress = address
+                finishEditingAddress()
+            } else {
+                address = typedAddress
+                closeSuggestions()
+            }
+            completionStart = nil
+            return true
+        }
+    }
+
+    private func open(_ suggestion: AddressSuggestion) {
+        // The list can report a click more than once before it closes.
+        guard !suggestions.isEmpty else { return }
+        address = suggestion.url.absoluteString
+        browser.open(suggestion.url)
+        finishEditingAddress()
+    }
+
+    private func finishEditingAddress() {
+        closeSuggestions()
+        completionStart = nil
+        addressBlurRequest += 1
+        browser.window?.makeFirstResponder(browser.focusedPage?.webView)
+        addressIsFocused = false
+        chromeHover.addressIsFocused = false
+    }
+
+    private func closeSuggestions() {
+        suggestions = []
+        selectedSuggestion = nil
+        typedAddress = ""
     }
 
     /// Navigation, bookmarks, and the page. In the vertical layout the sidebar supplies the leading inset.
@@ -411,6 +546,14 @@ struct BrowserWindow: View {
                     PageErrorView(error: error, isLoading: tab.isLoading) { tab.retry() }
                 }
             }
+            .overlay(alignment: .topTrailing) {
+                if tab.isFindBarVisible {
+                    FindBar(tab: tab, browser: browser)
+                        .padding(10)
+                        .transition(.opacity.combined(with: .offset(y: -4)))
+                }
+            }
+            .animation(.easeOut(duration: 0.15), value: tab.isFindBarVisible)
             .overlay(alignment: .topLeading) {
                 if tab.isLoading {
                     GeometryReader { geometry in
@@ -462,7 +605,7 @@ struct BrowserWindow: View {
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(id: "downloads", placement: .automatic) { toolbarComponent(.downloads) }
             .sharedBackgroundVisibility(.automatic)
-        ForEach(BrowserExtensions.shared.toolbarExtensions) { item in
+        ForEach(browser.isPrivate ? [] : BrowserExtensions.shared.toolbarExtensions) { item in
             ToolbarItem(id: "extension.\(item.id.uuidString)", placement: .automatic) { ExtensionButton(item: item, browser: browser) }
                 .defaultCustomization(.hidden)
                 .sharedBackgroundVisibility(.automatic)
@@ -648,16 +791,24 @@ struct BrowserWindow: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.primary.opacity(0.85))
                 .frame(width: 14)
+            if browser.isPrivate { privateLabel }
             AddressTextField(text: $address,
                              requiresVisibleToolbar: requiresVisibleToolbar,
                              browserWindow: browserWindow.window,
                              pageURL: browser.activeTab?.isNewTab == false ? browser.activeTab?.url : nil,
                              pageTitle: browser.activeTab?.pageTitle ?? "",
+                             completionStart: completionStart,
+                             suggestions: suggestions,
+                             selectedSuggestion: selectedSuggestion,
+                             onEdit: editAddress,
+                             onCommand: performAddressCommand,
+                             onChooseSuggestion: open,
                              focusRequest: browser.addressFocusRequest == browser.consumedAddressFocusRequest ? 0 : browser.addressFocusRequest,
                              onFocusApplied: { browser.consumedAddressFocusRequest = $0 },
                              onFocusChange: {
                                  addressIsFocused = $0
                                  chromeHover.addressIsFocused = $0
+                                 if !$0 { closeSuggestions() }
                              }, onSubmit: {
                 guard BrowserAddress.url(for: address) != nil, let tabID = browser.activeTabID else { return }
                 chromeHover.addressNavigationSubmitted(in: tabID)
@@ -666,6 +817,9 @@ struct BrowserWindow: View {
                 chromeHover.addressIsFocused = false
             })
             .frame(minWidth: 0, idealWidth: 200, maxWidth: .infinity)
+            zoomButton
+            passwordButton
+            trackerBlockingButton
             bookmarkButton
         }
         .padding(.horizontal, BrowserChrome.edgeInset)
@@ -676,6 +830,98 @@ struct BrowserWindow: View {
                 .strokeBorder(addressIsFocused ? accent.opacity(0.7) : Color.clear, lineWidth: 1)
         }
         .contextMenu { ToolbarContextMenu(customize: { ChromeCustomization.customizeToolbar(in: browser.window) }, browser: browser, window: browser.window) }
+        .privateChrome(browser.isPrivate)
+    }
+
+    @ViewBuilder
+    private var zoomButton: some View {
+        if let tab = browser.focusedPage, !tab.isNewTab, tab.pageZoom != 1 {
+            Button { browser.resetZoom() } label: {
+                Text(tab.pageZoom, format: .percent.precision(.fractionLength(0)))
+                    .font(.system(size: 11, weight: .medium))
+                    .monospacedDigit()
+                    .padding(.horizontal, 6)
+                    .frame(height: 20)
+                    .background(Color.primary.opacity(0.08), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Reset Zoom (⌘0)")
+            .accessibilityLabel("Zoom \(Int((tab.pageZoom * 100).rounded())) percent, reset")
+        }
+    }
+
+    private var privateLabel: some View {
+        Label("Private", systemImage: "eyeglasses")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(accent)
+            .padding(.horizontal, 10)
+            .frame(height: BrowserChrome.toolbarHeight)
+            .background(accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .help("Private Window: history, cookies, and website data aren’t kept after it closes")
+            .accessibilityLabel("Private Window")
+    }
+
+    /// Shows whether trackers are blocked on the page's site, and turns blocking off for the site. A private window
+    /// shows the state without changing it, since the change would be kept after it closes.
+    @ViewBuilder
+    private var trackerBlockingButton: some View {
+        if contentBlocker.isEnabled, let tab = browser.focusedPage, !tab.isNewTab, let host = tab.host,
+           ["http", "https"].contains(tab.url?.scheme?.lowercased() ?? "") {
+            let isBlocking = contentBlocker.isBlocking(on: host)
+            let site = ContentBlocker.site(host)
+            let status = contentBlocker.isReady
+                ? (isBlocking ? "Trackers are blocked on \(site)" : "Tracker blocking is off for \(site)")
+                : (contentBlocker.lastError ?? "Preparing tracker protection…")
+            Menu {
+                Text(status)
+                Button(isBlocking ? "Turn Off Blocking for This Site" : "Turn On Blocking for This Site") {
+                    Task {
+                        await contentBlocker.setBlocking(!isBlocking, on: host)
+                        tab.reload()
+                    }
+                }
+                .disabled(browser.isPrivate || !contentBlocker.isReady || contentBlocker.isUpdating)
+            } label: {
+                Image(systemName: !contentBlocker.isReady ? "exclamationmark.shield" : isBlocking ? "shield.lefthalf.filled" : "shield.slash")
+                    .foregroundStyle(isBlocking ? Color.secondary : Color.orange)
+            }
+            .menuStyle(.button)
+            .menuIndicator(.hidden)
+            .buttonStyle(ChromeIconButtonStyle(size: 26))
+            .fixedSize()
+            .help(status)
+            .accessibilityLabel(status)
+        }
+    }
+
+    /// Offers the passwords saved for exactly the page's origin, once the page shows a password field.
+    @ViewBuilder
+    private var passwordButton: some View {
+        if let tab = browser.focusedPage, !tab.isNewTab, tab.hasPasswordFields, let passwords = browser.passwords {
+            let accounts = passwords.passwords(for: PasswordOrigin(url: tab.url))
+            if !accounts.isEmpty {
+                Menu {
+                    Text("Passwords for \(PasswordOrigin(url: tab.url)?.description ?? "this site")")
+                    ForEach(accounts) { account in
+                        Button(account.username.isEmpty ? "Fill Password" : "Fill “\(account.username)”") {
+                            Task { await PasswordAutofill.fill(account, in: tab, from: passwords) }
+                        }
+                    }
+                    Divider()
+                    Button("Show Passwords…") { openSettings() }
+                } label: {
+                    Image(systemName: "key.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .buttonStyle(ChromeIconButtonStyle(size: 26))
+                .fixedSize()
+                .help("Fill Saved Password")
+                .accessibilityLabel("Fill saved password")
+            }
+        }
     }
 
     @ViewBuilder

@@ -53,6 +53,7 @@ final class BrowserExtensions: NSObject {
         self.applicationDirectories = applicationDirectories ?? (persistent && !BrowserProfile.isTesting ? DiscoveredExtension.applicationDirectories : [])
         let controllerConfiguration: WKWebExtensionController.Configuration = persistent ? .default() : .nonPersistent()
         let webConfiguration = WKWebViewConfiguration()
+        webConfiguration.websiteDataStore = BrowserProfile.websiteDataStore
         BrowserTab.applyBrowserPreferences(to: webConfiguration)
         controllerConfiguration.webViewConfiguration = webConfiguration
         controllerConfiguration.defaultWebsiteDataStore = BrowserProfile.websiteDataStore
@@ -205,7 +206,7 @@ final class BrowserExtensions: NSObject {
     }
 
     func register(_ browser: BrowserModel) {
-        guard !windows.contains(browser) else { return }
+        guard !browser.isPrivate, !windows.contains(browser) else { return }
         windows.add(browser)
         controller.didOpenWindow(browser)
         browser.tabs.forEach {

@@ -32,11 +32,20 @@ enum BrowserChrome {
     static let smallGap: CGFloat = 4
 }
 
-enum TabLayout: String, CaseIterable {
+enum TabLayout: String, CaseIterable, Identifiable {
     case horizontal
     case vertical
 
     static let storageKey = "tabLayout"
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .horizontal: "Horizontal"
+        case .vertical: "Vertical"
+        }
+    }
 
     var toggled: TabLayout { self == .vertical ? .horizontal : .vertical }
 }
@@ -364,6 +373,7 @@ final class WindowChromeView: NSView {
                 self.applyToolbarVisibility(in: window)
                 self.publishToolbarItems(in: window)
                 self.applyNativeCommands()
+                ToolbarAddressAllocation.update(in: window)
             }
             self.centerTitlebarControls()
         }
@@ -478,6 +488,7 @@ final class WindowChromeView: NSView {
                 customizationAdapter = ToolbarCustomizationAdapter(source: delegate)
                 toolbar.delegate = customizationAdapter
             }
+            customizationAdapter?.replaceNonrepeatableDividers(in: toolbar)
         }
         guard observedToolbar !== window.toolbar else { return }
         toolbarObservations.removeAll()
@@ -664,5 +675,22 @@ private final class TitlebarTabHostingView: NSHostingView<AnyView> {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(superview?.bounds.size ?? newSize)
+    }
+}
+
+extension BrowserChrome {
+    /// Laid over the window's glass in a private window, so it reads as different at a glance.
+    static let privateTint = Color(red: 0.11, green: 0.08, blue: 0.20).opacity(0.72)
+}
+
+extension View {
+    /// A private window's tabs, toolbar, and new tab page are always dark. Its pages keep the system appearance.
+    @ViewBuilder
+    func privateChrome(_ isPrivate: Bool) -> some View {
+        if isPrivate {
+            environment(\.colorScheme, .dark)
+        } else {
+            self
+        }
     }
 }

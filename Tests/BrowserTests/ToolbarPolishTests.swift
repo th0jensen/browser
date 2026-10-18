@@ -72,6 +72,8 @@ final class ToolbarPolishTests: XCTestCase {
     }
 
     func testSavedNativeLayoutSettlesAndWindowVisibilityStaysIndependent() async throws {
+        await ContentBlocker.shared.prepare()
+        await BrowserExtensions.shared.restore()
         let suite = "PersistedNativeToolbar-\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -84,6 +86,9 @@ final class ToolbarPolishTests: XCTestCase {
         for _ in 0..<2 {
             let browser = BrowserModel(chromePreferences: WindowChromePreferences(defaults: defaults))
             browser.chromePreferences.autoHideToolbar = false
+            // This test exercises chrome visibility with page focus, independently of new-tab editing.
+            browser.activeTab?.isNewTab = false
+            browser.consumedAddressFocusRequest = browser.addressFocusRequest
             let window = ToolbarPolishWindow(contentRect: .init(x: 0, y: 0, width: 1000, height: 700),
                                   styleMask: [.titled, .closable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
@@ -93,6 +98,12 @@ final class ToolbarPolishTests: XCTestCase {
             window.orderBack(nil)
         }
         try await waitUntil { windows.allSatisfy { $0.toolbar?.itemIdentifiers.map(\.rawValue) == chosen } }
+        try await waitUntil { models.allSatisfy { $0.chromeHover != nil && $0.window != nil } }
+        for (window, browser) in zip(windows, models) {
+            window.makeFirstResponder(browser.activeTab?.webView)
+            browser.chromeHover?.dismissAddressFocus()
+        }
+        try await waitUntil { models.allSatisfy { $0.chromeHover?.addressIsFocused == false } }
         let firstToolbar = try XCTUnwrap(windows[0].toolbar)
         let secondToolbar = try XCTUnwrap(windows[1].toolbar)
         XCTAssertNotEqual(firstToolbar.identifier, secondToolbar.identifier)
@@ -227,40 +238,92 @@ final class ToolbarPolishTests: XCTestCase {
         XCTAssertEqual(adapter.toolbarAllowedItemIdentifiers(next).filter { $0.rawValue.hasPrefix("divider") }.count, 1)
     }
 
+    func testAdapterReplacesExistingNonrepeatableDividersBeforeRestoringRepeatedCopies() throws {
+        let source = PolishToolbarDelegate()
+        let toolbar = NSToolbar(identifier: "BrowserToolbar.tests.ExistingDivider.\(UUID())")
+        toolbar.delegate = source
+        let original: [NSToolbarItem.Identifier] = [.init("back"), .init("divider0"), .init("address"), .init("settings")]
+        toolbar.itemIdentifiers = original
+        XCTAssertFalse(try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == "divider0" }).allowsDuplicatesInToolbar)
+
+        let adapter = ToolbarCustomizationAdapter(source: source)
+        toolbar.delegate = adapter
+        adapter.replaceNonrepeatableDividers(in: toolbar)
+        XCTAssertEqual(toolbar.itemIdentifiers, original, "Upgrading the divider must preserve item order")
+        XCTAssertTrue(try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == "divider0" }).allowsDuplicatesInToolbar)
+
+        toolbar.itemIdentifiers = original + [.init("divider0")]
+        XCTAssertEqual(toolbar.itemIdentifiers, original + [.init("divider0")])
+        XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier.rawValue == "divider0" }.count, 2)
+        XCTAssertTrue(toolbar.items.filter { $0.itemIdentifier.rawValue == "divider0" }.allSatisfy {
+            $0.allowsDuplicatesInToolbar && $0.view?.fittingSize.width == 1
+        })
+    }
+
     func testNativePaletteUsesRealSpacesAndOneRepeatableThinDivider() async throws {
+        await ContentBlocker.shared.prepare()
+        await BrowserExtensions.shared.restore()
         let suite = "ToolbarSpaces-\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(TabLayout.vertical.rawValue, forKey: TabLayout.storageKey)
+        let chosen: [NSToolbarItem.Identifier] = [.init("back"), .space, .init("divider0"), .init("address"), .flexibleSpace, .init("settings"), .init("divider0")]
+        defaults.set(try JSONSerialization.data(withJSONObject: ["identifiers": chosen.map(\.rawValue)]), forKey: "toolbarLayout.vertical")
         let browser = BrowserModel(chromePreferences: WindowChromePreferences(defaults: defaults))
         browser.chromePreferences.autoHideToolbar = false
+        browser.activeTab?.isNewTab = false
+        browser.consumedAddressFocusRequest = browser.addressFocusRequest
         let window = ToolbarPolishWindow(contentRect: .init(x: 0, y: 0, width: 1000, height: 700),
                               styleMask: [.titled, .closable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        let host = NSHostingController(rootView: BrowserWindow(bookmarks: BookmarkStore(defaults: defaults), browser: browser).defaultAppStorage(defaults))
+        let host = NSHostingController(rootView: BrowserWindow(bookmarks: BookmarkStore(defaults: defaults), browser: browser, persistsToolbarLayout: true).defaultAppStorage(defaults))
         host.sizingOptions = .minSize
         window.contentViewController = host
         defer { window.close(); defaults.removePersistentDomain(forName: suite) }
         window.orderBack(nil)
-        try await waitUntil { window.toolbar?.delegate is ToolbarCustomizationAdapter }
+        try await waitUntil {
+            window.toolbar?.delegate is ToolbarCustomizationAdapter && window.toolbar?.itemIdentifiers == chosen
+        }
         let toolbar = try XCTUnwrap(window.toolbar)
         let allowed = try XCTUnwrap(toolbar.delegate?.toolbarAllowedItemIdentifiers?(toolbar))
         XCTAssertEqual(allowed.filter { $0 == .space }.count, 1)
         XCTAssertEqual(allowed.filter { $0 == .flexibleSpace }.count, 1)
         XCTAssertEqual(allowed.filter { $0.rawValue.hasPrefix("divider") }.count, 1)
-        toolbar.itemIdentifiers = [.init("back"), .space, .init("divider0"), .init("address"), .flexibleSpace, .init("settings"), .init("divider0")]
-        try await Task.sleep(for: .milliseconds(150))
+        // Seed the same saved configuration that a completed customization creates. Mutating only AppKit's
+        // item array bypasses that configuration and can be replaced by SwiftUI's next startup update.
         XCTAssertEqual(toolbar.itemIdentifiers.filter { $0.rawValue == "divider0" }.count, 2)
         XCTAssertTrue(toolbar.items.filter { $0.itemIdentifier.rawValue == "divider0" }.allSatisfy { $0.view?.fittingSize.width == 1 })
         XCTAssertNil(toolbar.items.first { $0.itemIdentifier == .space }?.view)
         XCTAssertNil(toolbar.items.first { $0.itemIdentifier == .flexibleSpace }?.view)
-        let address = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == "address" }?.view)
-        let settings = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier.rawValue == "settings" }?.view)
-        func gap() -> CGFloat { settings.convert(settings.bounds, to: nil).minX - address.convert(address.bounds, to: nil).maxX }
-        let narrowGap = gap()
+        func gap() -> CGFloat? {
+            // SwiftUI can replace hosting views during a resize; measure the currently attached views.
+            guard let address = toolbar.items.first(where: { $0.itemIdentifier.rawValue == "address" })?.view,
+                  let settings = toolbar.items.first(where: { $0.itemIdentifier.rawValue == "settings" })?.view,
+                  address.window === window, settings.window === window else { return nil }
+            return settings.convert(settings.bounds, to: nil).minX - address.convert(address.bounds, to: nil).maxX
+        }
+        func settledGap() async throws -> CGFloat {
+            var previous: CGFloat?
+            var stableSamples = 0
+            for _ in 0..<50 {
+                window.contentView?.layoutSubtreeIfNeeded()
+                if toolbar.itemIdentifiers == chosen, let current = gap() {
+                    stableSamples = previous.map { abs(current - $0) < 0.01 } == true ? stableSamples + 1 : 0
+                    if stableSamples >= 3 { return current }
+                    previous = current
+                } else { stableSamples = 0 }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTFail("Toolbar gap did not settle")
+            return try XCTUnwrap(previous)
+        }
+        let narrowGap = try await settledGap()
         window.setContentSize(NSSize(width: 1400, height: 700))
-        try await Task.sleep(for: .milliseconds(150))
-        XCTAssertGreaterThan(gap(), narrowGap + 50, "Flexible space must grow when the window grows")
-        toolbar.itemIdentifiers = [.flexibleSpace, .init("address"), .init("settings")]
+        try await waitUntil { window.frame.width == 1400 && gap().map { $0 > narrowGap + 50 } == true }
+        let wideGap = try await settledGap()
+        XCTAssertGreaterThan(wideGap, narrowGap + 50, "Flexible space must grow when the window grows")
+        let leadingSpace: [NSToolbarItem.Identifier] = [.flexibleSpace, .init("address"), .init("settings")]
+        defaults.set(try JSONSerialization.data(withJSONObject: ["identifiers": leadingSpace.map(\.rawValue)]), forKey: "toolbarLayout.vertical")
+        try await waitUntil { toolbar.itemIdentifiers == leadingSpace }
         func addressWidth() -> CGFloat { toolbar.items.first { $0.itemIdentifier.rawValue == "address" }?.view?.bounds.width ?? 0 }
         func settledAddressWidth() async throws -> CGFloat {
             var previous: CGFloat = -1

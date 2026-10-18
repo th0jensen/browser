@@ -40,6 +40,18 @@ final class BrowserTab: NSObject, Identifiable {
     private(set) var loadError: PageLoadError?
     /// Whether the failed load left the previous page behind the error, so going back shows that page.
     @ObservationIgnored private var loadErrorCoversPreviousPage = false
+    private(set) var pageZoom = 1.0
+
+    /// Whether the page has a password field, so saved passwords for its site can be offered.
+    var hasPasswordFields = false
+
+    var isFindBarVisible = false
+    var findText = ""
+    /// Whether the last search found nothing, shown in the find bar.
+    private(set) var findHasNoMatches = false
+    @ObservationIgnored private var findTask: Task<Void, Never>?
+    /// The page last added to history, so its title follows the page's and a reload isn't another visit.
+    @ObservationIgnored private var historyVisit: (id: UUID?, url: URL)?
 
     @ObservationIgnored private let pageDelegate = PageDelegate()
     @ObservationIgnored private var observations: [NSKeyValueObservation] = []
@@ -54,25 +66,31 @@ final class BrowserTab: NSObject, Identifiable {
     @ObservationIgnored private var selectionWaiters: [CheckedContinuation<Bool, Never>] = []
 
     /// Pass the configuration WebKit provides when a page opens a window, so the new page keeps its opener.
-    init(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration()) {
+    init(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), browser: BrowserModel? = nil) {
+        self.browser = browser
         super.init()
-        Self.prepareConfiguration(configuration)
+        Self.prepareConfiguration(configuration, includingExtensions: browser?.isPrivate != true)
+        if let browser { browser.preparePageConfiguration(configuration) }
         pageDelegate.tab = self
         install(WKWebView(frame: .zero, configuration: configuration))
     }
 
     /// A suspended tab for a page's saved history, such as a duplicated or reopened tab, which loads when it's selected.
-    init(url: URL?, title: String, interactionState: Any?) {
+    init(url: URL?, title: String, interactionState: Any?, browser: BrowserModel? = nil,
+         restoresVisit: Bool = false) {
+        self.browser = browser
         isNewTab = false
         self.url = url
         pageTitle = title
         suspendedState = interactionState
-        favicon = FaviconStore.cachedIcon(for: url)
+        if restoresVisit { historyVisit = url.map { (nil, $0) } }
+        favicon = browser?.isPrivate == true ? nil : FaviconStore.cachedIcon(for: url)
         faviconHost = url?.host()
         super.init()
         pageDelegate.tab = self
-        updateFavicon()
     }
+
+    func didAttachToBrowser() { updateFavicon() }
 
     var isSuspended: Bool {
         webView == nil
@@ -95,11 +113,14 @@ final class BrowserTab: NSObject, Identifiable {
         contentView.addSubview(webView)
         webView.navigationDelegate = pageDelegate
         webView.uiDelegate = pageDelegate
+        ContentBlocker.shared.attach(webView.configuration.userContentController)
         self.webView = webView
         PagePaintObserver.shared.install(in: webView, tab: self)
         PageAppearance.shared.install(in: webView)
-        LinkPreviewController.shared.install(in: webView, tab: self)
-        BrowserExtensions.shared.updateRules(in: webView)
+        if browser?.isPrivate != true {
+            LinkPreviewController.shared.install(in: webView, tab: self)
+            BrowserExtensions.shared.updateRules(in: webView)
+        }
 
         let options: NSKeyValueObservingOptions = isRestoring ? [] : .initial
         observe(webView, \.url, options, updatesHistory: true) { tab, webView in
@@ -112,6 +133,7 @@ final class BrowserTab: NSObject, Identifiable {
         }
         observe(webView, \.title, options) {
             $0.pageTitle = $1.title ?? ""
+            $0.updateVisitTitle()
             if $0.browser?.activeTabID == $0.id { $0.browser?.updateWindowTitle() }
             BrowserExtensions.shared.didChange(.title, for: $0)
         }
@@ -129,6 +151,7 @@ final class BrowserTab: NSObject, Identifiable {
         observe(webView, \.canGoBack, options, updatesHistory: true) { $0.canGoBack = $1.canGoBack }
         observe(webView, \.canGoForward, options, updatesHistory: true) { $0.canGoForward = $1.canGoForward }
         observe(webView, \.hasOnlySecureContent, options) { $0.hasOnlySecureContent = $1.hasOnlySecureContent }
+        observe(webView, \.pageZoom, options) { $0.pageZoom = $1.pageZoom }
     }
 
     /// Releases the web view, and with it the page's memory, keeping what the tab strip shows and the state to restore.
@@ -156,14 +179,14 @@ final class BrowserTab: NSObject, Identifiable {
     /// A pop-up gets a fresh configuration too, since its tie to the opener can't be restored.
     func restore() {
         guard isSuspended else { return }
-        let context = url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
+        let context = browser?.isPrivate == true ? nil : url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
         extensionOrigin = context?.baseURL
-        let webView = WKWebView(frame: .zero, configuration: context?.webViewConfiguration ?? Self.makeConfiguration())
+        let webView = WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url) ?? context?.webViewConfiguration ?? Self.makeConfiguration())
         install(webView, isRestoring: true)
         if let suspendedState {
             webView.interactionState = suspendedState
         } else if let url {
-            webView.load(URLRequest(url: url))
+            Self.load(url, in: webView)
         }
         suspendedState = nil
     }
@@ -185,6 +208,18 @@ final class BrowserTab: NSObject, Identifiable {
         return await withCheckedContinuation { selectionWaiters.append($0) }
     }
 
+    /// Shows a panel as a sheet on the page's window. A background tab's panel waits until the tab is selected,
+    /// so a page can't take over the window, and is dismissed if the tab closes first.
+    func present(_ alert: NSAlert, in webView: WKWebView? = nil) async -> NSApplication.ModalResponse? {
+        guard let webView = webView ?? self.webView, await waitUntilSelected() else { return nil }
+        // The selected tab's page joins the window on SwiftUI's next update.
+        for _ in 0..<20 where webView.window == nil {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard let window = webView.window else { return nil }
+        return await alert.beginSheetModal(for: window)
+    }
+
     func didBecomeSelected() {
         resumeSelectionWaiters(true)
     }
@@ -204,22 +239,26 @@ final class BrowserTab: NSObject, Identifiable {
         await webView?.requestMediaPlaybackState() == .playing
     }
 
-    static func makeConfiguration() -> WKWebViewConfiguration {
+    static func makeConfiguration(includingExtensions: Bool = true) -> WKWebViewConfiguration {
         let configuration = WKWebViewConfiguration()
-        prepareConfiguration(configuration)
+        configuration.websiteDataStore = BrowserProfile.websiteDataStore
+        prepareConfiguration(configuration, includingExtensions: includingExtensions)
         return configuration
     }
 
     /// Apply browser settings to WebKit-provided pop-up and extension configurations as well as ordinary tabs.
     /// Keep the supplied process pool, data store and content controller so opener and extension messaging survive.
-    private static func prepareConfiguration(_ configuration: WKWebViewConfiguration) {
+    private static func prepareConfiguration(_ configuration: WKWebViewConfiguration, includingExtensions: Bool = true) {
         applyBrowserPreferences(to: configuration)
-        BrowserExtensions.shared.configure(configuration)
+        if !includingExtensions, configuration.webExtensionController != nil {
+            configuration.webExtensionController = nil
+            configuration.userContentController = WKUserContentController()
+        }
+        if includingExtensions { BrowserExtensions.shared.configure(configuration) }
     }
 
     /// Also used for extension background pages, so network requests keep the same browser identity.
     static func applyBrowserPreferences(to configuration: WKWebViewConfiguration) {
-        configuration.websiteDataStore = BrowserProfile.websiteDataStore
         configuration.applicationNameForUserAgent = safariApplicationName
         configuration.preferences.isElementFullscreenEnabled = true
         configuration.preferences.isTextInteractionEnabled = true
@@ -257,6 +296,7 @@ final class BrowserTab: NSObject, Identifiable {
         let forward = list.forwardList
         if backList != back { backList = back }
         if forwardList != forward { forwardList = forward }
+        if webView?.isLoading == false { recordVisit() }
     }
 
     var title: String {
@@ -284,18 +324,27 @@ final class BrowserTab: NSObject, Identifiable {
         restore()
         let controller = BrowserExtensions.shared.controller
         let oldContext = extensionOrigin.flatMap { controller.extensionContext(for: $0) }
-        let newContext = controller.extensionContext(for: url)
+        let newContext = browser?.isPrivate == true ? nil : controller.extensionContext(for: url)
         if oldContext !== newContext {
             // WebKit forbids ordinary web pages in an extension-owned configuration, and vice versa.
             suspend()
             suspendedState = nil
-            install(WKWebView(frame: .zero, configuration: newContext?.webViewConfiguration ?? Self.makeConfiguration()))
+            install(WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url) ?? newContext?.webViewConfiguration ?? Self.makeConfiguration()))
         }
         extensionOrigin = newContext?.baseURL
         self.url = url
         updateFavicon()
         pageDelegate.isLoadingFromBrowser = true
-        webView?.load(URLRequest(url: url))
+        if let webView { Self.load(url, in: webView) }
+    }
+
+    /// A local file, such as an HTML file opened from the Finder, may only read itself.
+    private static func load(_ url: URL, in webView: WKWebView) {
+        if url.isFileURL {
+            webView.loadFileURL(url, allowingReadAccessTo: url)
+        } else {
+            webView.load(URLRequest(url: url))
+        }
     }
 
     func reload() {
@@ -317,6 +366,103 @@ final class BrowserTab: NSObject, Identifiable {
         }
     }
 
+    /// A page has started to show in the tab: it gets its site's zoom, and joins history.
+    func didCommitNavigation() {
+        clearLoadError()
+        findHasNoMatches = false
+        hasPasswordFields = false
+        applyZoom()
+        recordVisit()
+    }
+
+    /// Adds the page shown to history, unless it's the same page as before, ignoring the part after `#`.
+    /// Only committed web pages count, so error pages and pop-ups that never loaded are left out.
+    private func recordVisit() {
+        guard let webView, let url = webView.url, loadError == nil,
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              webView.backForwardList.currentItem?.url == url,
+              historyVisit.map({ Self.withoutFragment($0.url) != Self.withoutFragment(url) }) ?? true else { return }
+        historyVisit = (browser?.history?.recordVisit(to: url, title: webView.title ?? ""), url)
+    }
+
+    private func updateVisitTitle() {
+        guard let historyVisit, let id = historyVisit.id, url == historyVisit.url, !pageTitle.isEmpty else { return }
+        browser?.history?.updateTitle(of: id, to: pageTitle)
+    }
+
+    private static func withoutFragment(_ url: URL) -> URL {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.fragment = nil
+        return components?.url ?? url
+    }
+
+    // MARK: Zoom
+
+    private func applyZoom() {
+        let level = browser?.zoomLevels.level(for: host) ?? 1
+        pageZoom = level
+        if let webView, webView.pageZoom != level { webView.pageZoom = level }
+    }
+
+    /// Zooms the page, and remembers the level for its site.
+    func setZoom(_ level: Double) {
+        guard let webView else { return }
+        webView.pageZoom = level
+        pageZoom = level
+        browser?.zoomLevels.setLevel(level, for: host)
+    }
+
+    // MARK: Find
+
+    /// Searches from the start of the current match, so typing more of a word keeps the match it's on.
+    func findAsYouType() {
+        findTask?.cancel()
+        guard let webView, !findText.isEmpty else {
+            findHasNoMatches = false
+            return
+        }
+        findTask = Task { [weak self] in
+            let script = "(() => { const selection = getSelection(); if (selection.rangeCount) selection.collapseToStart(); })()"
+            _ = try? await webView.evaluateJavaScript(script, contentWorld: .defaultClient)
+            guard !Task.isCancelled else { return }
+            await self?.runFind(backwards: false)
+        }
+    }
+
+    func find(backwards: Bool = false) {
+        findTask?.cancel()
+        findTask = Task { [weak self] in await self?.runFind(backwards: backwards) }
+    }
+
+    /// WebKit selects and highlights the match it finds, wrapping around the page.
+    private func runFind(backwards: Bool) async {
+        guard let webView, !findText.isEmpty else { return }
+        let text = findText
+        if browser?.isPrivate != true {
+            let pasteboard = NSPasteboard(name: .find)
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+        }
+        let configuration = WKFindConfiguration()
+        configuration.backwards = backwards
+        configuration.caseSensitive = false
+        configuration.wraps = true
+        let result = try? await webView.find(text, configuration: configuration)
+        guard !Task.isCancelled, findText == text else { return }
+        findHasNoMatches = result?.matchFound != true
+    }
+
+    func selectedText() async -> String? {
+        guard let webView else { return nil }
+        return try? await webView.evaluateJavaScript("getSelection().toString()", contentWorld: .defaultClient) as? String
+    }
+
+    /// Gives the page keyboard focus.
+    func focusPage() {
+        guard let webView, let window = webView.window else { return }
+        window.makeFirstResponder(webView)
+    }
+
     func showLoadError(_ error: PageLoadError, coversPreviousPage: Bool) {
         loadError = error
         loadErrorCoversPreviousPage = coversPreviousPage
@@ -335,7 +481,7 @@ final class BrowserTab: NSObject, Identifiable {
         guard let webView else { return }
         pageDelegate.isLoadingFromBrowser = true
         if let url = loadError?.url {
-            webView.load(URLRequest(url: url))
+            Self.load(url, in: webView)
         } else {
             webView.reload()
         }
@@ -389,11 +535,12 @@ final class BrowserTab: NSObject, Identifiable {
         }
         if faviconHost != host {
             faviconHost = host
-            favicon = FaviconStore.cachedIcon(for: url)
+            favicon = browser?.isPrivate == true ? nil : FaviconStore.cachedIcon(for: url)
         }
+        let remember = browser?.isPrivate != true
         let needsSiteIcon = favicon == nil
         faviconTask = Task { [weak self] in
-            if needsSiteIcon, let icon = await FaviconStore.icon(for: url) {
+            if needsSiteIcon, let icon = await FaviconStore.icon(for: url, remember: remember) {
                 guard !Task.isCancelled, self?.url == url else { return }
                 self?.favicon = icon
             }
@@ -402,7 +549,8 @@ final class BrowserTab: NSObject, Identifiable {
             try? await Task.sleep(for: .milliseconds(300))
             guard let self, !Task.isCancelled, let webView, !webView.isLoading, webView.url == url else { return }
             let candidates = await FaviconStore.candidates(in: webView)
-            guard let icon = await FaviconStore.icon(forPage: url, candidates: candidates),
+            guard let icon = await FaviconStore.icon(forPage: url, candidates: candidates,
+                                                     remember: !(browser?.isPrivate ?? false)),
                   !Task.isCancelled, self.url == url else { return }
             favicon = icon
         }

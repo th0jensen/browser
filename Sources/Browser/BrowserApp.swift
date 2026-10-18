@@ -1,8 +1,14 @@
+import AppKit
 import SwiftUI
 import Darwin
 
 @main
 struct BrowserApp: App {
+    static let windowID = "browser"
+    static let privateWindowID = "private"
+    @State private var history: HistoryStore
+    @State private var session: SessionStore
+    @State private var browsingData: BrowsingData
     @NSApplicationDelegateAdaptor(BrowserApplicationDelegate.self) private var applicationDelegate
     @State private var bookmarks = BookmarkStore()
     @State private var downloads = DownloadManager()
@@ -17,30 +23,52 @@ struct BrowserApp: App {
                 exit(1)
             }
         }
+        let history = HistoryStore(file: BrowserProfile.isTesting ? nil : .applicationSupport(named: "History.plist"))
+        let session = SessionStore(file: BrowserProfile.isTesting ? nil : .applicationSupport(named: "Session.plist"),
+                                   restoresWindows: SessionPreferences.restoresWindows)
+        _history = State(initialValue: history)
+        _session = State(initialValue: session)
+        _browsingData = State(initialValue: BrowsingData(history: history, session: session))
     }
 
     var body: some Scene {
-        WindowGroup {
-            BrowserWindow(bookmarks: bookmarks, downloads: downloads)
+        WindowGroup(id: Self.windowID) {
+            BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: history, session: session)
+                .environment(browsingData)
                 .modifier(ScrollbarVisibility())
                 .frame(minWidth: 680, minHeight: 440)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    BrowserSessionStore.shared.flush()
+                    session.saveBeforeQuitting()
                 }
         }
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
+        .restorationBehavior(.disabled)
         .windowToolbarLabelStyle($toolbarLabelStyle)
         .commands {
             ToolbarCommands()
-            BrowserCommands(bookmarks: bookmarks)
+            BrowserCommands(bookmarks: bookmarks, history: history, session: session, updater: .shared)
         }
-        Settings { BrowserSettings() }
+        WindowGroup("Private Window", id: Self.privateWindowID) {
+            BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: nil, session: nil, isPrivate: true)
+                .modifier(ScrollbarVisibility())
+                .environment(browsingData)
+                .frame(minWidth: 680, minHeight: 440)
+        }
+        .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
+        .restorationBehavior(.disabled)
+        .windowToolbarLabelStyle($toolbarLabelStyle)
+        Settings { BrowserSettings(browsingData: browsingData) }
             .windowStyle(.hiddenTitleBar)
     }
 }
 
 private final class BrowserApplicationDelegate: NSObject, NSApplicationDelegate {
+    func application(_ application: NSApplication, open urls: [URL]) {
+        ExternalURLRouter.shared.open(urls)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Both build variants share a bundle identity. Use this bundle's icon for
         // the running app rather than a cached icon from the other variant.
@@ -64,7 +92,11 @@ extension FocusedValues {
 
 private struct BrowserCommands: Commands {
     let bookmarks: BookmarkStore
+    let history: HistoryStore
+    let session: SessionStore
+    let updater: AppUpdater
     @FocusedValue(\.browserModel) private var browser
+    @Environment(\.openWindow) private var openWindow
     @AppStorage(BookmarksBarVisibility.storageKey) private var bookmarksBarVisibility = BookmarksBarVisibility.always
     private var tabLayout: TabLayout {
         get { chrome.tabLayout }
@@ -81,12 +113,27 @@ private struct BrowserCommands: Commands {
     }
 
     private var bookmarkableTab: BrowserTab? {
-        guard let tab = browser?.activeTab, !tab.isNewTab, tab.url != nil else { return nil }
+        guard let tab = browser?.focusedPage, !tab.isNewTab, tab.url != nil else { return nil }
+        return tab
+    }
+
+    private var pageTab: BrowserTab? {
+        guard let tab = browser?.focusedPage, !tab.isNewTab else { return nil }
         return tab
     }
 
     var body: some Commands {
+        if updater.isAvailable {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
+            }
+        }
         CommandGroup(replacing: .newItem) {
+            Button("New Window") { openWindow(id: BrowserApp.windowID) }
+                .keyboardShortcut("n", modifiers: .command)
+            Button("New Private Window") { openWindow(id: BrowserApp.privateWindowID) }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
             Button("New Tab") { browser?.addTab() }
                 .keyboardShortcut("t", modifiers: .command)
             Button("Reopen Closed Tab") { browser?.reopenClosedTab() }
@@ -105,6 +152,35 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.command, .shift])
                 .disabled(browser?.activeTab?.isNewTab != false)
         }
+        CommandGroup(replacing: .printItem) {
+            Button("Print…") { browser?.printActivePage() }
+                .keyboardShortcut("p", modifiers: .command)
+                .disabled(pageTab?.webView == nil)
+        }
+        CommandGroup(replacing: .textEditing) {
+            Menu("Find") {
+                Button("Find…") { browser?.showFindBar() }
+                    .keyboardShortcut("f", modifiers: .command)
+                Button("Find Next") { browser?.findNext() }
+                    .keyboardShortcut("g", modifiers: .command)
+                Button("Find Previous") { browser?.findNext(backwards: true) }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                Button("Use Selection for Find") { browser?.useSelectionForFind() }
+                    .keyboardShortcut("e", modifiers: .command)
+            }
+            .disabled(pageTab == nil)
+            // Replacing the group removes these too, so they're sent to the page or text field as AppKit would.
+            Menu("Spelling and Grammar") {
+                Button("Show Spelling and Grammar") { send(#selector(NSText.showGuessPanel(_:))) }
+                    .keyboardShortcut(":", modifiers: .command)
+                Button("Check Document Now") { send(#selector(NSText.checkSpelling(_:))) }
+                    .keyboardShortcut(";", modifiers: .command)
+            }
+            Menu("Speech") {
+                Button("Start Speaking") { send(#selector(NSTextView.startSpeaking(_:))) }
+                Button("Stop Speaking") { send(#selector(NSTextView.stopSpeaking(_:))) }
+            }
+        }
         CommandMenu("Tabs") {
             Button("Add Right Split") {
                 guard let browser, let tab = browser.activeTab else { return }
@@ -115,7 +191,7 @@ private struct BrowserCommands: Commands {
                     browser.requestAddressFocus()
                 }
             }
-            .keyboardShortcut("+", modifiers: [.command, .shift])
+            .keyboardShortcut("+", modifiers: [.command, .option])
             .disabled(browser == nil || (browser?.activeSplit?.tabIDs.count ?? 1) >= SplitTabGroup.limit)
             if let browser, let tab = browser.activeTab, browser.activeSplit != nil {
                 SplitTabMenu(browser: browser, tab: tab)
@@ -179,13 +255,19 @@ private struct BrowserCommands: Commands {
             Button("Open Location") { browser?.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
             Button("Toggle Address Bar") { browser?.toggleAddressFocus() }
-                .keyboardShortcut("g", modifiers: .command)
+                .keyboardShortcut("l", modifiers: [.command, .option])
             Button("Reload Page") { browser?.reload() }
                 .keyboardShortcut("r", modifiers: .command)
-            Button("Back") { browser?.goBack() }
-                .keyboardShortcut("[", modifiers: .command)
-            Button("Forward") { browser?.goForward() }
-                .keyboardShortcut("]", modifiers: .command)
+            Divider()
+            Button("Actual Size") { browser?.resetZoom() }
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(pageTab.map { $0.pageZoom == 1 } ?? true)
+            Button("Zoom In") { browser?.zoomIn() }
+                .keyboardShortcut("+", modifiers: .command)
+                .disabled(!(browser?.canZoom ?? false))
+            Button("Zoom Out") { browser?.zoomOut() }
+                .keyboardShortcut("-", modifiers: .command)
+                .disabled(!(browser?.canZoom ?? false))
         }
         CommandGroup(after: .sidebar) {
             Button(tabLayout == .vertical ? "Use Horizontal Tabs" : "Use Vertical Tabs") {
@@ -211,6 +293,35 @@ private struct BrowserCommands: Commands {
             .keyboardShortcut("b", modifiers: [.command, .shift])
             Divider()
         }
+        CommandMenu("History") {
+            Button("Back") { browser?.goBack() }
+                .keyboardShortcut("[", modifiers: .command)
+            Button("Forward") { browser?.goForward() }
+                .keyboardShortcut("]", modifiers: .command)
+            Divider()
+            Button("Reopen All Windows from Last Session") {
+                // A private window can't take the restored tabs.
+                for _ in 0..<session.reopenLastSession(reusing: browser?.isPrivate == true ? nil : browser) {
+                    openWindow(id: BrowserApp.windowID)
+                }
+            }
+            .disabled(session.reopenableWindows.isEmpty)
+
+            let recentVisits = history.recentVisits(limit: 15)
+            if !recentVisits.isEmpty {
+                Divider()
+                ForEach(recentVisits) { visit in
+                    Button(Self.menuTitle(visit.displayTitle)) { browser?.open(visit.url) }
+                }
+            }
+
+            Divider()
+            Button("Show All History") { browser?.isShowingHistory.toggle() }
+                .keyboardShortcut("y", modifiers: .command)
+                .disabled(browser?.history == nil)
+            Button("Clear History and Website Data…") { browser?.isShowingClearData = true }
+                .disabled(browser == nil)
+        }
         CommandMenu("Bookmarks") {
             Button(bookmarks.isBookmarked(bookmarkableTab?.url) ? "Remove Bookmark" : "Bookmark This Page") {
                 guard let tab = bookmarkableTab, let url = tab.url else { return }
@@ -231,5 +342,14 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("i", modifiers: [.command, .option])
                 .disabled(browser?.activeTab?.isNewTab != false)
         }
+    }
+
+    /// Sends an editing action to the focused page or text field.
+    private func send(_ action: Selector) {
+        NSApp.sendAction(action, to: nil, from: nil)
+    }
+
+    private static func menuTitle(_ title: String) -> String {
+        title.count > 60 ? String(title.prefix(59)) + "…" : title
     }
 }

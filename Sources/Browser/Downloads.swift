@@ -24,13 +24,19 @@ final class DownloadItem: Identifiable {
     fileprivate(set) var originalName: String?
     fileprivate(set) var namingError: String?
     fileprivate(set) var isNaming = false
+    fileprivate(set) var hasRecoverableFile = false
+    @ObservationIgnored fileprivate var allowsIntelligence = true
     @ObservationIgnored fileprivate var sourceTitle = ""
     @ObservationIgnored fileprivate var sourceURL: URL?
     @ObservationIgnored fileprivate var namingTask: Task<Void, Never>?
+    /// A chosen destination is published only after the complete file is available.
+    @ObservationIgnored fileprivate var chosenDestination: DownloadDestination?
     @ObservationIgnored fileprivate let download: WKDownload
     @ObservationIgnored fileprivate var progressObservation: NSKeyValueObservation?
     /// Asks whether a download the page started on its own may go ahead, or `nil` when the user started it.
     @ObservationIgnored fileprivate var confirmation: (@MainActor () async -> Bool)?
+    /// The window the save panel opens on, when Settings ▸ Downloads asks where to save each file.
+    @ObservationIgnored fileprivate weak var window: NSWindow?
 
     fileprivate init(download: WKDownload) {
         self.download = download
@@ -38,16 +44,22 @@ final class DownloadItem: Identifiable {
     }
 }
 
-/// Downloads from every window, saved to the Downloads folder.
+/// Downloads from every window, saved to the Downloads folder or where the user chooses.
 @MainActor
 @Observable
 final class DownloadManager: NSObject, WKDownloadDelegate {
     private(set) var items: [DownloadItem] = []
     @ObservationIgnored let directory: URL
+    @ObservationIgnored private let asksWhereToSave: @MainActor () -> Bool
+    @ObservationIgnored private let destinationChooser: (@MainActor (String, NSWindow?) async -> URL?)?
     @ObservationIgnored private let shouldTidyDownloads: @MainActor () -> Bool
     @ObservationIgnored private let suggestName: @Sendable (String, String, URL?) async throws -> String
 
     init(directory: URL = .downloadsDirectory,
+         asksWhereToSave: @escaping @MainActor () -> Bool = {
+             !BrowserProfile.isTesting && DownloadPreferences.asksWhereToSave
+         },
+         destinationChooser: (@MainActor (String, NSWindow?) async -> URL?)? = nil,
          shouldTidyDownloads: @escaping @MainActor () -> Bool = {
              !BrowserProfile.isTesting && UserDefaults.standard.bool(forKey: BrowserIntelligence.downloadsKey)
                  && BrowserIntelligence.unavailableReason == nil
@@ -56,6 +68,8 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
              try await LocalIntelligence.shared.downloadName(filename: $0, sourceTitle: $1, sourceURL: $2)
          }) {
         self.directory = directory
+        self.asksWhereToSave = asksWhereToSave
+        self.destinationChooser = destinationChooser
         self.shouldTidyDownloads = shouldTidyDownloads
         self.suggestName = suggestName
     }
@@ -73,12 +87,16 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
 
     /// Pass a confirmation for a download the user didn't start. It's asked before anything is saved,
     /// and the download disappears if it's refused.
-    func track(_ download: WKDownload, sourceTitle: String = "", sourceURL: URL? = nil, confirmation: (@MainActor () async -> Bool)? = nil) {
+    func track(_ download: WKDownload, in window: NSWindow? = nil,
+               sourceTitle: String = "", sourceURL: URL? = nil, allowsIntelligence: Bool = true,
+               confirmation: (@MainActor () async -> Bool)? = nil) {
         let item = DownloadItem(download: download)
-        if shouldTidyDownloads() { Task { await LocalIntelligence.shared.prepare(.download) } }
-        item.sourceTitle = sourceTitle
-        item.sourceURL = sourceURL
+        item.allowsIntelligence = allowsIntelligence
+        if allowsIntelligence, shouldTidyDownloads() { Task { await LocalIntelligence.shared.prepare(.download) } }
+        item.sourceTitle = allowsIntelligence ? sourceTitle : ""
+        item.sourceURL = allowsIntelligence ? sourceURL : nil
         item.confirmation = confirmation
+        item.window = window
         download.delegate = self
         item.progressObservation = download.progress.observe(\.fractionCompleted) { [weak item] progress, _ in
             let (fraction, completed, total) = (progress.fractionCompleted, progress.completedUnitCount,
@@ -96,8 +114,10 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         guard item.state == .downloading else { return }
         item.state = .cancelled
         let partialFile = item.destinationURL
+        let chosenDestination = item.chosenDestination
         item.download.cancel { _ in
-            partialFile.map { try? FileManager.default.removeItem(at: $0) }
+            if let chosenDestination { chosenDestination.discardTransfer() }
+            else { partialFile.map { try? FileManager.default.removeItem(at: $0) } }
         }
     }
 
@@ -112,7 +132,10 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
     }
 
     func clearFinished() {
-        items.filter { $0.state != .downloading }.forEach { $0.namingTask?.cancel() }
+        items.filter { $0.state != .downloading }.forEach {
+            $0.namingTask?.cancel()
+            $0.chosenDestination?.discardTransfer()
+        }
         items.removeAll { $0.state != .downloading }
     }
 
@@ -151,9 +174,14 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
             // It might have been cancelled while the user was asked.
             guard item.state == .downloading else { return nil }
         }
+        if asksWhereToSave() {
+            return await chooseDestination(for: item, suggestedFilename: suggestedFilename)
+        }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         // Downloads that are still running haven't necessarily created their files yet.
-        let reserved = Set(items.filter { $0.state == .downloading }.compactMap(\.destinationURL))
+        let reserved = Set(items.filter { $0.state == .downloading }.flatMap { item in
+            [item.destinationURL, item.chosenDestination?.selectedURL].compactMap { $0?.standardizedFileURL }
+        })
         let url = Self.uniqueURL(for: suggestedFilename, in: directory) {
             reserved.contains($0) || FileManager.default.fileExists(atPath: $0.path)
         }
@@ -162,8 +190,65 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         return url
     }
 
+    /// Asks where to save the file. Cancelling the panel cancels the download.
+    private func chooseDestination(for item: DownloadItem, suggestedFilename: String) async -> URL? {
+        let chosenURL: URL?
+        if let destinationChooser {
+            chosenURL = await destinationChooser(suggestedFilename, item.window)
+        } else {
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = (suggestedFilename as NSString).lastPathComponent
+            panel.directoryURL = directory
+            panel.canCreateDirectories = true
+            let response = if let window = item.window {
+                await panel.beginSheetModal(for: window)
+            } else {
+                await panel.begin()
+            }
+            chosenURL = response == .OK ? panel.url : nil
+        }
+        guard let url = chosenURL, item.state == .downloading else {
+            items.removeAll { $0 === item }
+            return nil
+        }
+        // Another running transfer must retain its destination even before it creates a file.
+        guard !items.contains(where: { other in
+            other !== item && other.state == .downloading
+                && (other.chosenDestination?.selectedURL ?? other.destinationURL)?.standardizedFileURL == url.standardizedFileURL
+        }) else {
+            item.state = .failed
+            item.namingError = "Another download is saving to this file."
+            return nil
+        }
+        do {
+            let destination = try DownloadDestination(selectedURL: url)
+            item.chosenDestination = destination
+            item.name = url.lastPathComponent
+            item.destinationURL = destination.transferURL
+            return destination.transferURL
+        } catch {
+            item.state = .failed
+            item.namingError = "Could not prepare the chosen destination. " + error.localizedDescription
+            return nil
+        }
+    }
+
     func downloadDidFinish(_ download: WKDownload) {
         guard let item = item(for: download) else { return }
+        if let destination = item.chosenDestination {
+            do {
+                // Quarantine the staged file before publishing it at the chosen address.
+                quarantine(destination.transferURL, from: download.originalRequest?.url)
+                try destination.publish()
+                item.destinationURL = destination.selectedURL
+            } catch {
+                item.state = .failed
+                item.hasRecoverableFile = true
+                item.namingError = "Could not save the file. The complete download is available using Show in Finder. "
+                    + error.localizedDescription
+                return
+            }
+        }
         item.state = .finished
         item.progress = 1
         if let url = item.destinationURL {
@@ -176,11 +261,12 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         guard let item = item(for: download), item.state == .downloading else { return }
         item.state = .failed
         // Without resume support, a partial file is of no use.
-        if let url = item.destinationURL { try? FileManager.default.removeItem(at: url) }
+        if let destination = item.chosenDestination { destination.discardTransfer() }
+        else if let url = item.destinationURL { try? FileManager.default.removeItem(at: url) }
     }
 
     private func tidyDownload(_ item: DownloadItem) {
-        guard shouldTidyDownloads(), let originalURL = item.destinationURL else { return }
+        guard item.allowsIntelligence, item.chosenDestination == nil, shouldTidyDownloads(), let originalURL = item.destinationURL else { return }
         let originalName = item.name
         let suggest = suggestName
         item.isNaming = true
@@ -243,5 +329,37 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         values.quarantineProperties = properties
         var url = url
         try? url.setResourceValues(values)
+    }
+}
+
+
+/// Keeps a replacement separate from the existing file until WebKit finishes. The
+/// replacement directory is on the destination's volume so final publication is atomic.
+struct DownloadDestination: Sendable {
+    let selectedURL: URL
+    let transferURL: URL
+    private let replacementDirectory: URL
+    private let replacesExistingFile: Bool
+
+    init(selectedURL: URL) throws {
+        self.selectedURL = selectedURL
+        replacesExistingFile = FileManager.default.fileExists(atPath: selectedURL.path)
+        replacementDirectory = try FileManager.default.url(for: .itemReplacementDirectory, in: .userDomainMask,
+                                                            appropriateFor: selectedURL, create: true)
+        transferURL = replacementDirectory.appending(path: selectedURL.lastPathComponent)
+    }
+
+    func publish() throws {
+        if replacesExistingFile {
+            _ = try FileManager.default.replaceItemAt(selectedURL, withItemAt: transferURL, options: .usingNewMetadataOnly)
+        } else {
+            // A file that appeared after the panel was accepted must not be overwritten.
+            try FileManager.default.moveItem(at: transferURL, to: selectedURL)
+        }
+        try? FileManager.default.removeItem(at: replacementDirectory)
+    }
+
+    func discardTransfer() {
+        try? FileManager.default.removeItem(at: replacementDirectory)
     }
 }

@@ -2,13 +2,18 @@ import SwiftUI
 import WebKit
 
 struct BrowserSettings: View {
+    let browsingData: BrowsingData
     private enum Category: String, CaseIterable, Identifiable {
-        case general = "General", appearance = "Appearance", extensions = "Extensions", intelligence = "Intelligence"
+        case general = "General", appearance = "Appearance", privacy = "Privacy", passwords = "Passwords", sites = "Site Settings", downloads = "Downloads", extensions = "Extensions", intelligence = "Intelligence"
         var id: String { rawValue }
         var symbol: String {
             switch self {
             case .general: "gearshape"
             case .appearance: "paintpalette"
+            case .privacy: "hand.raised"
+            case .passwords: "key"
+            case .sites: "globe"
+            case .downloads: "arrow.down.circle"
             case .extensions: "puzzlepiece.extension"
             case .intelligence: "sparkles"
             }
@@ -34,7 +39,8 @@ struct BrowserSettings: View {
     var body: some View {
         HStack(spacing: 0) {
             List(selection: $selection) {
-                Section("Browser") { category(.general); category(.appearance) }
+                Section("Browser") { category(.general); category(.appearance); category(.downloads) }
+                Section("Privacy and Security") { category(.privacy); category(.passwords); category(.sites) }
                 Section("Features") { category(.extensions); category(.intelligence) }
             }
             .listStyle(.sidebar)
@@ -44,12 +50,16 @@ struct BrowserSettings: View {
                 Text((selection ?? .general).rawValue)
                     .font(.system(size: 22, weight: .semibold))
                     .padding(.horizontal, 20).padding(.top, 22).padding(.bottom, 4)
-                Form {
+                Group {
                     switch selection ?? .general {
-                    case .general: general
-                    case .appearance: appearance
-                    case .extensions: installedExtensions
-                    case .intelligence: intelligence
+                    case .general: GeneralSettings(updater: .shared, additionalSettings: AnyView(general))
+                    case .appearance: Form { appearance }
+                    case .privacy: PrivacySettings(browsingData: browsingData, contentBlocker: .shared)
+                    case .passwords: PasswordSettings(passwords: .shared, passkeys: passkeys)
+                    case .sites: SiteSettings(contentBlocker: .shared, sitePermissions: .shared, zoomLevels: .shared)
+                    case .downloads: DownloadSettings()
+                    case .extensions: Form { installedExtensions }
+                    case .intelligence: Form { intelligence }
                     }
                 }
                 .formStyle(.grouped)
@@ -82,7 +92,6 @@ struct BrowserSettings: View {
             Section("Links") {
                 Toggle("Open external links from pinned tabs in Peek", isOn: $peekLinks)
             }
-            security
         }
     }
 
@@ -162,20 +171,6 @@ struct BrowserSettings: View {
                     Button("Import Extension…") { Task { await extensions.chooseImport() } }.disabled(extensions.isBusy)
                 }
             }
-        }
-    }
-
-    private var security: some View {
-        Section("Passkeys") {
-            LabeledContent("Access") {
-                Text(passkeys.status == .unavailable ? "Unavailable in this build" : passkeys.status == .authorized ? "Enabled" : passkeys.status == .denied ? "Not allowed" : "Not enabled")
-                    .foregroundStyle(.secondary)
-            }
-            if passkeys.status == .notDetermined {
-                Button("Enable Passkeys…") { Task { await passkeys.requestAccess() } }.disabled(passkeys.isRequesting)
-            }
-            if passkeys.status == .denied { Text(passkeys.status.description).font(.caption).foregroundStyle(.secondary) }
-            if passkeys.status != .unavailable { Button("Refresh Access") { passkeys.refresh() } }
         }
     }
 }
