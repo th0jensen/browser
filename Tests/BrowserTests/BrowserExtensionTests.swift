@@ -107,6 +107,116 @@ final class BrowserExtensionTests: XCTestCase {
         XCTAssertTrue(store.installed[0].isEnabled)
     }
 
+    func testNavigationPreparationLoadsKnownEnabledExtensionsBeforeApplicationDiscovery() async throws {
+        let source = try makeExtension()
+        let storage = directory.appending(path: "installed")
+        let importer = BrowserExtensions(directory: storage, persistent: false)
+        try await importer.importResources(from: source)
+        var item = try XCTUnwrap(importer.installed.first)
+        item.isEnabled = true
+        try JSONEncoder().encode([item]).write(to: storage.appending(path: "extensions.json"))
+        let fixture = try makeSafariApp()
+        let store = BrowserExtensions(directory: storage, persistent: false, applicationDirectories: [fixture.applications])
+
+        await store.prepare()
+
+        XCTAssertTrue(store.context(for: item)?.isLoaded == true)
+        XCTAssertEqual(store.installed.count, 1, "Navigation must not wait for scanning other applications")
+        await store.restore()
+        XCTAssertEqual(store.installed.count, 2)
+        XCTAssertTrue(store.context(for: item)?.isLoaded == true)
+    }
+
+    func testConcurrentLoadsShareOneRuntimeRequestAndFailedLoadsCanRetry() async throws {
+        let source = try makeExtension()
+        let storage = directory.appending(path: "installed")
+        let importer = BrowserExtensions(directory: storage, persistent: false)
+        try await importer.importResources(from: source)
+        let item = try XCTUnwrap(importer.installed.first)
+        let gate = ExtensionLoadGate()
+        defer { gate.resumeAll() }
+        var reads = 0
+        let store = BrowserExtensions(directory: storage, persistent: false, extensionReader: { url in
+            reads += 1
+            if reads == 1 { throw ExtensionFailure("Temporary read failure") }
+            let webExtension = try await WKWebExtension(resourceBaseURL: URL(filePath: url.path, directoryHint: .isDirectory))
+            await gate.pause()
+            return webExtension
+        })
+        do {
+            try await store.load(item, askPermission: false)
+            XCTFail("The failed first attempt must be reported")
+        } catch { XCTAssertEqual(error.localizedDescription, "Temporary read failure") }
+
+        let first = Task { try await store.load(item, askPermission: false) }
+        try await gate.waitUntil { gate.requests == 1 }
+        let second = Task { try await store.load(item, askPermission: false) }
+        await Task.yield()
+        XCTAssertEqual(reads, 2, "Concurrent callers must join the retry instead of reading the extension twice")
+        gate.resumeAll()
+        try await first.value
+        try await second.value
+        XCTAssertEqual(reads, 2)
+        XCTAssertTrue(store.context(for: item)?.isLoaded == true)
+        store.remove(item)
+    }
+
+    func testDisablingDuringNavigationPreparationCannotReactivateTheExtension() async throws {
+        let source = try makeExtension()
+        let storage = directory.appending(path: "installed")
+        let importer = BrowserExtensions(directory: storage, persistent: false)
+        try await importer.importResources(from: source)
+        var item = try XCTUnwrap(importer.installed.first)
+        item.isEnabled = true
+        try JSONEncoder().encode([item]).write(to: storage.appending(path: "extensions.json"))
+        let gate = ExtensionLoadGate()
+        defer { gate.resumeAll() }
+        let store = BrowserExtensions(directory: storage, persistent: false, extensionReader: { url in
+            let webExtension = try await WKWebExtension(resourceBaseURL: URL(filePath: url.path, directoryHint: .isDirectory))
+            await gate.pause()
+            return webExtension
+        })
+        let preparation = Task { await store.prepare() }
+        try await gate.waitUntil { gate.requests == 1 }
+        await store.setEnabled(item, false)
+        gate.resumeAll()
+        await preparation.value
+
+        XCTAssertFalse(try XCTUnwrap(store.installed.first).isEnabled)
+        XCTAssertNil(store.context(for: item))
+        XCTAssertNil(store.errors[item.id], "A superseded load must not publish a stale error")
+        store.remove(item)
+    }
+
+    func testRemovingDuringRuleCompilationCannotRestoreDeletedBlockingRules() async throws {
+        let source = directory.appending(path: "blocker.json")
+        try #"[{"trigger":{"url-filter":"example.com"},"action":{"type":"block"}}]"#
+            .write(to: source, atomically: true, encoding: .utf8)
+        let storage = directory.appending(path: "installed")
+        let importer = BrowserExtensions(directory: storage, persistent: false)
+        try await importer.importResources(from: source)
+        var item = try XCTUnwrap(importer.installed.first)
+        item.isEnabled = true
+        try JSONEncoder().encode([item]).write(to: storage.appending(path: "extensions.json"))
+        let gate = ExtensionLoadGate()
+        defer { gate.resumeAll() }
+        let store = BrowserExtensions(directory: storage, persistent: false, ruleListCompiler: { identifier, rules in
+            let list = try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: identifier,
+                                                                                      encodedContentRuleList: rules)
+            await gate.pause()
+            return list
+        })
+        let preparation = Task { await store.prepare() }
+        try await gate.waitUntil { gate.requests == 1 }
+        store.remove(item)
+        gate.resumeAll()
+        await preparation.value
+
+        XCTAssertTrue(store.installed.isEmpty)
+        XCTAssertNil(store.activeRuleCounts[item.id])
+        XCTAssertNil(store.errors[item.id])
+    }
+
     private func makeSafariApp() throws -> (applications: URL, plugin: URL) {
         let applications = directory.appending(path: "Applications")
         let app = applications.appending(path: "Fixture.app")
@@ -356,5 +466,36 @@ final class BrowserExtensionTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTFail("Expected advertisement display to be \(expected)")
+    }
+}
+
+@MainActor
+private final class ExtensionLoadGate {
+    private(set) var requests = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+
+    func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                throw NSError(domain: "ExtensionLoadGate", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for a suspended extension load"])
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    func pause() async {
+        requests += 1
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func resumeAll() {
+        isOpen = true
+        let current = waiters
+        waiters = []
+        current.forEach { $0.resume() }
     }
 }

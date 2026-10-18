@@ -65,7 +65,7 @@ final class BrowserSessionStore {
     }
 
     func restore(in browser: BrowserModel) {
-        guard enabled, !hasRestored, !browser.isExtensionWindow else { return }
+        guard enabled, !hasRestored, !browser.isExtensionWindow && !browser.isPrivate else { return }
         hasRestored = true
         if let data = try? Data(contentsOf: file), let session = try? JSONDecoder().decode(BrowserSessionSnapshot.self, from: data) {
             browser.restoreSession(session)
@@ -76,7 +76,7 @@ final class BrowserSessionStore {
 
     /// Focus changes invalidate even snapshots already waiting on the writer queue.
     func didFocus(_ browser: BrowserModel) {
-        guard enabled, !browser.isExtensionWindow,
+        guard enabled, !browser.isExtensionWindow && !browser.isPrivate,
               browser.window == nil || browser.window?.isKeyWindow == true else { return }
         if owner !== browser {
             saveTask?.cancel()
@@ -137,7 +137,7 @@ final class BrowserSessionStore {
     }
 
     private func canSave(_ browser: BrowserModel) -> Bool {
-        enabled && hasRestored && !browser.isExtensionWindow && owner === browser
+        enabled && hasRestored && !browser.isExtensionWindow && !browser.isPrivate && owner === browser
     }
 }
 

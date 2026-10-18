@@ -1,3 +1,4 @@
+import Synchronization
 import WebKit
 import XCTest
 @testable import Browser
@@ -7,35 +8,6 @@ final class FaviconTests: XCTestCase {
     private let page = URL(string: "https://example.com/docs/page.html")!
     /// A 1×1 PNG.
     private static let pixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-
-    func testParsesIconLinksFromTheHead() {
-        let html = """
-            <html><head>
-            <link rel="mask-icon" href="/mask.svg" color="#000">
-            <link rel="fluid-icon" href="/fluid.png">
-            <LINK REL="Shortcut Icon" HREF='favicon.ico'>
-            <link href=/icon-32.png rel=icon sizes="16x16 32x32" type="image/png">
-            <link rel="apple-touch-icon" href="//cdn.example.net/touch.png?a=1&amp;b=2">
-            <link rel="icon" type="image/svg+xml" href="https://static.example.com/icon.svg">
-            <link rel="stylesheet" href="/style.css">
-            </head><body><link rel="icon" href="/late.png"></body></html>
-            """
-
-        let candidates = FaviconCandidate.candidates(inHTML: html, baseURL: page)
-
-        XCTAssertEqual(candidates, [
-            FaviconCandidate(url: URL(string: "https://example.com/docs/favicon.ico")!),
-            FaviconCandidate(url: URL(string: "https://example.com/icon-32.png")!, sizes: [16, 32]),
-            FaviconCandidate(url: URL(string: "https://cdn.example.net/touch.png?a=1&b=2")!, isTouchIcon: true),
-        ])
-    }
-
-    func testResolvesLinksAgainstTheBaseElement() {
-        let html = #"<head><base href="https://assets.example.org/v2/"><link rel="icon" href="icons/a.png"></head>"#
-
-        XCTAssertEqual(FaviconCandidate.candidates(inHTML: html, baseURL: page).map(\.url),
-                       [URL(string: "https://assets.example.org/v2/icons/a.png")!])
-    }
 
     func testIgnoresUnsupportedSchemes() {
         XCTAssertNil(FaviconCandidate(rel: "icon", href: "javascript:alert(1)", baseURL: page))
@@ -71,8 +43,6 @@ final class FaviconTests: XCTestCase {
         XCTAssertFalse(FaviconData.isIconMIMEType("image/svg+xml"))
         XCTAssertFalse(FaviconData.isIconMIMEType("application/pdf"))
         XCTAssertFalse(FaviconData.isIconMIMEType("text/html"))
-        XCTAssertTrue(FaviconData.isPageMIMEType("text/html"))
-        XCTAssertFalse(FaviconData.isPageMIMEType("application/json"))
 
         let png = try XCTUnwrap(Data(base64Encoded: Self.pixelPNG))
         XCTAssertEqual(FaviconData.imageType(of: png), .png)
@@ -152,4 +122,126 @@ final class FaviconTests: XCTestCase {
         XCTAssertNotNil(FaviconStore.cachedIcon(for: pageURL))
         XCTAssertEqual(FaviconStore.cache.entry(forHost: "favicon-test.invalid")?.source, URL(string: iconURL))
     }
+}
+
+
+extension FaviconTests {
+    func testClearingCacheRejectsWritesFromRequestsStartedBeforeClear() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = FaviconCache(directory: directory)
+        let generation = cache.writeGeneration
+        let entry = FaviconCache.Entry(source: URL(string: "https://example.com/favicon.ico")!, data: Data([1]))
+        cache.save(entry, forHost: "example.com", generation: generation)
+        cache.removeEntries(since: .distantPast)
+        cache.save(entry, forHost: "example.com", generation: generation)
+        XCTAssertNil(cache.entry(forHost: "example.com"))
+        cache.save(entry, forHost: "example.com", generation: cache.writeGeneration)
+        XCTAssertEqual(cache.entry(forHost: "example.com"), entry)
+    }
+
+    func testPrivateDocumentIconDoesNotPopulateSharedMemoryOrDisk() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
+        let originalCache = FaviconStore.cache
+        FaviconStore.cache = FaviconCache(directory: directory)
+        defer {
+            FaviconStore.cache = originalCache
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let page = URL(string: "https://private-\(UUID().uuidString).invalid/")!
+        let icon = FaviconCandidate(url: URL(string: "data:image/png;base64,\(Self.pixelPNG)")!)
+        let image = await FaviconStore.icon(forPage: page, candidates: [icon], remember: false)
+        XCTAssertNotNil(image)
+        XCTAssertNil(FaviconStore.cachedIcon(for: page))
+        XCTAssertNil(FaviconStore.cache.entry(forHost: page.host()!))
+    }
+}
+
+private actor FaviconRequestRecorder {
+    private(set) var urls: [URL] = []
+    func record(_ url: URL) { urls.append(url) }
+}
+
+extension FaviconTests {
+    func testSpeculativeIconRequestNeverReplaysCallbackURLOrFallsBackToPage() async {
+        let callback = URL(string: "https://login.example/callback?code=single-use&state=AbC")!
+        let recorder = FaviconRequestRecorder()
+        let result: Data? = await FaviconRequests.siteIcon(for: callback) { url in
+            await recorder.record(url)
+            return nil // A missing favicon must not trigger a GET of the callback page.
+        }
+        let requests = await recorder.urls
+        XCTAssertNil(result)
+        XCTAssertEqual(requests, [URL(string: "https://login.example/favicon.ico")!])
+        XCTAssertFalse(requests.contains(callback))
+        XCTAssertNil(requests.first?.query)
+        XCTAssertNil(requests.first?.fragment)
+    }
+
+    func testLoopbackCallbackListenerIsNeverProbedForAnIcon() async {
+        let recorder = FaviconRequestRecorder()
+        let callbacks = [
+            "http://127.0.0.1:54321/?user_id=123&access_token=single-use",
+            "http://localhost:54321/callback?code=single-use",
+            "http://[::1]:54321/callback?code=single-use",
+        ]
+        for address in callbacks {
+            let result: Data? = await FaviconRequests.siteIcon(for: URL(string: address)!) { url in
+                await recorder.record(url)
+                return Data() // Model a one-shot listener: any request would consume it.
+            }
+            XCTAssertNil(result, address)
+        }
+        let requests = await recorder.urls
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testIconNetworkPolicyRejectsLoopbackRedirectDestinations() {
+        for address in [
+            "http://localhost:8765/callback", "https://localhost./callback", "http://app.localhost/callback",
+            "http://127.0.0.1:8765/", "http://127.4.5.6/", "http://127.1/", "http://2130706433/",
+            "http://0x7f000001/", "http://0177.0.0.1/", "http://0.0.0.0:8765/",
+            "http://[::1]:8765/", "http://[0:0:0:0:0:0:0:1]/", "http://[::]/",
+            "http://[::ffff:127.0.0.1]:8765/",
+        ] {
+            XCTAssertFalse(FaviconRequests.allowsNetworkRequest(to: URL(string: address)!), address)
+        }
+        for address in ["https://example.com/favicon.ico", "http://127.example.com/favicon.ico",
+                        "https://localhost.example/favicon.ico", "http://[2001:db8::1]/favicon.ico"] {
+            XCTAssertTrue(FaviconRequests.allowsNetworkRequest(to: URL(string: address)!), address)
+        }
+    }
+}
+
+
+extension FaviconTests {
+    func testURLSessionRedirectBoundaryRejectsLoopbackCallbackRequests() throws {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let icon = URL(string: "https://example.com/favicon.ico")!
+        let task = session.dataTask(with: icon)
+        let response = try XCTUnwrap(HTTPURLResponse(url: icon, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: nil))
+        let policy = FaviconRedirectPolicy()
+        for target in ["http://127.0.0.1:52815/?code=single-use", "http://localhost:52815/callback",
+                       "http://[::1]:52815/callback"] {
+            let redirect = URLRequest(url: URL(string: target)!)
+            let accepted = FaviconRedirectResult(redirect)
+            policy.urlSession(session, task: task, willPerformHTTPRedirection: response, newRequest: redirect) { request in
+                accepted.request.withLock { $0 = request }
+            }
+            XCTAssertNil(accepted.request.withLock { $0 }, target)
+        }
+        let publicRedirect = URLRequest(url: URL(string: "https://cdn.example.com/icon.png")!)
+        let accepted = FaviconRedirectResult(nil)
+        policy.urlSession(session, task: task, willPerformHTTPRedirection: response, newRequest: publicRedirect) { request in
+            accepted.request.withLock { $0 = request }
+        }
+        XCTAssertEqual(accepted.request.withLock { $0?.url }, publicRedirect.url)
+    }
+}
+
+
+private final class FaviconRedirectResult: Sendable {
+    let request: Mutex<URLRequest?>
+    init(_ request: URLRequest?) { self.request = Mutex(request) }
 }

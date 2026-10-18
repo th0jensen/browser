@@ -7,6 +7,9 @@ settings:
   base:
     SWIFT_VERSION: 6.0
     MACOSX_DEPLOYMENT_TARGET: "26.0"
+    # The release workflow sets both from the version tag and the commit count.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
 schemes:
   Browser:
     build:
@@ -18,8 +21,13 @@ schemes:
     test:
       config: Debug
       targets: [BrowserTests]
-targets:
-  Browser:
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    # The release workflow downloads Sparkle's signing tools for this same version.
+    exactVersion: 2.10.0
+targetTemplates:
+  BrowserApp:
     type: application
     platform: macOS
     sources:
@@ -28,6 +36,8 @@ targets:
         buildPhase: resources
     settings:
       base:
+        PRODUCT_NAME: Browser
+        PRODUCT_MODULE_NAME: Browser
         PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: Browser
@@ -35,14 +45,20 @@ targets:
         INFOPLIST_KEY_NSCameraUsageDescription: Websites you allow can use the camera, for example for video calls.
         INFOPLIST_KEY_NSMicrophoneUsageDescription: Websites you allow can use the microphone, for example for calls.
         ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
         ENABLE_USER_SELECTED_FILES: readwrite
         ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES
         ENABLE_FILE_ACCESS_DOWNLOADS_FOLDER: readwrite
         ENABLE_RESOURCE_ACCESS_CAMERA: YES
         ENABLE_RESOURCE_ACCESS_AUDIO_INPUT: YES
         ENABLE_RESOURCE_ACCESS_PRINTING: YES
+        # Passkeys need Apple's managed web browser entitlement and a provisioning profile that includes it (see
+        # RELEASING.md). Build with BROWSER_PASSKEYS=YES to sign with the entitlements file that adds it.
+        BROWSER_PASSKEYS: NO
+        PASSKEYS_ENTITLEMENTS_SUFFIX_YES: -Passkeys
       configs:
         Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser.debug
           PRODUCT_NAME: Browser-Debug
           PRODUCT_MODULE_NAME: Browser
           INFOPLIST_KEY_CFBundleDisplayName: Browser Debug
@@ -60,17 +76,65 @@ targets:
           STRIP_INSTALLED_PRODUCT: YES
           STRIP_STYLE: non-global
           COPY_PHASE_STRIP: YES
+targets:
+  # The Mac App Store build: the same app without Sparkle, which the store updates instead.
+  BrowserAppStore:
+    templates:
+      - BrowserApp
     info:
-      path: DerivedData/Browser-Info.plist
-      properties:
+      path: Config/BrowserAppStore-Info.plist
+      properties: &sharedInfo
         CFBundleIconFile: $(BROWSER_APP_ICON)
+        NSUserActivityTypes: [NSUserActivityTypeBrowsingWeb]
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         CFBundleURLTypes:
-          - CFBundleURLName: Web URLs
+          - CFBundleURLName: Web site URL
             CFBundleURLSchemes: [http, https]
             CFBundleTypeRole: Viewer
-        NSUserActivityTypes: [NSUserActivityTypeBrowsingWeb]
-    entitlements:
-      path: Browser.entitlements
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: HTML document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Default
+            LSItemContentTypes: [public.html]
+          - CFBundleTypeName: XHTML document
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Default
+            LSItemContentTypes: [public.xhtml]
+        # Pages may load over plain HTTP, like in any browser. The app's own connections still need HTTPS.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsInWebContent: true
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: Config/BrowserAppStore$(PASSKEYS_ENTITLEMENTS_SUFFIX_$(BROWSER_PASSKEYS)).entitlements
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) APP_STORE
+  # Distributed directly with a Developer ID, and updated with Sparkle.
+  Browser:
+    templates:
+      - BrowserApp
+    sources:
+      # Sparkle's license travels with the app that includes it.
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+    dependencies:
+      - package: Sparkle
+    info:
+      path: Config/Browser-Info.plist
+      properties:
+        <<: *sharedInfo
+        SUFeedURL: $(SPARKLE_FEED_URL)
+        SUPublicEDKey: $(SPARKLE_PUBLIC_ED_KEY)
+        SUEnableAutomaticChecks: true
+        # A sandboxed app installs updates through Sparkle's installer service.
+        SUEnableInstallerLauncherService: true
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: Config/Browser$(PASSKEYS_ENTITLEMENTS_SUFFIX_$(BROWSER_PASSKEYS)).entitlements
+        # The release workflow sets this to its own repository. Local builds do not update by default.
+        SPARKLE_FEED_URL: ""
+        # PLACEHOLDER, not a real key: replace it with the public key Sparkle's generate_keys prints (see
+        # RELEASING.md). Updates stay off until it's set; the release workflow can also pass it in.
+        SPARKLE_PUBLIC_ED_KEY: REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY
   BrowserTests:
     type: bundle.unit-test
     platform: macOS

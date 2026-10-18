@@ -139,7 +139,8 @@ private struct PeekEscapeHandler: NSViewRepresentable {
             guard window != nil else { return }
             // The native page is attached after SwiftUI's onAppear callback.
             DispatchQueue.main.async { [weak self] in
-                guard let self, let view = self.browser?.peek?.tab.webView, view.window === self.window else { return }
+                guard let self, let tab = self.browser?.peek?.tab, !tab.isFindBarVisible,
+                      let view = tab.webView, view.window === self.window else { return }
                 self.window?.makeFirstResponder(view)
             }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -147,7 +148,8 @@ private struct PeekEscapeHandler: NSViewRepresentable {
                     guard let self, self.window === event.window, self.window?.attachedSheet == nil,
                           self.browser?.peek != nil, event.keyCode == 53,
                           event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else { return false }
-                    self.browser?.dismissPeek()
+                    if self.browser?.peek?.tab.isFindBarVisible == true { self.browser?.closeFindBar() }
+                    else { self.browser?.dismissPeek() }
                     return true
                 }
                 return handled ? nil : event

@@ -59,3 +59,100 @@ final class DownloadManagerTests: XCTestCase {
         XCTAssertTrue(downloads.items.isEmpty)
     }
 }
+
+
+extension DownloadManagerTests {
+    func testChosenReplacementKeepsOriginalUntilSuccessfulPublication() throws {
+        let directory = try makeDirectory()
+        let selected = directory.appending(path: "report.txt")
+        try Data("original".utf8).write(to: selected)
+        let destination = try DownloadDestination(selectedURL: selected)
+        defer { destination.discardTransfer() }
+        try Data("complete download".utf8).write(to: destination.transferURL)
+        XCTAssertEqual(try String(contentsOf: selected, encoding: .utf8), "original")
+        try destination.publish()
+        XCTAssertEqual(try String(contentsOf: selected, encoding: .utf8), "complete download")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.transferURL.path))
+    }
+
+    func testCancellingChosenReplacementNeverDeletesOriginal() throws {
+        let directory = try makeDirectory()
+        let selected = directory.appending(path: "report.txt")
+        try Data("original".utf8).write(to: selected)
+        let destination = try DownloadDestination(selectedURL: selected)
+        try Data("partial".utf8).write(to: destination.transferURL)
+        destination.discardTransfer()
+        XCTAssertEqual(try String(contentsOf: selected, encoding: .utf8), "original")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.transferURL.path))
+    }
+
+    func testNewChosenDestinationDoesNotOverwriteFileCreatedDuringTransfer() throws {
+        let directory = try makeDirectory()
+        let selected = directory.appending(path: "report.txt")
+        let destination = try DownloadDestination(selectedURL: selected)
+        defer { destination.discardTransfer() }
+        try Data("download".utf8).write(to: destination.transferURL)
+        try Data("another file".utf8).write(to: selected)
+        XCTAssertThrowsError(try destination.publish())
+        XCTAssertEqual(try String(contentsOf: selected, encoding: .utf8), "another file")
+        XCTAssertEqual(try String(contentsOf: destination.transferURL, encoding: .utf8), "download")
+    }
+}
+
+
+private actor DownloadNameRecorder {
+    private(set) var calls = 0
+    func record() { calls += 1 }
+}
+
+extension DownloadManagerTests {
+    private func startDownload(in browser: BrowserModel) async throws {
+        browser.sitePermissions.setDecision(true, for: .downloads, on: "example.com")
+        let tab = try XCTUnwrap(browser.activeTab)
+        let view = try XCTUnwrap(tab.webView)
+        view.loadHTMLString("<title>Private source</title><a id=file download=original.txt href='data:text/plain,hello'>Get</a>",
+                            baseURL: URL(string: "https://example.com")!)
+        try await waitUntil { !tab.isLoading && tab.pageTitle == "Private source" }
+        _ = try await view.evaluateJavaScript("document.getElementById('file').click(); 0")
+        try await waitUntil { browser.downloads.items.first?.state == .finished }
+    }
+
+    func testPrivateDownloadNeverCallsIntelligenceEvenWhenNamingIsEnabled() async throws {
+        let directory = try makeDirectory()
+        let recorder = DownloadNameRecorder()
+        let downloads = DownloadManager(directory: directory, shouldTidyDownloads: { true }, suggestName: { _, _, _ in
+            await recorder.record()
+            return "Changed Name"
+        })
+        let browser = BrowserModel.makePrivate(downloads: downloads)
+        try await startDownload(in: browser)
+        let calls = await recorder.calls
+        XCTAssertEqual(calls, 0)
+        let item = try XCTUnwrap(downloads.items.first)
+        XCTAssertEqual(item.name, "original.txt")
+        XCTAssertNil(item.originalName)
+        XCTAssertFalse(item.isNaming)
+    }
+
+    func testChosenFilenameIsNotChangedByAutomaticNaming() async throws {
+        let directory = try makeDirectory()
+        let selected = directory.appending(path: "My Exact Name.txt")
+        let recorder = DownloadNameRecorder()
+        let downloads = DownloadManager(directory: directory, asksWhereToSave: { true },
+                                        destinationChooser: { _, _ in selected },
+                                        shouldTidyDownloads: { true }, suggestName: { _, _, _ in
+            await recorder.record()
+            return "Changed Name"
+        })
+        let browser = BrowserModel(downloads: downloads)
+        try await startDownload(in: browser)
+        let calls = await recorder.calls
+        XCTAssertEqual(calls, 0)
+        let item = try XCTUnwrap(downloads.items.first)
+        XCTAssertEqual(item.name, "My Exact Name.txt")
+        XCTAssertEqual(item.destinationURL, selected)
+        XCTAssertNil(item.originalName)
+        XCTAssertFalse(item.isNaming)
+        XCTAssertEqual(try String(contentsOf: selected, encoding: .utf8), "hello")
+    }
+}

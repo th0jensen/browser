@@ -96,7 +96,7 @@ extension BrowserModel {
         splits.append(group)
         activeTabID = targetID
         restoreVisibleSplit()
-        BrowserSessionStore.shared.save(self)
+        requestSessionSave()
         return true
     }
 
@@ -110,7 +110,7 @@ extension BrowserModel {
 
     func separateSplit(_ id: UUID) {
         splits.removeAll { $0.id == id }
-        BrowserSessionStore.shared.save(self)
+        requestSessionSave()
     }
 
     func removeSplitPane(_ tabID: UUID) {
@@ -121,7 +121,7 @@ extension BrowserModel {
         splits[index].tabIDs.removeAll { $0 == tabID }
         pruneSplits()
         if activeTabID == tabID { activeTabID = group.tabIDs.first { $0 != tabID } }
-        BrowserSessionStore.shared.save(self)
+        requestSessionSave()
     }
 
     func pruneSplits() {

@@ -2,3 +2,4 @@
 .build/
 DerivedData/
 Browser.xcodeproj/
+Config/*-Info.plist

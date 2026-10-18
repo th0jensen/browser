@@ -90,7 +90,7 @@ private struct LinkPreviewCard: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
                 Image(systemName: "sparkles").font(.system(size: 11))
-                Text("5-second preview").font(.system(size: 11, weight: .medium))
+                Text("5-second Preview").font(.system(size: 11, weight: .medium))
                 Spacer()
                 Text("On-device").font(.system(size: 10))
             }.foregroundStyle(.secondary)
@@ -129,7 +129,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDe
     private let controllers = NSHashTable<WKUserContentController>.weakObjects()
     private let views = NSHashTable<WKWebView>.weakObjects()
     private let tabs = NSMapTable<WKWebView, BrowserTab>.weakToWeakObjects()
-    private var enabled = UserDefaults.standard.bool(forKey: BrowserIntelligence.previewsKey)
+    private var enabled = UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey)
     private(set) var presentedPreview: LinkPreviewState?
     private let summaryProvider: @Sendable (URL) async throws -> LinkSummary
     private var settingsObserver: NSObjectProtocol?
@@ -168,7 +168,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDe
     }
 
     private func refreshSetting() {
-        setEnabled(UserDefaults.standard.bool(forKey: BrowserIntelligence.previewsKey))
+        setEnabled(UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey))
     }
 
     func setEnabled(_ next: Bool) {

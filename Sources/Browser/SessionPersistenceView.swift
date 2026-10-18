@@ -3,6 +3,7 @@ import SwiftUI
 /// Keep tab URL/title/selection observation outside the window's chrome hierarchy.
 struct SessionPersistenceView: View {
     let browser: BrowserModel
+    var session: SessionStore? = nil
     @State private var cachedSnapshot: BrowserSessionSnapshot?
 
     var body: some View {
@@ -12,8 +13,8 @@ struct SessionPersistenceView: View {
             .onChange(of: snapshot, initial: true) { _, snapshot in
                 guard cachedSnapshot != snapshot else { return }
                 cachedSnapshot = snapshot
-                BrowserSessionStore.shared.requestSave(snapshot, from: browser)
+                if !browser.isPrivate { session?.requestSave() }
             }
-            .onDisappear { BrowserSessionStore.shared.flush(browser) }
+            .onDisappear { if !browser.isPrivate { session?.requestSave() } }
     }
 }

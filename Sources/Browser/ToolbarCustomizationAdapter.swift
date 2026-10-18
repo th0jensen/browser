@@ -29,6 +29,20 @@ final class ToolbarCustomizationAdapter: NSObject, NSToolbarDelegate {
         if Self.canonical(identifier).rawValue == "divider0" { return ToolbarDividerItem(itemIdentifier: .init("divider0")) }
         return source.toolbar?(toolbar, itemForItemIdentifier: identifier, willBeInsertedIntoToolbar: inserted)
     }
+
+    /// SwiftUI may have made a nonrepeatable divider before this delegate was installed. AppKit checks
+    /// existing items before asking the delegate for another copy, so replace those items before restoring
+    /// a saved layout with repeated dividers. Remove them all first to avoid collisions between legacy IDs.
+    func replaceNonrepeatableDividers(in toolbar: NSToolbar) {
+        guard toolbar.delegate === self else { return }
+        let indices = toolbar.items.indices.filter {
+            Self.canonical(toolbar.items[$0].itemIdentifier).rawValue == "divider0"
+                && !toolbar.items[$0].allowsDuplicatesInToolbar
+        }
+        for index in indices.reversed() { toolbar.removeItem(at: index) }
+        for index in indices { toolbar.insertItem(withItemIdentifier: .init("divider0"), at: index) }
+    }
+
     static func canonical(_ identifier: NSToolbarItem.Identifier) -> NSToolbarItem.Identifier {
         identifier.rawValue.hasPrefix("divider") ? .init("divider0") : identifier
     }

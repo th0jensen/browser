@@ -1,22 +1,32 @@
 import Foundation
 import WebKit
 
-/// Both app variants use one sandbox identity; WebKit owns cookies, IndexedDB and credential storage.
+/// Debug has its own sandbox and always uses disposable browsing data, including direct app launches.
 @MainActor
 enum BrowserProfile {
-    static let bundleIdentifier = "dev.athas.browser"
+    static let bundleIdentifier = Bundle.main.bundleIdentifier ?? "dev.athas.browser"
     static let isTesting = NSClassFromString("XCTestCase") != nil
         || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
-    // Debug QA may use a disposable session without touching the shared profile.
     static let qaDirectory: URL? = {
         #if DEBUG
-        if let index = CommandLine.arguments.firstIndex(of: "--qa-profile"),
-           CommandLine.arguments.indices.contains(index + 1) {
-            return URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true)
-        }
-        #endif
+        guard !isTesting else { return nil }
+        return debugDirectory(arguments: CommandLine.arguments, applicationSupport: .applicationSupportDirectory)
+        #else
         return nil
+        #endif
     }()
+
+    #if DEBUG
+    static func debugDirectory(arguments: [String], applicationSupport: URL) -> URL {
+        if let index = arguments.firstIndex(of: "--qa-profile"), arguments.indices.contains(index + 1) {
+            let requested = URL(fileURLWithPath: arguments[index + 1], isDirectory: true).resolvingSymlinksInPath()
+            let root = applicationSupport.resolvingSymlinksInPath().path + "/"
+            if requested.path.hasPrefix(root) { return requested }
+        }
+        return applicationSupport.appending(path: bundleIdentifier, directoryHint: .isDirectory)
+            .appending(path: "QA-\(UUID())", directoryHint: .isDirectory)
+    }
+    #endif
     static let directory = qaDirectory ?? (isTesting
         ? FileManager.default.temporaryDirectory.appending(path: "BrowserTests-\(ProcessInfo.processInfo.processIdentifier)")
         : URL.applicationSupportDirectory.appending(path: bundleIdentifier, directoryHint: .isDirectory))

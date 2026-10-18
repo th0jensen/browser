@@ -19,9 +19,6 @@ final class ToolbarAlignmentView: NSView {
     weak var browserWindow: NSWindow?
     private var observers: [NSObjectProtocol] = []
     private var updateIsScheduled = false
-    private weak var sizedHost: NSView?
-    private weak var minimumWidth: NSLayoutConstraint?
-    private weak var maximumWidth: NSLayoutConstraint?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -68,44 +65,64 @@ final class ToolbarAlignmentView: NSView {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             updateIsScheduled = false
-            guard let window = browserWindow,
-                  let item = window.toolbar?.items.first(where: { item in
-                      item.itemIdentifier.rawValue == "address" && item.view.map { isDescendant(of: $0) } == true
-                  }), let host = item.view,
-                  (window.toolbar?.isVisible == false || window.toolbar?.visibleItems?.contains(item) == true) else { return }
-            if sizedHost !== host {
-                [minimumWidth, maximumWidth].compactMap { $0 }.forEach { $0.isActive = false }
-                host.translatesAutoresizingMaskIntoConstraints = false
-                host.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-                host.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-                let minimum = host.widthAnchor.constraint(greaterThanOrEqualToConstant: 160)
-                let maximum = host.widthAnchor.constraint(lessThanOrEqualToConstant: 100_000)
-                NSLayoutConstraint.activate([minimum, maximum])
-                minimumWidth = minimum
-                maximumWidth = maximum
-                sizedHost = host
-            }
-            if minimumWidth?.constant != 160 { minimumWidth?.constant = 160 }
-            let items = window.toolbar?.items ?? []
-            let flexibleCount = items.filter { $0.itemIdentifier == .flexibleSpace }.count
-            if flexibleCount > 0 {
-                let fixedWidth = items.filter { $0 !== item && $0.itemIdentifier != .flexibleSpace }.reduce(CGFloat.zero) { width, item in
-                    width + (item.itemIdentifier == .space ? 20 : (item.view?.fittingSize.width ?? 24))
-                }
-                // A flexible item may precede the address field. Its allocated
-                // position cannot be used as an input to its own next allocation.
-                let leading: CGFloat
-                if window.toolbarStyle != .expanded, let zoom = window.standardWindowButton(.zoomButton) {
-                    leading = zoom.convert(zoom.bounds, to: nil).maxX + BrowserChrome.edgeInset
-                } else { leading = BrowserChrome.edgeInset }
-                let gutters = CGFloat(max(0, items.count - 1)) * BrowserChrome.edgeInset
-                let available = max(160, window.frame.width - leading - fixedWidth - gutters - BrowserChrome.edgeInset)
-                let allocation = max(160, available / CGFloat(flexibleCount + 1))
-                if maximumWidth?.constant != allocation { maximumWidth?.constant = allocation }
-            } else {
-                if maximumWidth?.constant != 100_000 { maximumWidth?.constant = 100_000 }
-            }
+            guard let window = browserWindow else { return }
+            ToolbarAddressAllocation.update(in: window)
         }
+    }
+}
+
+
+/// The current native toolbar item owns its allocation. SwiftUI may move or replace the background marker,
+/// so both its layout notifications and the window chrome update the same allocator for this window.
+@MainActor
+final class ToolbarAddressAllocation {
+    private static let allocations = NSMapTable<NSWindow, ToolbarAddressAllocation>.weakToStrongObjects()
+    private weak var sizedHost: NSView?
+    private weak var minimumWidth: NSLayoutConstraint?
+    private weak var maximumWidth: NSLayoutConstraint?
+
+    static func update(in window: NSWindow) {
+        let allocation = allocations.object(forKey: window) ?? ToolbarAddressAllocation()
+        allocations.setObject(allocation, forKey: window)
+        allocation.apply(in: window)
+    }
+
+    private func apply(in window: NSWindow) {
+        guard let toolbar = window.toolbar,
+              let item = toolbar.items.first(where: { $0.itemIdentifier.rawValue == "address" }),
+              let host = item.view,
+              (!toolbar.isVisible || (host.window === window && toolbar.visibleItems?.contains(item) == true)) else { return }
+        if sizedHost !== host {
+            [minimumWidth, maximumWidth].compactMap { $0 }.forEach { $0.isActive = false }
+            host.translatesAutoresizingMaskIntoConstraints = false
+            host.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+            host.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let minimum = host.widthAnchor.constraint(greaterThanOrEqualToConstant: 160)
+            let maximum = host.widthAnchor.constraint(lessThanOrEqualToConstant: 100_000)
+            NSLayoutConstraint.activate([minimum, maximum])
+            minimumWidth = minimum
+            maximumWidth = maximum
+            sizedHost = host
+        }
+        let items = toolbar.items
+        let flexibleCount = items.filter { $0.itemIdentifier == .flexibleSpace }.count
+        let maximum: CGFloat
+        if flexibleCount > 0 {
+            let fixedWidth = items.filter { $0 !== item && $0.itemIdentifier != .flexibleSpace }.reduce(CGFloat.zero) { width, item in
+                width + (item.itemIdentifier == .space ? 20 : (item.view?.fittingSize.width ?? 24))
+            }
+            // A leading flexible item's allocated position cannot feed its own next allocation.
+            let leading: CGFloat
+            if window.toolbarStyle != .expanded, let zoom = window.standardWindowButton(.zoomButton) {
+                leading = zoom.convert(zoom.bounds, to: nil).maxX + BrowserChrome.edgeInset
+            } else { leading = BrowserChrome.edgeInset }
+            let gutters = CGFloat(max(0, items.count - 1)) * BrowserChrome.edgeInset
+            let available = max(160, window.frame.width - leading - fixedWidth - gutters - BrowserChrome.edgeInset)
+            maximum = max(160, available / CGFloat(flexibleCount + 1))
+        } else {
+            maximum = 100_000
+        }
+        if maximumWidth?.constant != maximum { maximumWidth?.constant = maximum }
     }
 }
 

@@ -24,6 +24,13 @@ struct InstalledExtension: Codable, Identifiable {
 @MainActor
 @Observable
 final class BrowserExtensions: NSObject {
+    typealias ExtensionReader = @MainActor (URL) async throws -> WKWebExtension
+    typealias RuleListCompiler = @MainActor (String, String) async throws -> WKContentRuleList?
+
+    private struct PendingLoad {
+        let revision: UInt64
+        let task: Task<Void, Error>
+    }
     static let shared: BrowserExtensions = {
         BrowserExtensions(persistent: !BrowserProfile.isTesting)
     }()
@@ -32,27 +39,40 @@ final class BrowserExtensions: NSObject {
     private(set) var errors: [UUID: String] = [:]
     var lastError: String?
     private(set) var isBusy = false
+    @ObservationIgnored private var activeExtensionUpdates = 0
     private(set) var actionRevision = 0
     private(set) var activeRuleCounts: [UUID: Int] = [:]
     @ObservationIgnored private var blockerIcons: [String: NSImage] = [:]
     @ObservationIgnored private var toolbarIcons: [UUID: NSImage] = [:]
     @ObservationIgnored private var contexts: [UUID: WKWebExtensionContext] = [:]
     @ObservationIgnored private var ruleLists: [UUID: WKContentRuleList] = [:]
+    @ObservationIgnored private var pendingLoads: [UUID: PendingLoad] = [:]
+    @ObservationIgnored private var loadRevisions: [UUID: UInt64] = [:]
+    @ObservationIgnored private let extensionReader: ExtensionReader?
+    @ObservationIgnored private let ruleListCompiler: RuleListCompiler
     @ObservationIgnored private var windows = NSHashTable<BrowserModel>.weakObjects()
     @ObservationIgnored private weak var focusedBrowser: BrowserModel?
     @ObservationIgnored private let directory: URL
     @ObservationIgnored private var restoration: Task<Void, Never>?
+    @ObservationIgnored private var preparation: Task<Void, Never>?
     @ObservationIgnored private let applicationDirectories: [URL]
     @ObservationIgnored private var popupPresentation: ChromePopoverPresentation?
     @ObservationIgnored private weak var popupBrowser: BrowserModel?
     @ObservationIgnored private weak var popupContext: WKWebExtensionContext?
     @ObservationIgnored private var extensionWindows: [UUID: ExtensionWindowController] = [:]
 
-    init(directory: URL? = nil, persistent: Bool = true, applicationDirectories: [URL]? = nil) {
+    init(directory: URL? = nil, persistent: Bool = true, applicationDirectories: [URL]? = nil,
+         extensionReader: ExtensionReader? = nil, ruleListCompiler: RuleListCompiler? = nil) {
         self.directory = directory ?? BrowserProfile.directory.appending(path: "Extensions", directoryHint: .isDirectory)
         self.applicationDirectories = applicationDirectories ?? (persistent && !BrowserProfile.isTesting ? DiscoveredExtension.applicationDirectories : [])
+        self.extensionReader = extensionReader
+        self.ruleListCompiler = ruleListCompiler ?? { identifier, rules in
+            try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: identifier,
+                                                                             encodedContentRuleList: rules)
+        }
         let controllerConfiguration: WKWebExtensionController.Configuration = persistent ? .default() : .nonPersistent()
         let webConfiguration = WKWebViewConfiguration()
+        webConfiguration.websiteDataStore = BrowserProfile.websiteDataStore
         BrowserTab.applyBrowserPreferences(to: webConfiguration)
         controllerConfiguration.webViewConfiguration = webConfiguration
         controllerConfiguration.defaultWebsiteDataStore = BrowserProfile.websiteDataStore
@@ -80,25 +100,45 @@ final class BrowserExtensions: NSObject {
         await task.value
     }
 
+    /// Restore known enabled extensions before navigating; application discovery can finish afterward.
+    func prepare() async {
+        if let preparation { await preparation.value; return }
+        let task = Task { await restoreEnabled() }
+        preparation = task
+        await task.value
+    }
+
     private func restoreInstalled() async {
-        isBusy = true
-        defer { isBusy = false }
+        beginExtensionUpdate()
+        defer { endExtensionUpdate() }
+        await prepare()
         await discoverApplications()
         await restoreEnabled()
     }
 
     private func restoreEnabled() async {
-        for item in installed where item.isEnabled {
-            do { try await load(item, askPermission: false); errors[item.id] = nil }
-            catch { errors[item.id] = error.localizedDescription }
+        let identifiers = installed.filter(\.isEnabled).map(\.id)
+        for identifier in identifiers {
+            // Each earlier load can suspend while Settings disables or removes later items.
+            guard let item = installed.first(where: { $0.id == identifier && $0.isEnabled }) else { continue }
+            do {
+                try await load(item, askPermission: false)
+                if installed.contains(where: { $0.id == identifier && $0.isEnabled }) { errors[identifier] = nil }
+            } catch is CancellationError {
+                // A newer user choice owns this extension's runtime and error state.
+            } catch {
+                if installed.contains(where: { $0.id == identifier && $0.isEnabled }) {
+                    errors[identifier] = error.localizedDescription
+                }
+            }
         }
     }
 
     func refreshInstalledApplications() async {
         await restore()
         guard !isBusy else { return }
-        isBusy = true
-        defer { isBusy = false }
+        beginExtensionUpdate()
+        defer { endExtensionUpdate() }
         await discoverApplications()
         await restoreEnabled()
     }
@@ -205,7 +245,7 @@ final class BrowserExtensions: NSObject {
     }
 
     func register(_ browser: BrowserModel) {
-        guard !windows.contains(browser) else { return }
+        guard !browser.isPrivate, !windows.contains(browser) else { return }
         windows.add(browser)
         controller.didOpenWindow(browser)
         browser.tabs.forEach {
@@ -258,6 +298,16 @@ final class BrowserExtensions: NSObject {
         try JSONEncoder().encode(installed).write(to: directory.appending(path: "extensions.json"), options: .atomic)
     }
 
+    private func beginExtensionUpdate() {
+        activeExtensionUpdates += 1
+        isBusy = true
+    }
+
+    private func endExtensionUpdate() {
+        activeExtensionUpdates -= 1
+        isBusy = activeExtensionUpdates > 0
+    }
+
     func chooseImport() async {
         let panel = NSOpenPanel()
         panel.title = "Import Browser Extensions"
@@ -267,8 +317,8 @@ final class BrowserExtensions: NSObject {
         panel.allowsMultipleSelection = true
         panel.directoryURL = URL(filePath: "/Applications")
         guard await panel.begin() == .OK else { return }
-        isBusy = true
-        defer { isBusy = false }
+        beginExtensionUpdate()
+        defer { endExtensionUpdate() }
         for url in panel.urls {
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
@@ -316,6 +366,7 @@ final class BrowserExtensions: NSObject {
     }
 
     private func readWebExtension(at url: URL) async throws -> WKWebExtension {
+        if let extensionReader { return try await extensionReader(url) }
         if url.pathExtension == "appex", let bundle = Bundle(url: url) {
             return try await WKWebExtension(appExtensionBundle: bundle)
         }
@@ -368,9 +419,10 @@ final class BrowserExtensions: NSObject {
     }
 
     func setEnabled(_ item: InstalledExtension, _ enabled: Bool) async {
-        guard !isBusy else { return }
-        isBusy = true
-        defer { isBusy = false }
+        // Disabling must invalidate an in-flight restoration or permission request immediately.
+        guard !enabled || !isBusy else { return }
+        if enabled { beginExtensionUpdate() }
+        defer { if enabled { endExtensionUpdate() } }
         do {
             if enabled { try await load(item, askPermission: true) }
             else { try unload(item) }
@@ -378,10 +430,38 @@ final class BrowserExtensions: NSObject {
             installed[index].isEnabled = enabled
             try persist()
             errors[item.id] = nil
-        } catch { errors[item.id] = error.localizedDescription }
+        } catch is CancellationError {
+            // A disable/remove superseded this request.
+        } catch {
+            if installed.contains(where: { $0.id == item.id }) { errors[item.id] = error.localizedDescription }
+        }
     }
 
     func load(_ item: InstalledExtension, askPermission: Bool) async throws {
+        guard installed.contains(where: { $0.id == item.id }) else { throw CancellationError() }
+        if let pending = pendingLoads[item.id] { return try await pending.task.value }
+        let revision = loadRevisions[item.id, default: 0]
+        let task = Task { try await self.loadRuntime(item, askPermission: askPermission, revision: revision) }
+        pendingLoads[item.id] = PendingLoad(revision: revision, task: task)
+        defer {
+            if pendingLoads[item.id]?.revision == revision { pendingLoads[item.id] = nil }
+        }
+        try await task.value
+    }
+
+    private func validateLoad(_ identifier: UUID, revision: UInt64) throws {
+        try Task.checkCancellation()
+        guard loadRevisions[identifier, default: 0] == revision,
+              installed.contains(where: { $0.id == identifier }) else { throw CancellationError() }
+    }
+
+    private func invalidateLoad(_ identifier: UUID) {
+        loadRevisions[identifier, default: 0] &+= 1
+        pendingLoads.removeValue(forKey: identifier)?.task.cancel()
+    }
+
+    private func loadRuntime(_ item: InstalledExtension, askPermission: Bool, revision: UInt64) async throws {
+        try validateLoad(item.id, revision: revision)
         let resource = directory.appending(path: item.id.uuidString).appending(path: item.filename)
         switch item.kind {
         case .webExtension:
@@ -390,6 +470,7 @@ final class BrowserExtensions: NSObject {
                 throw ExtensionFailure("This extension requires Safari’s native companion messaging, which Browser cannot host. Import its content-blocker JSON rules instead, when available.")
             }
             let webExtension = try await readWebExtension(at: resource)
+            try validateLoad(item.id, revision: revision)
             if askPermission {
                 let permissions = webExtension.requestedPermissions.map(\.rawValue).sorted()
                 let sites = webExtension.allRequestedMatchPatterns.map(\.string).sorted()
@@ -397,6 +478,7 @@ final class BrowserExtensions: NSObject {
                                     + (permissions + sites).joined(separator: "\n")) else {
                     throw ExtensionFailure("Extension access was not allowed.")
                 }
+                try validateLoad(item.id, revision: revision)
             }
             let context = WKWebExtensionContext(for: webExtension)
             context.uniqueIdentifier = item.id.uuidString
@@ -414,8 +496,8 @@ final class BrowserExtensions: NSObject {
             guard count > 0 else {
                 throw ExtensionFailure("This category contains only a placeholder, with no usable blocking rules. Its Safari companion must provide the real list; it is not active in Browser.")
             }
-            let list = try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: item.id.uuidString,
-                                                                                       encodedContentRuleList: text)
+            let list = try await ruleListCompiler(item.id.uuidString, text)
+            try validateLoad(item.id, revision: revision)
             guard let list else { throw ExtensionFailure("WebKit did not compile the content-blocker rules.") }
             ruleLists[item.id] = list
             activeRuleCounts[item.id] = count
@@ -427,6 +509,7 @@ final class BrowserExtensions: NSObject {
     }
 
     private func unload(_ item: InstalledExtension) throws {
+        invalidateLoad(item.id)
         if let context = contexts[item.id] {
             if popupContext === context { closePopup() }
             try controller.unload(context)
