@@ -58,7 +58,9 @@ final class ToolbarAlignmentView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func scheduleUpdate() {
-        guard !updateIsScheduled, browserWindow?.toolbar?.isVisible == true else { return }
+        // Hidden chrome still needs its sizing constraints prepared when the
+        // sidebar configuration or window size changes, before the next reveal.
+        guard !updateIsScheduled, browserWindow?.toolbar != nil else { return }
         updateIsScheduled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -86,10 +88,10 @@ final class ToolbarAddressAllocation {
     }
 
     private func apply(in window: NSWindow) {
-        guard let toolbar = window.toolbar, toolbar.isVisible,
+        guard let toolbar = window.toolbar,
               let item = toolbar.items.first(where: { $0.itemIdentifier.rawValue == "address" }),
-              let host = item.view, host.window === window,
-              toolbar.visibleItems?.contains(item) == true else { return }
+              let host = item.view,
+              (!toolbar.isVisible || (host.window === window && toolbar.visibleItems?.contains(item) == true)) else { return }
         if sizedHost !== host {
             [minimumWidth, maximumWidth].compactMap { $0 }.forEach { $0.isActive = false }
             host.translatesAutoresizingMaskIntoConstraints = false
