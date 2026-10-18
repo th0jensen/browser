@@ -61,7 +61,7 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
          },
          destinationChooser: (@MainActor (String, NSWindow?) async -> URL?)? = nil,
          shouldTidyDownloads: @escaping @MainActor () -> Bool = {
-             !BrowserProfile.isTesting && UserDefaults.standard.bool(forKey: BrowserIntelligence.downloadsKey)
+             !BrowserProfile.isTesting && UserDefaults.standard.bool(forKey: BrowserIntelligence.tidyDownloadsKey)
                  && BrowserIntelligence.unavailableReason == nil
          },
          suggestName: @escaping @Sendable (String, String, URL?) async throws -> String = {

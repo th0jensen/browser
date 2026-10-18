@@ -52,6 +52,16 @@ final class BrowserTab: NSObject, Identifiable {
     @ObservationIgnored private var findTask: Task<Void, Never>?
     /// The page last added to history, so its title follows the page's and a reload isn't another visit.
     @ObservationIgnored private var historyVisit: (id: UUID?, url: URL)?
+    @ObservationIgnored private(set) var navigationRevision = 0
+
+    func invalidateNavigation() { navigationRevision &+= 1 }
+
+    func stopLoading() {
+        invalidateNavigation()
+        webView?.stopLoading()
+        findTask?.cancel()
+        stopWaitingForSelection()
+    }
 
     @ObservationIgnored private let pageDelegate = PageDelegate()
     @ObservationIgnored private var observations: [NSKeyValueObservation] = []
@@ -157,6 +167,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// Releases the web view, and with it the page's memory, keeping what the tab strip shows and the state to restore.
     func suspend() {
         guard let webView, !isNewTab else { return }
+        invalidateNavigation()
         stopWaitingForSelection()
         suspendedState = webView.interactionState
         observations.forEach { $0.invalidate() }
@@ -179,6 +190,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// A pop-up gets a fresh configuration too, since its tie to the opener can't be restored.
     func restore() {
         guard isSuspended else { return }
+        invalidateNavigation()
         let context = browser?.isPrivate == true ? nil : url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
         extensionOrigin = context?.baseURL
         let webView = WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url) ?? context?.webViewConfiguration ?? Self.makeConfiguration())
@@ -319,6 +331,7 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     func load(_ url: URL) {
+        invalidateNavigation()
         thumbnailCapture.invalidate()
         isNewTab = false
         restore()
@@ -348,6 +361,7 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     func reload() {
+        invalidateNavigation()
         if loadError != nil {
             retry()
         } else if let webView {
@@ -359,11 +373,17 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     func goBack() {
+        invalidateNavigation()
         if loadError != nil, loadErrorCoversPreviousPage {
             clearLoadError()
         } else {
             webView?.goBack()
         }
+    }
+
+    func goForward() {
+        invalidateNavigation()
+        webView?.goForward()
     }
 
     /// A page has started to show in the tab: it gets its site's zoom, and joins history.
@@ -382,11 +402,13 @@ final class BrowserTab: NSObject, Identifiable {
               ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
               webView.backForwardList.currentItem?.url == url,
               historyVisit.map({ Self.withoutFragment($0.url) != Self.withoutFragment(url) }) ?? true else { return }
+        if let browser, browser.isClosed || browser.tab(for: webView) !== self { return }
         historyVisit = (browser?.history?.recordVisit(to: url, title: webView.title ?? ""), url)
     }
 
     private func updateVisitTitle() {
         guard let historyVisit, let id = historyVisit.id, url == historyVisit.url, !pageTitle.isEmpty else { return }
+        if let browser, browser.isClosed || browser.tab(withID: self.id) !== self { return }
         browser?.history?.updateTitle(of: id, to: pageTitle)
     }
 
@@ -479,6 +501,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// Loads the address that failed again, keeping the error up until a page loads.
     func retry() {
         guard let webView else { return }
+        invalidateNavigation()
         pageDelegate.isLoadingFromBrowser = true
         if let url = loadError?.url {
             Self.load(url, in: webView)

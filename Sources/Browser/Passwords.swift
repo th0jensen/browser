@@ -162,6 +162,14 @@ final class PasswordManager {
         case update
     }
 
+    /// The credential state the user is being asked to replace. Recheck it after waiting for the tab or sheet.
+    struct SaveProposal: Equatable {
+        let offer: Offer
+        fileprivate let account: SavedPassword
+        fileprivate let revision: UInt64
+        fileprivate let previousPassword: String?
+    }
+
     /// Every saved sign-in, by site then user name. Loaded the first time it's needed.
     private(set) var passwords: [SavedPassword] = []
     private(set) var lastError: String?
@@ -174,6 +182,8 @@ final class PasswordManager {
     @ObservationIgnored private let storage: PasswordStorage
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private var hasLoaded = false
+    @ObservationIgnored private var pendingSaveOffers: Set<SavedPassword> = []
+    @ObservationIgnored private var passwordRevisions: [SavedPassword: UInt64] = [:]
 
     /// Pass `nil` defaults to keep the settings in memory only.
     init(storage: PasswordStorage, defaults: UserDefaults? = nil) {
@@ -222,17 +232,51 @@ final class PasswordManager {
     /// Whether to offer to save a sign-in: not when saving is off or refused for the site, or the same password is
     /// already saved.
     func offer(for capture: PasswordCapture) -> Offer? {
+        saveProposal(for: capture)?.offer
+    }
+
+    func saveProposal(for capture: PasswordCapture) -> SaveProposal? {
         guard offersToSave, !neverSaveSites.contains(capture.origin.description) else { return nil }
         loadIfNeeded()
         guard hasLoaded else { return nil }
-        let account = capture.account
-        guard passwords(for: capture.origin).contains(account) else { return .save }
         // A failed read must not be mistaken for a changed password.
-        do { return try storage.password(for: account) == capture.password ? nil : .update }
+        do {
+            let previousPassword = try storage.password(for: capture.account)
+            guard previousPassword != capture.password else { return nil }
+            return SaveProposal(offer: previousPassword == nil ? .save : .update, account: capture.account,
+                                revision: passwordRevisions[capture.account, default: 0], previousPassword: previousPassword)
+        }
         catch {
             report(error, operation: "read this password")
             return nil
         }
+    }
+
+    /// All windows share this reservation, including tabs with different script message handlers.
+    func reserveSaveOffer(for capture: PasswordCapture) -> SaveProposal? {
+        guard !pendingSaveOffers.contains(capture.account), let proposal = saveProposal(for: capture) else { return nil }
+        pendingSaveOffers.insert(capture.account)
+        return proposal
+    }
+
+    func releaseSaveOffer(for account: SavedPassword) {
+        pendingSaveOffers.remove(account)
+    }
+
+    /// A newer save, removal, or preference change supersedes a sheet that was already waiting for the user.
+    @discardableResult
+    func save(_ capture: PasswordCapture, ifUnchanged proposal: SaveProposal) throws -> Bool {
+        guard capture.account == proposal.account, passwordRevisions[capture.account, default: 0] == proposal.revision,
+              offersToSave, !neverSaveSites.contains(capture.origin.description) else { return false }
+        let currentPassword: String?
+        do { currentPassword = try storage.password(for: capture.account) }
+        catch {
+            report(error, operation: "check this saved password")
+            throw error
+        }
+        guard currentPassword == proposal.previousPassword, currentPassword != capture.password else { return false }
+        try save(capture)
+        return true
     }
 
     func save(_ capture: PasswordCapture) throws {
@@ -241,12 +285,14 @@ final class PasswordManager {
             report(error, operation: "save this password")
             throw error
         }
+        passwordRevisions[capture.account, default: 0] &+= 1
         reload()
     }
 
     func remove(_ account: SavedPassword) {
         do {
             try storage.remove(account)
+            passwordRevisions[account, default: 0] &+= 1
             reload()
         } catch {
             report(error, operation: "remove this password")

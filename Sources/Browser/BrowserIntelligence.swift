@@ -4,9 +4,9 @@ import FoundationModels
 /// No model downloads, cloud provider, startup warm-up, or long-lived transcripts.
 /// The OS selects the installed on-device model; variant is informational, not a selector.
 enum BrowserIntelligence {
-    static let titlesKey = "intelligence.tidySavedTitles"
-    static let downloadsKey = "intelligence.tidyDownloads"
-    static let previewsKey = "intelligence.linkPreviews"
+    static let tidyTabTitlesKey = "intelligence.tidySavedTitles"
+    static let tidyDownloadsKey = "intelligence.tidyDownloads"
+    static let fiveSecondPreviewsKey = "intelligence.linkPreviews"
 
     static var unavailableReason: String? {
         switch SystemLanguageModel.default.availability {

@@ -151,8 +151,6 @@ enum PasswordAutofill {
 @MainActor
 final class PasswordMessageHandler: NSObject, WKScriptMessageHandler {
     private weak var browser: BrowserModel?
-    /// Sign-ins being offered right now, so a form submitted twice doesn't ask twice.
-    private var offering: Set<SavedPassword> = []
 
     init(browser: BrowserModel) {
         self.browser = browser
@@ -170,19 +168,19 @@ final class PasswordMessageHandler: NSObject, WKScriptMessageHandler {
         }
         guard let capture = PasswordCapture(body: message.body, isMainFrame: message.frameInfo.isMainFrame,
                                             origin: PasswordOrigin(message.frameInfo.securityOrigin)),
-              let offer = passwords.offer(for: capture), !offering.contains(capture.account) else { return }
-        offering.insert(capture.account)
+              let proposal = passwords.reserveSaveOffer(for: capture) else { return }
         Task {
-            await ask(offer, capture, in: tab, passwords: passwords)
-            offering.remove(capture.account)
+            defer { passwords.releaseSaveOffer(for: capture.account) }
+            await ask(proposal, capture, in: tab, passwords: passwords)
         }
     }
 
-    private func ask(_ offer: PasswordManager.Offer, _ capture: PasswordCapture, in tab: BrowserTab,
+    private func ask(_ proposal: PasswordManager.SaveProposal, _ capture: PasswordCapture, in tab: BrowserTab,
                      passwords: PasswordManager) async {
+        guard await tab.waitUntilSelected(), passwords.saveProposal(for: capture) == proposal else { return }
         let site = capture.origin.host
         let alert = NSAlert()
-        switch offer {
+        switch proposal.offer {
         case .save:
             alert.messageText = "Save your password for “\(site)”?"
             alert.informativeText = "Browser keeps it in your keychain, and can fill it in when you sign in to "
@@ -194,10 +192,10 @@ final class PasswordMessageHandler: NSObject, WKScriptMessageHandler {
             alert.addButton(withTitle: "Update Password")
         }
         alert.addButton(withTitle: "Not Now")
-        if offer == .save { alert.addButton(withTitle: "Never for This Website") }
+        if proposal.offer == .save { alert.addButton(withTitle: "Never for This Website") }
         switch await tab.present(alert) {
         case .alertFirstButtonReturn?:
-            do { try passwords.save(capture) }
+            do { try passwords.save(capture, ifUnchanged: proposal) }
             catch {
                 let failure = NSAlert()
                 failure.messageText = "Couldn’t Save Password"

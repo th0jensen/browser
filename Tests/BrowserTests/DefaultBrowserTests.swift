@@ -87,4 +87,19 @@ final class DefaultBrowserTests: XCTestCase {
         router.register(normal)
         XCTAssertFalse(normal.isBlank)
     }
+
+    func testExternalLinksAppendAfterExistingTabsRegardlessOfSelection() {
+        let router = ExternalURLRouter()
+        let browser = BrowserModel()
+        let original = ["first", "second", "third"].map { URL(string: "https://routing-test.invalid/\($0)")! }
+        browser.openInNewTabs(original)
+        browser.activeTabID = browser.tabs[0].id
+        router.register(browser)
+        let incoming = ["external-a", "external-b"].map { URL(string: "https://routing-test.invalid/\($0)")! }
+
+        router.open(incoming)
+
+        XCTAssertEqual(browser.tabs.map(\.url), original + incoming)
+        XCTAssertTrue(browser.activeTab === browser.tabs.last)
+    }
 }

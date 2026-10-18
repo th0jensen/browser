@@ -34,6 +34,7 @@ struct BrowserApp: App {
     var body: some Scene {
         WindowGroup(id: Self.windowID) {
             BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: history, session: session)
+                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .environment(browsingData)
                 .modifier(ScrollbarVisibility())
                 .frame(minWidth: 680, minHeight: 440)
@@ -44,6 +45,7 @@ struct BrowserApp: App {
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
         .restorationBehavior(.disabled)
+        .handlesExternalEvents(matching: ["*"])
         .windowToolbarLabelStyle($toolbarLabelStyle)
         .commands {
             ToolbarCommands()
@@ -51,6 +53,7 @@ struct BrowserApp: App {
         }
         WindowGroup("Private Window", id: Self.privateWindowID) {
             BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: nil, session: nil, isPrivate: true)
+                .handlesExternalEvents(preferring: [], allowing: [])
                 .modifier(ScrollbarVisibility())
                 .environment(browsingData)
                 .frame(minWidth: 680, minHeight: 440)
@@ -58,6 +61,7 @@ struct BrowserApp: App {
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
         .restorationBehavior(.disabled)
+        .handlesExternalEvents(matching: [])
         .windowToolbarLabelStyle($toolbarLabelStyle)
         Settings { BrowserSettings(browsingData: browsingData) }
             .windowStyle(.hiddenTitleBar)
@@ -162,9 +166,9 @@ private struct BrowserCommands: Commands {
                 Button("Find…") { browser?.showFindBar() }
                     .keyboardShortcut("f", modifiers: .command)
                 Button("Find Next") { browser?.findNext() }
-                    .keyboardShortcut("g", modifiers: .command)
+                    .keyboardShortcut("g", modifiers: [.command, .option])
                 Button("Find Previous") { browser?.findNext(backwards: true) }
-                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .keyboardShortcut("g", modifiers: [.command, .option, .shift])
                 Button("Use Selection for Find") { browser?.useSelectionForFind() }
                     .keyboardShortcut("e", modifiers: .command)
             }
@@ -198,7 +202,7 @@ private struct BrowserCommands: Commands {
             }
             Divider()
             Button("New Folder…") { browser?.requestNewFolder() }
-            Button(browser?.isTidyingTabs == true ? "Cancel Tidying" : "Tidy Tabs") {
+            Button(browser?.isTidyingTabs == true ? "Cancel Tidy Tabs" : "Tidy Tabs") {
                 if browser?.isTidyingTabs == true { browser?.cancelTidyingTabs() } else { browser?.tidyTemporaryTabs() }
             }.disabled(browser?.isTidyingTabs != true && (browser?.canTidyTabs != true || BrowserIntelligence.unavailableReason != nil))
             if browser?.regularTabs.contains(where: { $0.temporarySection != nil }) == true {
@@ -255,7 +259,7 @@ private struct BrowserCommands: Commands {
             Button("Open Location") { browser?.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
             Button("Toggle Address Bar") { browser?.toggleAddressFocus() }
-                .keyboardShortcut("l", modifiers: [.command, .option])
+                .keyboardShortcut("g", modifiers: .command)
             Button("Reload Page") { browser?.reload() }
                 .keyboardShortcut("r", modifiers: .command)
             Divider()

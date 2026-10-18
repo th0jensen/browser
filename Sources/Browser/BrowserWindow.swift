@@ -14,7 +14,8 @@ struct BrowserWindow: View {
     let session: SessionStore?
     @Environment(BrowsingData.self) private var browsingData: BrowsingData?
     @Environment(\.openWindow) private var openWindow
-    @State private var browser: BrowserModel
+    @StateObject private var windowState: BrowserWindowState
+    private var browser: BrowserModel { windowState.browser }
     @State private var address = ""
     /// What the user typed, without the inline completion.
     @State private var typedAddress = ""
@@ -77,15 +78,18 @@ struct BrowserWindow: View {
          session: SessionStore? = nil, isPrivate: Bool = false) {
         self.bookmarks = bookmarks
         self.session = session
-        _browser = State(initialValue: isPrivate ? BrowserModel.makePrivate(downloads: downloads)
-            : BrowserModel(downloads: downloads, history: history, passwords: .shared))
+        // StateObject constructs this once, before evaluating the window's first body.
+        _windowState = StateObject(wrappedValue: BrowserWindowState(
+            browser: isPrivate ? BrowserModel.makePrivate(downloads: downloads)
+                : BrowserModel(downloads: downloads, history: history, passwords: .shared, createsInitialTab: false),
+            session: session, router: .shared))
         _chromeHover = State(initialValue: ChromeHoverController())
     }
 
     init(bookmarks: BookmarkStore, browser: BrowserModel, chromeHover: ChromeHoverController = ChromeHoverController(), persistsToolbarLayout: Bool = !BrowserProfile.isTesting) {
         self.bookmarks = bookmarks
         self.session = nil
-        _browser = State(initialValue: browser)
+        _windowState = StateObject(wrappedValue: BrowserWindowState(browser: browser))
         _chromeHover = State(initialValue: chromeHover)
         self.persistsToolbarLayout = persistsToolbarLayout
     }
@@ -100,6 +104,7 @@ struct BrowserWindow: View {
     }
 
     var body: some View {
+        @Bindable var browser = windowState.browser
         // Keep the page host stable while the existing native chrome is shown or hidden.
         HStack(spacing: 0) {
             if tabLayout == .vertical && !autoHideSidebar {
@@ -226,17 +231,12 @@ struct BrowserWindow: View {
         }
         .task {
             await contentBlocker.prepare()
+        }
+        .task {
             if !browser.isPrivate { await BrowserExtensions.shared.restore() }
-            if let session, !browser.isPrivate, !browser.isExtensionWindow {
-                browser.sessionStore = session
-                for _ in 0..<session.attach(browser) { openWindow(id: BrowserApp.windowID) }
-            }
-            if !browser.isExtensionWindow { ExternalURLRouter.shared.register(browser, openWindow: openWindow) }
-            if browser.activeTab?.isNewTab == true { browser.requestAddressFocus() }
         }
         .onDisappear {
-            ExternalURLRouter.shared.unregister(browser)
-            session?.detach(browser)
+            windowState.close()
             persistSidebarWidth()
             chromeHover.stop()
             BrowserExtensions.shared.unregister(browser)
@@ -249,10 +249,7 @@ struct BrowserWindow: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { notification in
             if let window = notification.object as? NSWindow, browser.window === window {
-                ExternalURLRouter.shared.unregister(browser)
-                session?.detach(browser)
-                browser.cancelTidyingTabs()
-                browser.dismissPeek()
+                windowState.close()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
@@ -275,6 +272,7 @@ struct BrowserWindow: View {
             chromeHover.menuIsTracking = false
         }
         .onAppear {
+            windowState.appear(openWindow: openWindow)
             WindowChromeSettingsTarget.shared.browser = browser
             chromeHover.compactToolbar = compactToolbar
             chromeHover.autoHideSidebar = autoHideSidebar

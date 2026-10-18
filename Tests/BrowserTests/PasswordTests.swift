@@ -132,6 +132,53 @@ final class PasswordTests: XCTestCase {
         XCTAssertTrue(PasswordManager.shared.usesEphemeralStorage)
     }
 
+    func testSaveOffersAreReservedByAccountAcrossMessageHandlersAndReleasedAfterDismissal() throws {
+        let passwords = PasswordManager(storage: MemoryPasswordStorage())
+        let capture = try XCTUnwrap(PasswordCapture(body: submission(), isMainFrame: true, origin: example))
+        let otherUser = try XCTUnwrap(PasswordCapture(body: submission(username: "bob"), isMainFrame: true, origin: example))
+        let otherSite = try XCTUnwrap(PasswordCapture(body: submission(), isMainFrame: true,
+                                                    origin: PasswordOrigin(host: "other.example")))
+
+        XCTAssertNotNil(passwords.reserveSaveOffer(for: capture))
+        XCTAssertNil(passwords.reserveSaveOffer(for: capture), "A second tab must join the existing offer for this account")
+        XCTAssertNotNil(passwords.reserveSaveOffer(for: otherUser), "Different usernames have independent offers")
+        XCTAssertNotNil(passwords.reserveSaveOffer(for: otherSite), "An origin is part of the account key")
+        passwords.releaseSaveOffer(for: capture.account)
+        XCTAssertNotNil(passwords.reserveSaveOffer(for: capture), "Dismissing or closing a tab must release its offer")
+        passwords.releaseSaveOffer(for: capture.account)
+        passwords.releaseSaveOffer(for: otherUser.account)
+        passwords.releaseSaveOffer(for: otherSite.account)
+    }
+
+    func testQueuedAndPresentedPasswordOffersCannotOverwriteANewerCredential() throws {
+        let storage = MemoryPasswordStorage()
+        let passwords = PasswordManager(storage: storage)
+        let oldCapture = try XCTUnwrap(PasswordCapture(body: submission(password: "old submitted password"),
+                                                       isMainFrame: true, origin: example))
+        let newerCapture = try XCTUnwrap(PasswordCapture(body: submission(password: "newer saved password"),
+                                                         isMainFrame: true, origin: example))
+        let queued = try XCTUnwrap(passwords.reserveSaveOffer(for: oldCapture))
+        try passwords.save(newerCapture)
+        XCTAssertNotEqual(passwords.saveProposal(for: oldCapture), queued,
+                          "A background tab must recheck the credential before presenting its queued offer")
+        XCTAssertFalse(try passwords.save(oldCapture, ifUnchanged: queued))
+        XCTAssertEqual(storage.items[oldCapture.account], newerCapture.password)
+        passwords.releaseSaveOffer(for: oldCapture.account)
+
+        let presented = try XCTUnwrap(passwords.reserveSaveOffer(for: oldCapture))
+        storage.items[oldCapture.account] = "changed while the sheet was open"
+        XCTAssertFalse(try passwords.save(oldCapture, ifUnchanged: presented),
+                       "A sheet must recheck storage when the user approves it")
+        XCTAssertEqual(storage.items[oldCapture.account], "changed while the sheet was open")
+        passwords.releaseSaveOffer(for: oldCapture.account)
+
+        let current = try XCTUnwrap(passwords.reserveSaveOffer(for: oldCapture))
+        XCTAssertTrue(try passwords.save(oldCapture, ifUnchanged: current))
+        XCTAssertEqual(storage.items[oldCapture.account], oldCapture.password)
+        passwords.releaseSaveOffer(for: oldCapture.account)
+        XCTAssertNil(passwords.reserveSaveOffer(for: oldCapture), "An already saved credential needs no new prompt")
+    }
+
     func testKeychainFailuresAreReportedAndDoNotOfferToOverwriteUnreadablePasswords() throws {
         let storage = MemoryPasswordStorage()
         let passwords = PasswordManager(storage: storage)

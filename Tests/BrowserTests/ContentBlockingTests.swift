@@ -121,6 +121,76 @@ final class ContentBlockingTests: XCTestCase {
         XCTAssertFalse(blocker.isBlocking(on: "example.com"))
         XCTAssertFalse(ContentBlocker(defaults: defaults).isEnabled)
     }
+
+    func testPreparationWaitsForCurrentExceptionsAndNeverInstallsSupersededRules() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try XCTUnwrap(WKContentRuleListStore(url: directory))
+        let gate = TrackerRuleCompilationGate()
+        defer { gate.resumeAll() }
+        let controller = RecordingRuleController()
+        var compiledRules: [String] = []
+        let blocker = ContentBlocker(store: store, ruleListCompiler: { identifier, rules in
+            compiledRules.append(rules)
+            await gate.pause()
+            return try await store.compileContentRuleList(forIdentifier: identifier, encodedContentRuleList: rules)
+        })
+        blocker.attach(controller)
+        try await gate.waitUntil { gate.requests == 1 }
+        var prepared = false
+        let preparation = Task {
+            await blocker.prepare()
+            prepared = true
+        }
+
+        let firstChange = Task { await blocker.setBlocking(false, on: "first.example") }
+        try await gate.waitUntil { blocker.exceptions.contains("first.example") }
+        gate.resumeNext()
+        try await gate.waitUntil { gate.requests == 2 }
+        XCTAssertTrue(controller.additions.isEmpty, "The initial rules were superseded while compiling")
+        XCTAssertFalse(prepared, "Navigation must wait for the current exceptions")
+
+        let secondChange = Task { await blocker.setBlocking(false, on: "second.example") }
+        try await gate.waitUntil { blocker.exceptions.contains("second.example") }
+        gate.resumeNext()
+        try await gate.waitUntil { gate.requests == 3 }
+        XCTAssertTrue(controller.additions.isEmpty, "A second superseded compilation must not replace protection")
+        XCTAssertFalse(prepared)
+        gate.resumeNext()
+        await firstChange.value
+        await secondChange.value
+        await preparation.value
+
+        XCTAssertTrue(prepared)
+        XCTAssertTrue(blocker.isReady)
+        XCTAssertFalse(blocker.isUpdating)
+        XCTAssertNil(blocker.lastError)
+        XCTAssertEqual(controller.additions, ["Trackers"])
+        XCTAssertTrue(try XCTUnwrap(compiledRules.last).contains("*first.example"))
+        XCTAssertTrue(try XCTUnwrap(compiledRules.last).contains("*second.example"))
+    }
+
+    func testPreparationReportsCompilationFailureWithoutRetryingForever() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try XCTUnwrap(WKContentRuleListStore(url: directory))
+        var attempts = 0
+        let blocker = ContentBlocker(store: store, ruleListCompiler: { _, _ in
+            attempts += 1
+            throw NSError(domain: "TrackerRuleCompiler", code: 1, userInfo: [NSLocalizedDescriptionKey: "Controlled compilation failure"])
+        })
+
+        await blocker.prepare()
+        XCTAssertEqual(attempts, 1)
+        XCTAssertFalse(blocker.isReady)
+        XCTAssertFalse(blocker.isUpdating)
+        XCTAssertTrue(blocker.lastError?.contains("Controlled compilation failure") == true)
+        await blocker.prepare()
+        XCTAssertEqual(attempts, 2, "A later request may retry once after the previous attempt failed")
+        XCTAssertFalse(blocker.isReady)
+    }
 }
 
 private extension TrackerBlocklist.Rule {
@@ -131,8 +201,10 @@ private extension TrackerBlocklist.Rule {
 private final class RecordingRuleController: WKUserContentController {
     private(set) var identifiers: Set<String> = []
     private(set) var removeAllCalls = 0
+    private(set) var additions: [String] = []
 
     override func add(_ contentRuleList: WKContentRuleList) {
+        additions.append(contentRuleList.identifier)
         identifiers.insert(contentRuleList.identifier)
         super.add(contentRuleList)
     }
@@ -146,5 +218,41 @@ private final class RecordingRuleController: WKUserContentController {
         removeAllCalls += 1
         identifiers = []
         super.removeAllContentRuleLists()
+    }
+}
+
+@MainActor
+private final class TrackerRuleCompilationGate {
+    private(set) var requests = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isOpen = false
+
+    func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                throw NSError(domain: "TrackerRuleCompilationGate", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for a tracker rule update"])
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    func pause() async {
+        requests += 1
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func resumeNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().resume()
+    }
+
+    func resumeAll() {
+        isOpen = true
+        let current = waiters
+        waiters = []
+        current.forEach { $0.resume() }
     }
 }

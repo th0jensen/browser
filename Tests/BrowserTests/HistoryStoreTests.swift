@@ -157,3 +157,39 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(history.visits.map(\.url), [apple])
     }
 }
+
+
+extension HistoryStoreTests {
+    func testClearAndImmediateSaveBeforeInitialLoadDurablyRemovesSavedHistory() async throws {
+        let file = makeFile()
+        defer { try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent()) }
+        let saved = [HistoryVisit(url: swift, title: "Saved", date: .now - 60)]
+        file.writeNow(try PropertyListEncoder.binary.encode(saved))
+        let history = HistoryStore(file: file)
+        // No suspension: the initial MainActor loading task has not run yet.
+        history.clear(.all)
+        history.saveNow()
+        let persisted = try PropertyListDecoder().decode([HistoryVisit].self, from: XCTUnwrap(file.readNow()))
+        XCTAssertTrue(persisted.isEmpty)
+        // The cancelled initial loader must not merge the old file after the save.
+        for _ in 0..<5 { await Task.yield() }
+        XCTAssertTrue(history.visits.isEmpty)
+        let reloaded = HistoryStore(file: StoreFile(url: file.url))
+        await reloaded.waitUntilLoaded()
+        XCTAssertTrue(reloaded.visits.isEmpty)
+    }
+
+    func testImmediateSaveMergesStartupVisitsExactlyOnce() async throws {
+        let file = makeFile()
+        defer { try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent()) }
+        let saved = [HistoryVisit(url: swift, title: "Saved", date: .now - 60)]
+        file.writeNow(try PropertyListEncoder.binary.encode(saved))
+        let history = HistoryStore(file: file)
+        history.recordVisit(to: apple, title: "New")
+        history.saveNow()
+        for _ in 0..<5 { await Task.yield() }
+        XCTAssertEqual(history.visits.map(\.url), [swift, apple])
+        let persisted = try PropertyListDecoder().decode([HistoryVisit].self, from: XCTUnwrap(file.readNow()))
+        XCTAssertEqual(persisted.map(\.url), [swift, apple])
+    }
+}

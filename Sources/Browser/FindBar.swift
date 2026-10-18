@@ -34,11 +34,11 @@ struct FindBar: View {
                 Button { browser.findNext(backwards: true) } label: {
                     Image(systemName: "chevron.up")
                 }
-                .help("Previous Match (⇧⌘G)")
+                .help("Previous Match (⇧⌥⌘G)")
                 Button { browser.findNext() } label: {
                     Image(systemName: "chevron.down")
                 }
-                .help("Next Match (⌘G)")
+                .help("Next Match (⌥⌘G)")
             }
             .disabled(tab.findText.isEmpty)
 

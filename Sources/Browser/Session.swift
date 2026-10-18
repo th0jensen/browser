@@ -105,9 +105,14 @@ final class SessionStore {
 
     /// Remembers a window from now on. A window that opens while saved windows are waiting restores the next one.
     /// Returns how many more windows to open for the rest.
-    func attach(_ browser: BrowserModel) -> Int {
+    func attach(_ browser: BrowserModel, restoringClosedWindows: Bool = false,
+                restoringPendingWindows: Bool = true) -> Int {
         guard !browser.isPrivate, !browser.isExtensionWindow,
               !openBrowsers.contains(where: { $0 === browser }) else { return 0 }
+        if restoringClosedWindows, openBrowsers.isEmpty, pendingWindows.isEmpty {
+            pendingWindows = reopenableWindows
+            reopenableWindows = []
+        }
         browser.sessionStore = self
         browsers.removeAll { $0.browser == nil }
         browsers.append(WeakBrowser(browser: browser))
@@ -115,7 +120,7 @@ final class SessionStore {
             observeBrowsers()
             scheduleSave()
         }
-        guard !pendingWindows.isEmpty else { return 0 }
+        guard restoringPendingWindows, !pendingWindows.isEmpty else { return 0 }
         browser.restoreSession(pendingWindows.removeFirst())
         if windowsBeingOpened > 0 {
             windowsBeingOpened -= 1

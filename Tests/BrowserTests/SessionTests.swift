@@ -186,6 +186,50 @@ extension SessionTests {
 
 
 extension SessionTests {
+    func testWindowIsRestoredAndQueuedLinksAppendedBeforeItsFirstView() throws {
+        let file = makeFile()
+        defer { try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent()) }
+        let saved = [window(["First", "Selected", "Last"], selected: 1), window(["Other window"])]
+        file.writeNow(try PropertyListEncoder.binary.encode(SessionSnapshot(windows: saved)))
+        let session = SessionStore(file: file)
+        let router = ExternalURLRouter()
+        let incoming = [page(titled: "ExternalA"), page(titled: "ExternalB")]
+        router.open(incoming)
+        let browser = BrowserModel(createsInitialTab: false)
+        XCTAssertTrue(browser.tabs.isEmpty)
+
+        let state = BrowserWindowState(browser: browser, session: session, router: router)
+
+        XCTAssertNil(state.browser.window, "Restoration must be complete before a native window can paint")
+        XCTAssertEqual(browser.tabs.map(\.url), saved[0].tabs.map(\.url) + incoming)
+        XCTAssertTrue(browser.activeTab === browser.tabs.last)
+        XCTAssertEqual(session.snapshot.windows.count, 2)
+
+        let other = BrowserWindowState(browser: BrowserModel(createsInitialTab: false), session: session, router: router)
+        XCTAssertEqual(other.browser.tabs.map(\.title), ["Other window"])
+        XCTAssertEqual(browser.tabs.count, 5, "Later windows must not consume the queued links again")
+    }
+
+    func testOpeningAWindowAfterTheLastClosedRestoresOnlyWhenEnabled() throws {
+        for enabled in [true, false] {
+            let session = SessionStore(file: nil)
+            let closing = BrowserModel()
+            closing.restoreSession(window(["SavedA", "SavedB"], selected: 1))
+            _ = session.attach(closing)
+            session.detach(closing)
+            let router = ExternalURLRouter()
+            router.open([page(titled: "External")])
+
+            let state = BrowserWindowState(browser: BrowserModel(createsInitialTab: false), session: session,
+                                           router: router, restoresWindows: enabled)
+
+            XCTAssertEqual(state.browser.tabs.map(\.url),
+                           enabled ? [page(titled: "SavedA"), page(titled: "SavedB"), page(titled: "External")]
+                               : [page(titled: "External")])
+            XCTAssertEqual(session.reopenableWindows.isEmpty, enabled)
+        }
+    }
+
     func testSavingBeforeAndDuringWindowRestorationPreservesPendingWindows() async throws {
         let file = makeFile()
         defer { try? FileManager.default.removeItem(at: file.url.deletingLastPathComponent()) }

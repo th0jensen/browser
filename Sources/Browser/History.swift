@@ -95,7 +95,10 @@ final class HistoryStore {
         self.file = file
         guard let file else { return }
         loading = Task { [weak self] in
+            guard !Task.isCancelled else { return }
             let saved = await Self.loadVisits(from: file)
+            // saveNow may have completed the initial merge synchronously while this read waited.
+            guard !Task.isCancelled else { return }
             self?.merge(saved)
         }
         _ = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil,
@@ -201,6 +204,7 @@ final class HistoryStore {
     private func merge(_ saved: [HistoryVisit]) {
         loading = nil
         let savedCount = saved.count
+        let hasPendingChanges = !visits.isEmpty || !pendingRemovals.isEmpty
         var saved = saved
         for shouldRemove in pendingRemovals {
             saved.removeAll(where: shouldRemove)
@@ -210,7 +214,7 @@ final class HistoryStore {
         Self.prune(&visits, now: .now)
         cachedPages = nil
         // Saves skipped while loading, and expired visits, need writing now.
-        if visits.count != savedCount || saved.count != savedCount { scheduleSave() }
+        if hasPendingChanges || visits.count != savedCount || saved.count != savedCount { scheduleSave() }
     }
 
     /// Drops visits older than `maxAge`, and the oldest beyond `maxVisits`.
@@ -232,10 +236,17 @@ final class HistoryStore {
         }
     }
 
-    /// Saves right away, for when the app quits. History that hasn't loaded yet is left as it is.
+    /// Finishes initial loading before a durable save, so an immediate clear-and-quit
+    /// cannot leave deleted visits on disk or discard visits made during startup.
     func saveNow() {
-        guard let file, loading == nil else { return }
+        guard let file else { return }
+        if loading != nil {
+            loading?.cancel()
+            let saved = file.readNow().flatMap { try? PropertyListDecoder().decode([HistoryVisit].self, from: $0) } ?? []
+            merge(saved)
+        }
         saveTask?.cancel()
+        saveTask = nil
         file.writeNow(try? PropertyListEncoder.binary.encode(visits))
     }
 

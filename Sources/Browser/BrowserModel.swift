@@ -69,6 +69,7 @@ final class BrowserModel: NSObject {
         didSet { updateWindowTitle() }
     }
     @ObservationIgnored var isExtensionWindow = false
+    @ObservationIgnored private(set) var isClosed = false
 
     private struct ClosedTab {
         let url: URL?
@@ -83,7 +84,7 @@ final class BrowserModel: NSObject {
          folders: TabFolderStore? = nil, chromePreferences: WindowChromePreferences? = nil,
          history: HistoryStore? = nil, zoomLevels: ZoomStore = .shared,
          websiteDataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore,
-         passwords: PasswordManager? = nil, isPrivate: Bool = false) {
+         passwords: PasswordManager? = nil, isPrivate: Bool = false, createsInitialTab: Bool = true) {
         self.chromePreferences = chromePreferences ?? WindowChromePreferences()
         self.downloads = downloads
         self.sitePermissions = isPrivate ? SitePermissions() : sitePermissions
@@ -98,7 +99,7 @@ final class BrowserModel: NSObject {
             ? TabFolderStore(directory: BrowserProfile.directory, enabled: false) : .shared)
         super.init()
         tabDrag.canSplit = { [weak self] source, target in self?.canSplitDrag(source, with: target) == true }
-        addTab(configuration: configuration ?? makeConfiguration())
+        if createsInitialTab { addTab(configuration: configuration ?? makeConfiguration()) }
         suspender = TabSuspender(browser: self)
     }
 
@@ -134,6 +135,17 @@ final class BrowserModel: NSObject {
     func requestSessionSave() {
         guard !isPrivate, !isExtensionWindow else { return }
         sessionStore?.requestSave()
+    }
+
+    func windowDidAppear() { isClosed = false }
+
+    func windowDidClose() {
+        guard !isClosed else { return }
+        isClosed = true
+        cancelTidyingTabs()
+        titleTasks.values.forEach { $0.cancel() }
+        for tab in tabs { tab.stopLoading() }
+        dismissPeek()
     }
 
     var activeTab: BrowserTab? {
@@ -498,7 +510,7 @@ final class BrowserModel: NSObject {
         guard let previous = peek else { return }
         peek = nil
         previous.tab.stopWaitingForSelection()
-        previous.tab.webView?.stopLoading()
+        previous.tab.stopLoading()
         BrowserExtensions.shared.didClose(previous.tab)
         if let activeTab { BrowserExtensions.shared.didActivate(activeTab, previous: nil) }
         window?.makeFirstResponder(activeTab?.webView)
@@ -617,6 +629,7 @@ final class BrowserModel: NSObject {
         cancelSavedTitle(for: tab)
         if renamingSavedPageID == tab.folderPageID { renamingSavedPageID = nil }
         tab.stopWaitingForSelection()
+        tab.stopLoading()
         let isBlank = tab.isNewTab || tab.url == nil
         closedTabs.append(ClosedTab(url: isBlank ? nil : tab.url, title: tab.pageTitle,
                                     interactionState: isBlank ? nil : tab.interactionState, folderPageID: tab.folderPageID))
@@ -722,10 +735,11 @@ final class BrowserModel: NSObject {
     }
 
     func goForward() {
-        (peek?.tab ?? activeTab)?.webView?.goForward()
+        (peek?.tab ?? activeTab)?.goForward()
     }
 
     func go(to item: WKBackForwardListItem) {
+        activeTab?.invalidateNavigation()
         activeTab?.webView?.go(to: item)
     }
 
@@ -1007,7 +1021,7 @@ extension BrowserModel {
     func savedTabBeganLoading(_ tab: BrowserTab) {
         cancelSavedTitle(for: tab)
         if !isPrivate, !BrowserProfile.isTesting, tab.folderPageID != nil,
-           UserDefaults.standard.bool(forKey: BrowserIntelligence.titlesKey) {
+           UserDefaults.standard.bool(forKey: BrowserIntelligence.tidyTabTitlesKey) {
             Task { await LocalIntelligence.shared.prepare(.name) }
         }
     }
@@ -1020,7 +1034,7 @@ extension BrowserModel {
 
     func tidySavedTabTitle(_ tab: BrowserTab) {
         guard !isPrivate else { return }
-        guard !BrowserProfile.isTesting, UserDefaults.standard.bool(forKey: BrowserIntelligence.titlesKey),
+        guard !BrowserProfile.isTesting, UserDefaults.standard.bool(forKey: BrowserIntelligence.tidyTabTitlesKey),
               !tab.isLoading, !tab.isNewTab, tab.loadError == nil, tab.pinnedPageID == nil,
               let id = tab.folderPageID, let page = folders.item(id), page.nameSource == nil,
               let url = tab.url, PinnedPageStore.valid(url), !tab.pageTitle.isEmpty, titleTasks[tab.id] == nil,
@@ -1041,7 +1055,7 @@ extension BrowserModel {
                 let name = try await LocalIntelligence.shared.savedTabName(title: originalTitle, url: url)
                 guard let self, let tab, !Task.isCancelled, self.tabs.contains(where: { $0 === tab }),
                       tab.folderPageID == id, tab.pinnedPageID == nil, tab.url == url, !tab.isLoading,
-                      UserDefaults.standard.bool(forKey: BrowserIntelligence.titlesKey),
+                      UserDefaults.standard.bool(forKey: BrowserIntelligence.tidyTabTitlesKey),
                       self.folders.item(id)?.nameSource == nil else { return }
                 try self.folders.renamePage(id, title: name, source: .automatic)
             } catch { /* Automatic naming is optional; keep the page's original title on failure. */ }

@@ -1,6 +1,5 @@
 import Foundation
 import Observation
-import SwiftUI
 import WebKit
 
 /// What Clear History and Website Data removes.
@@ -43,40 +42,115 @@ final class BrowsingData {
     /// Sites with cookies, storage, or cache, sorted by name. Empty until `loadSiteRecords()`.
     private(set) var siteRecords: [WKWebsiteDataRecord] = []
     private(set) var hasLoadedSiteRecords = false
+    @ObservationIgnored private let websiteDataOperations: WebsiteDataOperations
+    @ObservationIgnored private var hasRequestedSiteRecords = false
+    @ObservationIgnored private var siteDataGeneration: UInt = 0
+    @ObservationIgnored private var nextLoadSequence: UInt = 0
+    @ObservationIgnored private var appliedLoadSequence: UInt = 0
+    @ObservationIgnored private var pendingMutations = 0
+    @ObservationIgnored private var mutationWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
-    init(history: HistoryStore, session: SessionStore, dataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore) {
+    /// WebKit operations are injected together so tests can control completion order without using live sites.
+    struct WebsiteDataOperations {
+        let loadRecords: @MainActor () async -> [WKWebsiteDataRecord]
+        let removeRecords: @MainActor ([WKWebsiteDataRecord]) async -> Void
+        let removeModifiedSince: @MainActor (Set<String>, Date) async -> Void
+
+        @MainActor
+        static func live(in dataStore: WKWebsiteDataStore) -> Self {
+            Self(loadRecords: {
+                await dataStore.dataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes())
+            }, removeRecords: { records in
+                await dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: records)
+            }, removeModifiedSince: { types, start in
+                await dataStore.removeData(ofTypes: types, modifiedSince: start)
+            })
+        }
+    }
+
+    init(history: HistoryStore, session: SessionStore, dataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore,
+         websiteDataOperations: WebsiteDataOperations? = nil) {
         self.history = history
         self.session = session
         self.dataStore = dataStore
+        self.websiteDataOperations = websiteDataOperations ?? .live(in: dataStore)
     }
 
     /// Removes what the options name from the time range. Clearing all history also forgets the closed windows
     /// that History ▸ Reopen All Windows from Last Session would open.
     func clear(_ options: ClearDataOptions, range: HistoryClearRange, now: Date = .now) async {
-        let start = range.start(now: now)
-        if options.contains(.history) {
-            history.clear(range, now: now)
-            if range == .all { session.forgetClosedWindows() }
+        await performMutation {
+            let start = range.start(now: now)
+            if options.contains(.history) {
+                self.history.clear(range, now: now)
+                if range == .all { self.session.forgetClosedWindows() }
+            }
+            let types = options.websiteDataTypes()
+            if !types.isEmpty {
+                await self.websiteDataOperations.removeModifiedSince(types, start)
+            }
+            if options.contains(.favicons) {
+                await FaviconStore.clear(since: start)
+            }
         }
-        let types = options.websiteDataTypes()
-        if !types.isEmpty {
-            await dataStore.removeData(ofTypes: types, modifiedSince: start)
-        }
-        if options.contains(.favicons) {
-            await FaviconStore.clear(since: start)
-        }
-        if hasLoadedSiteRecords { await loadSiteRecords() }
     }
 
     func loadSiteRecords() async {
-        let records = await dataStore.dataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes())
+        guard !Task.isCancelled else { return }
+        hasRequestedSiteRecords = true
+        await waitForMutations()
+        guard !Task.isCancelled else { return }
+        nextLoadSequence &+= 1
+        let sequence = nextLoadSequence
+        let generation = siteDataGeneration
+        let records = await websiteDataOperations.loadRecords()
+        guard !Task.isCancelled, pendingMutations == 0, generation == siteDataGeneration,
+              sequence > appliedLoadSequence else { return }
         siteRecords = records.sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+        appliedLoadSequence = sequence
         hasLoadedSiteRecords = true
     }
 
     func removeData(for records: [WKWebsiteDataRecord]) async {
-        await dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: records)
-        await loadSiteRecords()
+        await performMutation { await self.websiteDataOperations.removeRecords(records) }
+    }
+
+    /// Once WebKit starts deleting, cancellation cannot undo it. Finish the accepted operation and its refresh
+    /// even if the view that requested it disappears. Reads taken before or during the deletion cannot publish.
+    private func performMutation(_ operation: @escaping @MainActor () async -> Void) async {
+        guard !Task.isCancelled else { return }
+        pendingMutations += 1
+        siteDataGeneration &+= 1
+        let mutation = Task { @MainActor in
+            await operation()
+            self.pendingMutations -= 1
+            self.siteDataGeneration &+= 1
+            guard self.pendingMutations == 0 else { return }
+            let waiters = Array(self.mutationWaiters.values)
+            self.mutationWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            if self.hasRequestedSiteRecords { await self.loadSiteRecords() }
+        }
+        await mutation.value
+    }
+
+    private func waitForMutations() async {
+        while pendingMutations > 0 && !Task.isCancelled {
+            let id = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard self.pendingMutations > 0, !Task.isCancelled else {
+                        continuation.resume()
+                        return
+                    }
+                    self.mutationWaiters[id] = continuation
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.mutationWaiters.removeValue(forKey: id)?.resume()
+                }
+            }
+        }
     }
 
     /// What a site has stored, for the site data list.
@@ -92,66 +166,5 @@ final class BrowsingData {
         if types.contains(WKWebsiteDataTypeServiceWorkerRegistrations) { parts.append("Service workers") }
         if !types.isDisjoint(with: ClearDataOptions.cacheTypes) { parts.append("Cache") }
         return parts.isEmpty ? "Other data" : parts.joined(separator: ", ")
-    }
-}
-
-/// History ▸ Clear History and Website Data, also opened from Settings ▸ Privacy.
-struct ClearDataView: View {
-    let data: BrowsingData
-    @Environment(\.dismiss) private var dismiss
-    @State private var range = HistoryClearRange.lastHour
-    @State private var options: ClearDataOptions = [.history, .siteData, .cache]
-    @State private var isClearing = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Clear History and Website Data")
-                .font(.system(size: 15, weight: .semibold))
-
-            Picker("Clear:", selection: $range) {
-                ForEach(HistoryClearRange.allCases) { range in
-                    Text(range == .all ? "All Time" : range.title).tag(range)
-                }
-            }
-            .fixedSize()
-
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("History", isOn: binding(for: .history))
-                Toggle(isOn: binding(for: .siteData)) {
-                    Text("Cookies and website data")
-                    Text("Signs you out of most websites.")
-                }
-                Toggle("Cached images and files", isOn: binding(for: .cache))
-                Toggle("Site icons", isOn: binding(for: .favicons))
-            }
-
-            Text("Private windows aren’t affected. Their data is removed when they close.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                if isClearing { ProgressView().controlSize(.small) }
-                Spacer()
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Clear") {
-                    isClearing = true
-                    Task {
-                        await data.clear(options, range: range)
-                        dismiss()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(options.isEmpty || isClearing)
-            }
-        }
-        .padding(20)
-        .frame(width: 400)
-    }
-
-    private func binding(for option: ClearDataOptions) -> Binding<Bool> {
-        Binding(get: { options.contains(option) },
-                set: { if $0 { options.insert(option) } else { options.remove(option) } })
     }
 }

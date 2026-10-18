@@ -239,7 +239,7 @@ struct TabStrip: View {
             .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             .disabled(!browser.isTidyingTabs && (!browser.canTidyTabs || BrowserIntelligence.unavailableReason != nil))
             .help(BrowserIntelligence.unavailableReason ?? "Group temporary tabs by topic on this Mac")
-            .accessibilityLabel(browser.isTidyingTabs ? "Cancel Tidying Tabs" : "Tidy Tabs")
+            .accessibilityLabel(browser.isTidyingTabs ? "Cancel Tidy Tabs" : "Tidy Tabs")
             .onHover { value in if value { Task { await LocalIntelligence.shared.prepare(.tidy) } } }
             TidyActivityDivider(isLoading: browser.isTidyingTabs)
         }.frame(maxWidth: .infinity).padding(.leading, BrowserChrome.edgeInset)
@@ -387,7 +387,7 @@ struct TabStrip: View {
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }
             .disabled(!browser.canReopenClosedTab)
         Divider()
-        Button(browser.isTidyingTabs ? "Cancel Tidying" : "Tidy Tabs") {
+        Button(browser.isTidyingTabs ? "Cancel Tidy Tabs" : "Tidy Tabs") {
             if browser.isTidyingTabs { browser.cancelTidyingTabs() } else { browser.tidyTemporaryTabs() }
         }.disabled(!browser.isTidyingTabs && (!browser.canTidyTabs || BrowserIntelligence.unavailableReason != nil))
         if browser.regularTabs.contains(where: { $0.temporarySection != nil }) {

@@ -16,6 +16,16 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
+        if navigationAction.targetFrame?.isMainFrame == true {
+            guard let tab else { return .cancel }
+            let request = PageNavigationRequest(tab: tab, webView: webView)
+            // The restored window can lay out immediately while its first navigation waits for protection.
+            async let protection: Void = ContentBlocker.shared.prepare()
+            if tab.browser?.isPrivate != true { await BrowserExtensions.shared.prepare() }
+            await protection
+            guard request.isCurrent else { return .cancel }
+            if tab.browser?.isPrivate != true { BrowserExtensions.shared.updateRules(in: webView) }
+        }
         if navigationAction.shouldPerformDownload { return .download }
         if navigationAction.targetFrame?.isMainFrame == true, let url = navigationAction.request.url,
            url.absoluteString != "about:blank" {
