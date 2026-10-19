@@ -24,3 +24,17 @@ Co-authored-by: Codex (GPT-6.1 Sol) <noreply@openai.com>
 Keep benchmark measurements and before/after results in the task thread, not PR descriptions or committed reports.
 
 When optimized benchmarking is explicitly requested, `just benchmark` uses the Release-optimized `Benchmark` configuration and `dev.athas.browser.benchmark` identity in normal DerivedData. It runs only isolated XCTest fixtures, never deployment or profile migration, and must leave the installed browsers running. Ordinary GUI QA continues to use Debug.
+
+# Project structure
+
+`project.yml` is the XcodeGen source of truth. `just` regenerates the ignored `Browser.xcodeproj`; change targets, resources, and build settings in the YAML. The shared `BrowserApp` template supplies both direct-distribution and App Store targets.
+
+# Extension hosting
+
+`BrowserExtensions` owns the shared `WKWebExtensionController`, installed-extension index, permissions, and action popups. `BrowserTab` attaches that controller to regular web views; private windows exclude extensions. Settings → Extensions → Development → Developer tools imports unpacked Web Extension directories or ZIPs by copying their resources into the current profile. Imports begin disabled and request their declared permissions when enabled.
+
+# Bundled extensions
+
+Extension sources live under `Extensions/`. Forced Dark is a Manifest V3 extension with a content script and action popup; its color math and preference validation are in `colors.js`. Run its JavaScript checks with `just --justfile Extensions/justfile test`. `BundledDarkExtensionTests` exercises actual WebKit injection, dynamic content, and popup preference updates through `just test`.
+
+Bundled resources are folder references in the shared app target. `BrowserExtensions.shared` registers them disabled by default and loads them directly from the app bundle. The persisted extension UUID preserves WebKit storage and enablement across app updates; do not replace it when updating bundled resources. An extension's popup is its own extension-origin web view and uses standard Web Extension storage APIs.

@@ -18,6 +18,7 @@ struct InstalledExtension: Codable, Identifiable {
     var hasToolbarAction: Bool?
     var toolbarActionLabel: String?
     var toolbarIconIsTemplate: Bool?
+    var bundledResource: String?
 }
 
 /// Owns extension resources and one controller shared by every window, tab and restored web view.
@@ -37,7 +38,8 @@ final class BrowserExtensions: NSObject {
         let task: Task<Void, Error>
     }
     static let shared: BrowserExtensions = {
-        BrowserExtensions(persistent: !BrowserProfile.isTesting)
+        BrowserExtensions(persistent: !BrowserProfile.isTesting,
+                          bundledDirectory: BrowserProfile.isTesting ? nil : Bundle.main.resourceURL)
     }()
     let controller: WKWebExtensionController
     private(set) var installed: [InstalledExtension] = []
@@ -60,6 +62,7 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private var windows = NSHashTable<BrowserModel>.weakObjects()
     @ObservationIgnored private weak var focusedBrowser: BrowserModel?
     @ObservationIgnored private let directory: URL
+    @ObservationIgnored private let bundledDirectory: URL?
     @ObservationIgnored private var restoration: Task<Void, Never>?
     @ObservationIgnored private var preparation: Task<Void, Never>?
     @ObservationIgnored private var didPrepare = false
@@ -71,7 +74,8 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private var extensionWindows: [UUID: ExtensionWindowController] = [:]
 
     init(directory: URL? = nil, persistent: Bool = true, applicationDirectories: [URL]? = nil,
-         extensionReader: ExtensionReader? = nil, ruleListCompiler: RuleListCompiler? = nil) {
+         extensionReader: ExtensionReader? = nil, ruleListCompiler: RuleListCompiler? = nil, bundledDirectory: URL? = nil) {
+        self.bundledDirectory = bundledDirectory
         self.directory = directory ?? BrowserProfile.directory.appending(path: "Extensions", directoryHint: .isDirectory)
         self.applicationDirectories = applicationDirectories ?? (persistent && !BrowserProfile.isTesting ? DiscoveredExtension.applicationDirectories : [])
         self.extensionReader = extensionReader
@@ -99,9 +103,28 @@ final class BrowserExtensions: NSObject {
                     toolbarIcons[item.id] = icon
                 }
             }
+            try registerBundledExtensions()
         } catch { lastError = error.localizedDescription }
         // No startup runtime work is necessary when there are no enabled extensions.
         didPrepare = !installed.contains(where: \.isEnabled)
+    }
+
+    private func registerBundledExtensions() throws {
+        guard let bundledDirectory else { return }
+        let resource = "ForcedDark"
+        let identifier = "dev.athas.browser.bundled.forced-dark"
+        guard !installed.contains(where: { $0.sourceIdentifier == identifier }) else { return }
+        let manifestURL = bundledDirectory.appending(path: resource).appending(path: "manifest.json")
+        let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
+        guard let name = manifest?["name"] as? String else { throw ExtensionFailure("Invalid bundled extension manifest.") }
+        let item = InstalledExtension(id: UUID(), name: name, kind: .webExtension, filename: resource,
+                                      needsNativeMessaging: false, sourceIdentifier: identifier, sourceAppName: "Browser",
+                                      bundledResource: resource)
+        // Keep a stable identity for WebKit extension storage across app updates.
+        // Bundled resources load directly from the signed app; they are never stale copies.
+        try FileManager.default.createDirectory(at: directory.appending(path: item.id.uuidString), withIntermediateDirectories: true)
+        installed.append(item)
+        try persist()
     }
 
     func restore() async {
@@ -507,7 +530,12 @@ final class BrowserExtensions: NSObject {
 
     private func loadRuntime(_ item: InstalledExtension, askPermission: Bool, revision: UInt64) async throws {
         try validateLoad(item.id, revision: revision)
-        let resource = directory.appending(path: item.id.uuidString).appending(path: item.filename)
+        let resource: URL
+        if let bundledResource = item.bundledResource, let bundledDirectory {
+            resource = bundledDirectory.appending(path: bundledResource, directoryHint: .isDirectory)
+        } else {
+            resource = directory.appending(path: item.id.uuidString).appending(path: item.filename)
+        }
         switch item.kind {
         case .webExtension:
             guard contexts[item.id] == nil else { return }

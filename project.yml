@@ -38,6 +38,9 @@ targetTemplates:
       - path: Sources/Browser
       - path: assets
         buildPhase: resources
+      - path: Extensions/ForcedDark
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: Browser
