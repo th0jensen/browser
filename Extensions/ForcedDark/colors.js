@@ -78,6 +78,7 @@
   const luminance = c => c.slice(0,3).map(linear).reduce((sum,x,i) => sum+x*[0.2126,0.7152,0.0722][i],0);
   const composite = (front, back) => [...front.slice(0,3).map((x,i) => x*front[3]+back[i]*(1-front[3])),1];
   const contrast = (a,b) => (Math.max(luminance(a),luminance(b))+0.05)/(Math.min(luminance(a),luminance(b))+0.05);
+  const isDark = color => Boolean(color) && toLab(color)[0] < 50;
   function background(color, surface) {
     if (!color || color[3] === 0) return color;
     const lab = toLab(color);
@@ -121,5 +122,5 @@
     return {enabled:typeof value.enabled === "boolean" ? value.enabled : true,
       background:/^#[\da-f]{6}$/i.test(value.background) && toLab(parse(value.background))[0] <= 45 ? value.background : defaults.background};
   }
-  globalThis.ForcedDarkColors = Object.freeze({parse,css,invert,toLab,fromLab,background,foreground,composite,contrast,settings,defaults});
+  globalThis.ForcedDarkColors = Object.freeze({parse,css,invert,toLab,fromLab,background,foreground,composite,contrast,isDark,settings,defaults});
 })();

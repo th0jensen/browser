@@ -16,6 +16,13 @@ test('Chromium lightness inversion uses 110 − L, capped at 100', () => {
   const lab = C.toLab(input);
   near(C.invert(input),C.fromLab([Math.min(110-lab[0],100),lab[1],lab[2]],1));
 });
+test('dark authored canvases are detected before page transformation', () => {
+  assert.equal(C.isDark(C.parse('#202124')),true);
+  assert.equal(C.isDark(C.parse('#121212')),true);
+  assert.equal(C.isDark(C.parse('#808080')),false);
+  assert.equal(C.isDark(C.parse('#ffffff')),false);
+  assert.equal(C.isDark(null),false);
+});
 test('light neutral surfaces use the custom background and retain alpha', () => {
   const surface = C.parse('#181c20');
   near(C.background([1,1,1,0.6],surface),[...surface.slice(0,3),0.6]);

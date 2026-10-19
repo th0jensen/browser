@@ -1,6 +1,11 @@
 (() => {
   "use strict";
-  const reveal = () => document.documentElement?.setAttribute("data-browser-forced-dark-ready", "");
+  const loadingBackground = "--browser-forced-dark-background";
+  const reveal = () => {
+    const root = document.documentElement;
+    root?.setAttribute("data-browser-forced-dark-ready", "");
+    root?.style.removeProperty(loadingBackground);
+  };
   // A failed page pass must never leave content hidden by the loading sheet.
   setTimeout(reveal,1500);
   if (document.contentType.startsWith("image/")) { reveal(); return; }
@@ -9,6 +14,12 @@
   const attribute = "data-browser-forced-dark";
   const skip = new Set(["SCRIPT","STYLE","LINK","META","HEAD","TITLE","IMG","PICTURE","VIDEO","CANVAS","IFRAME","OBJECT","EMBED"]);
   let preferences = C.defaults;
+  function paintLoadingCanvas() {
+    const root = document.documentElement;
+    if (!root) return;
+    if (preferences.enabled) root.style.setProperty(loadingBackground,preferences.background,"important");
+    else root.style.removeProperty(loadingBackground);
+  }
   let timer;
   let nextID = 0;
   const ids = new WeakMap();
@@ -102,6 +113,7 @@
   function render() {
     if (!document.documentElement) return;
     observer.disconnect();
+    paintLoadingCanvas();
     for (const [root,style] of roots) {
       if (root !== document && !root.host.isConnected) { roots.delete(root); }
       else style.disabled = true;
@@ -110,11 +122,14 @@
     // the same task; the browser cannot paint the authored white page between.
     reveal();
     if (!preferences.enabled) { observe(); return; }
-    if (!roots.has(document)) createSheet(document);
     const surface = C.parse(preferences.background);
     const rootStyle = getComputedStyle(document.documentElement);
     const bodyStyle = document.body && getComputedStyle(document.body);
     const base = [bodyStyle?.backgroundColor,rootStyle.backgroundColor].map(C.parse).find(color => color && color[3] >= 0.95);
+    // A dark page already provides its own coordinated palette. Do not scan or
+    // override it; disabling old sheets also handles a live light-to-dark switch.
+    if (C.isDark(base)) { observe(); return; }
+    if (!roots.has(document)) createSheet(document);
     const canvas = base ? C.background(base,surface) : surface;
     const scrollbar = `*{scrollbar-color:#747474 ${preferences.background}!important}*::-webkit-scrollbar-track{background-color:${preferences.background}!important}*::-webkit-scrollbar-thumb{background-color:#747474!important;border-color:${preferences.background}!important}`;
     const output = new Map([[document,[`html{background-color:${C.css(canvas)}!important;color-scheme:dark!important}`,scrollbar]]]);
@@ -160,11 +175,13 @@
   }
   api.storage.local.get("forcedDark").then(value => {
     preferences = C.settings(value.forcedDark);
+    paintLoadingCanvas();
     schedule();
   }).catch(schedule);
   api.storage.onChanged.addListener((changes,area) => {
     if (area !== "local" || !changes.forcedDark) return;
     preferences = C.settings(changes.forcedDark.newValue);
+    paintLoadingCanvas();
     schedule();
   });
   // Stylesheets, media queries, form states and viewport changes can alter

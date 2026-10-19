@@ -26,6 +26,9 @@ struct InstalledExtension: Codable, Identifiable {
 final class BrowserExtensions: NSObject {
     typealias ExtensionReader = @MainActor (URL) async throws -> WKWebExtension
     typealias RuleListCompiler = @MainActor (String, String) async throws -> WKContentRuleList?
+    static let forcedDarkApplicationIdentifier = "dev.athas.browser.forced-dark"
+    static let forcedDarkDescription = "Dark surfaces and readable text using Chromium’s CIELAB lightness inversion, while preserving images."
+    private static let forcedDarkBackgroundKey = "ForcedDarkUnderPageBackground"
 
     private final class AppliedRules {
         var revision: UInt64 = 0
@@ -57,6 +60,8 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private var loadRevisions: [UUID: UInt64] = [:]
     @ObservationIgnored private let extensionReader: ExtensionReader?
     @ObservationIgnored private let ruleListCompiler: RuleListCompiler
+    @ObservationIgnored private let appearanceDefaults: UserDefaults?
+    @ObservationIgnored private var forcedDarkBackground: NSColor?
     @ObservationIgnored private var windows = NSHashTable<BrowserModel>.weakObjects()
     @ObservationIgnored private weak var focusedBrowser: BrowserModel?
     @ObservationIgnored private let directory: URL
@@ -71,10 +76,12 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private var extensionWindows: [UUID: ExtensionWindowController] = [:]
 
     init(directory: URL? = nil, persistent: Bool = true, applicationDirectories: [URL]? = nil,
-         extensionReader: ExtensionReader? = nil, ruleListCompiler: RuleListCompiler? = nil) {
+         extensionReader: ExtensionReader? = nil, ruleListCompiler: RuleListCompiler? = nil,
+         appearanceDefaults: UserDefaults? = nil) {
         self.directory = directory ?? BrowserProfile.directory.appending(path: "Extensions", directoryHint: .isDirectory)
         self.applicationDirectories = applicationDirectories ?? (persistent && !BrowserProfile.isTesting ? DiscoveredExtension.applicationDirectories : [])
         self.extensionReader = extensionReader
+        self.appearanceDefaults = appearanceDefaults ?? (persistent ? .standard : nil)
         self.ruleListCompiler = ruleListCompiler ?? { identifier, rules in
             try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: identifier,
                                                                              encodedContentRuleList: rules)
@@ -100,10 +107,16 @@ final class BrowserExtensions: NSObject {
                 }
             }
         } catch { lastError = error.localizedDescription }
+        if installed.contains(where: { $0.isEnabled && $0.name == "Forced Dark" }) {
+            let hex = self.appearanceDefaults?.string(forKey: Self.forcedDarkBackgroundKey) ?? "#121212"
+            forcedDarkBackground = Self.color(hex: hex)
+        }
         // No startup runtime work is necessary when there are no enabled extensions.
         didPrepare = !installed.contains(where: \.isEnabled)
     }
+}
 
+extension BrowserExtensions {
     func restore() async {
         if let restoration { await restoration.value; return }
         let task = Task { await restoreInstalled() }
@@ -265,7 +278,10 @@ final class BrowserExtensions: NSObject {
         controller.didOpenWindow(browser)
         browser.tabs.forEach {
             controller.didOpenTab($0)
-            if let webView = $0.webView { updateRules(in: webView) }
+            if let webView = $0.webView {
+                updateRules(in: webView)
+                applyPageBackground(to: webView)
+            }
         }
         focus(browser)
     }
@@ -307,6 +323,45 @@ final class BrowserExtensions: NSObject {
 
     func updateRules(in webView: WKWebView) {
         applyRules(to: webView.configuration.userContentController)
+    }
+
+    func applyPageBackground(to webView: WKWebView) {
+        webView.underPageBackgroundColor = forcedDarkBackground
+    }
+
+    private static func isForcedDark(_ webExtension: WKWebExtension) -> Bool {
+        webExtension.displayName == "Forced Dark"
+            && webExtension.manifest["description"] as? String == forcedDarkDescription
+    }
+
+    private static func color(hex: String) -> NSColor? {
+        guard hex.count == 7, hex.first == "#", let value = UInt64(hex.dropFirst(), radix: 16) else { return nil }
+        return NSColor(srgbRed: CGFloat((value >> 16) & 0xff) / 255,
+                       green: CGFloat((value >> 8) & 0xff) / 255,
+                       blue: CGFloat(value & 0xff) / 255, alpha: 1)
+    }
+
+    private func setForcedDarkBackground(_ hex: String?) {
+        forcedDarkBackground = hex.flatMap(Self.color)
+        if let hex, forcedDarkBackground != nil {
+            appearanceDefaults?.set(hex, forKey: Self.forcedDarkBackgroundKey)
+        } else { appearanceDefaults?.removeObject(forKey: Self.forcedDarkBackgroundKey) }
+        for browser in windows.allObjects {
+            for tab in browser.tabs { if let webView = tab.webView { applyPageBackground(to: webView) } }
+        }
+    }
+
+    @discardableResult
+    func handleForcedDarkMessage(_ message: Any, applicationIdentifier: String?,
+                                 context: WKWebExtensionContext) throws -> [String: Bool] {
+        guard applicationIdentifier == Self.forcedDarkApplicationIdentifier, Self.isForcedDark(context.webExtension),
+              let value = message as? [String: Any], value["type"] as? String == "appearance",
+              let enabled = value["enabled"] as? Bool, let background = value["background"] as? String,
+              Self.color(hex: background) != nil else {
+            throw ExtensionFailure("This native extension message is not supported.")
+        }
+        setForcedDarkBackground(enabled ? background : nil)
+        return ["ok": true]
     }
 
     private func applyRules(to controller: WKUserContentController) {
@@ -427,7 +482,8 @@ final class BrowserExtensions: NSObject {
         let filename = url.pathExtension == "appex" ? "extension.appex" : url.pathExtension == "zip" ? "extension.zip" : "resources"
         let item = InstalledExtension(id: id, name: webExtension.displayName ?? url.lastPathComponent,
                                       kind: .webExtension, filename: filename,
-                                      needsNativeMessaging: webExtension.requestedPermissions.contains(.nativeMessaging),
+                                      needsNativeMessaging: webExtension.requestedPermissions.contains(.nativeMessaging)
+                                          && !Self.isForcedDark(webExtension),
                                       sourceIdentifier: discovery?.identifier, sourceAppName: discovery?.appName,
                                       sourceAppPath: discovery?.appURL?.path)
         try copyResource(url, for: item)
@@ -511,10 +567,10 @@ final class BrowserExtensions: NSObject {
         switch item.kind {
         case .webExtension:
             guard contexts[item.id] == nil else { return }
-            if item.needsNativeMessaging {
+            let webExtension = try await readWebExtension(at: resource)
+            if item.needsNativeMessaging && !Self.isForcedDark(webExtension) {
                 throw ExtensionFailure("This extension requires Safari’s native companion messaging, which Browser cannot host. Import its content-blocker JSON rules instead, when available.")
             }
-            let webExtension = try await readWebExtension(at: resource)
             try validateLoad(item.id, revision: revision)
             if askPermission {
                 let permissions = webExtension.requestedPermissions.map(\.rawValue).sorted()
@@ -531,6 +587,15 @@ final class BrowserExtensions: NSObject {
             for permission in webExtension.requestedPermissions { context.setPermissionStatus(.grantedExplicitly, for: permission) }
             for pattern in webExtension.allRequestedMatchPatterns { context.setPermissionStatus(.grantedExplicitly, for: pattern) }
             try controller.load(context)
+            do {
+                if Self.isForcedDark(webExtension) && webExtension.hasBackgroundContent {
+                    try await context.loadBackgroundContent()
+                }
+            } catch {
+                try? controller.unload(context)
+                setForcedDarkBackground(nil)
+                throw error
+            }
             contexts[item.id] = context
             cacheToolbarMetadata(item, extension: webExtension, action: context.action(for: nil))
             actionRevision += 1
@@ -556,6 +621,7 @@ final class BrowserExtensions: NSObject {
         invalidateLoad(item.id)
         if let context = contexts[item.id] {
             if popupContext === context { closePopup() }
+            if Self.isForcedDark(context.webExtension) { setForcedDarkBackground(nil) }
             try controller.unload(context)
             contexts[item.id] = nil
         }
@@ -616,6 +682,12 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
     func webExtensionController(_ controller: WKWebExtensionController,
                                 focusedWindowFor context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? {
         focusedBrowser
+    }
+
+    func webExtensionController(_ controller: WKWebExtensionController, sendMessage message: Any,
+                                toApplicationWithIdentifier applicationIdentifier: String?,
+                                for context: WKWebExtensionContext) async throws -> Any? {
+        try handleForcedDarkMessage(message, applicationIdentifier: applicationIdentifier, context: context)
     }
 
     func webExtensionController(_ controller: WKWebExtensionController, openNewTabUsing configuration: WKWebExtension.TabConfiguration,

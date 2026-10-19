@@ -1,7 +1,7 @@
 /* Loaded by WebKit before page scripts/first paint. Keep layout in place while
    the content script reads authored colors and publishes the first dark pass. */
 html:not([data-browser-forced-dark-ready]) {
-  background-color: #121212 !important;
+  background-color: var(--browser-forced-dark-background, #121212) !important;
   color-scheme: dark !important;
 }
 html:not([data-browser-forced-dark-ready]) body {
