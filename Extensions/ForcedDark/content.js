@@ -1,6 +1,9 @@
 (() => {
   "use strict";
-  if (document.contentType.startsWith("image/")) return;
+  const reveal = () => document.documentElement?.setAttribute("data-browser-forced-dark-ready", "");
+  // A failed page pass must never leave content hidden by the loading sheet.
+  setTimeout(reveal,1500);
+  if (document.contentType.startsWith("image/")) { reveal(); return; }
   const C = globalThis.ForcedDarkColors;
   const api = globalThis.browser ?? globalThis.chrome;
   const attribute = "data-browser-forced-dark";
@@ -13,11 +16,12 @@
   const observer = new MutationObserver(schedule);
   const colorPattern = /rgba?\([^)]*\)|color\(srgb [^)]*\)/g;
   function createSheet(root) {
-    const style = document.createElement("style");
-    style.dataset.browserForcedDarkSheet = "";
-    root.append(style);
-    roots.set(root,style);
-    return style;
+    // Constructed sheets use CSSOM, so a site's style-src CSP cannot block the
+    // extension by rejecting an inline <style> text node.
+    const sheet = new CSSStyleSheet();
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets,sheet];
+    roots.set(root,sheet);
+    return sheet;
   }
   function observe() {
     for (const root of roots.keys()) observer.observe(root, {subtree:true,childList:true,attributes:true,characterData:true});
@@ -62,18 +66,14 @@
     if (!document.documentElement) return;
     observer.disconnect();
     for (const [root,style] of roots) {
-      if (root !== document && !root.host.isConnected) { style.remove(); roots.delete(root); }
+      if (root !== document && !root.host.isConnected) { roots.delete(root); }
       else style.disabled = true;
     }
+    // Removing the loading guard and publishing the finished colors happen in
+    // the same task; the browser cannot paint the authored white page between.
+    reveal();
     if (!preferences.enabled) { observe(); return; }
-    // The document stylesheet belongs in <html>; shadow sheets belong in their
-    // own scope. Read all authored styles before publishing any new rules.
-    if (!roots.has(document)) {
-      const style = document.createElement("style");
-      style.dataset.browserForcedDarkSheet = "";
-      document.documentElement.append(style);
-      roots.set(document,style);
-    }
+    if (!roots.has(document)) createSheet(document);
     const surface = C.parse(preferences.background);
     const rootStyle = getComputedStyle(document.documentElement);
     const bodyStyle = document.body && getComputedStyle(document.body);
@@ -86,7 +86,7 @@
       const rules = output.get(root) ?? [];
       output.set(root,rules);
       for (const element of root.querySelectorAll("*")) {
-        if (skip.has(element.tagName) || element === roots.get(root)) continue;
+        if (skip.has(element.tagName)) continue;
         const parent = element.parentElement;
         const backdrop = backdrops.get(parent) ?? inherited;
         const style = getComputedStyle(element);
@@ -114,9 +114,8 @@
       walk(document,canvas);
       for (const [root,rules] of output) {
         const style = roots.get(root);
-        // Restore sheets removed by an application re-render.
-        if (!style.isConnected) (root === document ? document.documentElement : root).append(style);
-        style.textContent = rules.join("\n");
+        if (!root.adoptedStyleSheets.includes(style)) root.adoptedStyleSheets = [...root.adoptedStyleSheets,style];
+        style.replaceSync(rules.join("\n"));
         style.disabled = false;
       }
     } finally { observe(); }

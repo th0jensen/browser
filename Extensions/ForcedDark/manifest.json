@@ -8,6 +8,7 @@
   "content_scripts": [{
     "matches": ["http://*/*", "https://*/*"],
     "js": ["colors.js", "content.js"],
+    "css": ["loading.css"],
     "run_at": "document_start",
     "all_frames": true
   }],
