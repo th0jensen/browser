@@ -28,7 +28,16 @@
   }
   function schedule() {
     if (timer !== undefined) return;
-    timer = requestAnimationFrame(() => { timer = undefined; render(); });
+    // Hidden/occluded WebKit views can suspend animation frames entirely. The
+    // timer keeps background tabs correct; visible tabs recolor before paint.
+    const run = () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(timer);
+      timer = undefined;
+      render();
+    };
+    const frame = requestAnimationFrame(run);
+    timer = setTimeout(run,100);
   }
   function rule(element, declarations, pseudo = "") {
     if (!declarations.length) return "";
@@ -84,7 +93,7 @@
     if (outline && style.outlineStyle !== "none") result.push(declaration("outline-color",C.foreground(outline,effective)));
     const gradient = style.backgroundImage;
     if (gradient.includes("gradient(") && !gradient.includes("url(")) {
-      result.push(`background-image:${gradient.replace(colorPattern,text => C.css(C.background(C.parse(text),C.parse(preferences.background))))}!important`);
+      result.push(`background-image:${gradient.replace(colorPattern,text => { const color = C.parse(text); return color ? C.css(C.background(color,C.parse(preferences.background))) : text; })}!important`);
     }
     return {declarations:result,backdrop:effective};
   }
