@@ -193,6 +193,29 @@ final class ToolbarPolishTests: XCTestCase {
         XCTAssertNotNil(store.toolbarIcon(for: item))
     }
 
+    func testPendingLayoutWriteDoesNotOverwriteNewerExternalOrder() async throws {
+        let box = ToolbarDataBox()
+        let initial: [NSToolbarItem.Identifier] = [.init("back"), .init("address")]
+        box.data = try JSONSerialization.data(withJSONObject: ["identifiers": initial.map(\.rawValue)])
+        let binding = Binding(get: { box.data }, set: { box.data = $0 })
+        let source = PolishToolbarDelegate()
+        let toolbar = NSToolbar(identifier: "BrowserToolbar.tests.ExternalPendingLayout.\(UUID())")
+        let adapter = ToolbarCustomizationAdapter(source: source)
+        toolbar.delegate = adapter
+        toolbar.itemIdentifiers = initial
+        let persistence = ToolbarLayoutPersistence()
+        persistence.update(toolbar: toolbar, binding: binding)
+        toolbar.itemIdentifiers = initial + [.space]
+        persistence.capture(toolbar)
+        let external: [NSToolbarItem.Identifier] = [.init("settings"), .space, .init("address")]
+        let externalData = try JSONSerialization.data(withJSONObject: ["identifiers": external.map(\.rawValue)])
+        box.data = externalData
+        await Task.yield()
+        XCTAssertEqual(box.data, externalData, "A queued local write must not replace a newer shared order")
+        persistence.update(toolbar: toolbar, binding: binding)
+        XCTAssertEqual(toolbar.itemIdentifiers, external)
+    }
+
     func testLayoutSurvivesNewDefaultsAndMissingReturningExtensions() async throws {
         let box = ToolbarDataBox()
         let binding = Binding(get: { box.data }, set: { box.data = $0 })

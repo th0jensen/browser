@@ -79,19 +79,25 @@ final class ToolbarLayoutPersistence {
     }
 
     private func write(_ layout: Layout) {
+        guard let binding else { return }
         if encodedIdentifiers != layout.identifiers {
             encodedData = try? JSONEncoder().encode(layout)
             encodedIdentifiers = encodedData == nil ? nil : layout.identifiers
         }
-        guard let data = encodedData, binding?.wrappedValue != data, pendingWrite != data else { return }
+        guard let data = encodedData, binding.wrappedValue != data, pendingWrite != data else { return }
+        let sourceData = binding.wrappedValue
         pendingWrite = data
         let expectedToolbar = toolbar
         DispatchQueue.main.async { [weak self] in
             guard let self, self.pendingWrite == data else { return }
             self.pendingWrite = nil
             guard self.toolbar === expectedToolbar else { return }
+            // A different window can publish a newer order before this callback.
+            // Keep that external change instead of replacing it with an older edit.
+            let currentData = binding.wrappedValue
+            guard currentData == sourceData || currentData == data else { return }
             self.lastReadData = data
-            self.binding?.wrappedValue = data
+            if currentData != data { binding.wrappedValue = data }
         }
     }
 
