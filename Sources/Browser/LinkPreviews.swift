@@ -193,12 +193,10 @@ final class LinkPreviewState {
     let url: URL
     var result: LinkSummary?
     var image: NSImage?
-    var isLoading = true
     var isKept = false
     var cardWidth: CGFloat = 300
     var contentHeight: CGFloat = 150
     var maximumHeight: CGFloat = 420
-    var error: String?
     init(url: URL) { self.url = url }
 
     var contextText: String {
@@ -251,6 +249,8 @@ final class LinkPreviewPresentation {
     lazy var actions = PreviewNoteMenuPresenter(preview: self)
     var task: Task<Void, Never>?
     var imageTask: Task<Void, Never>?
+    var preparationTimeoutTask: Task<Void, Never>?
+    var isPresented: Bool { glass != nil || panel != nil }
 
     init(url: URL, sourceView: WKWebView, anchor: NSRect, open: @escaping () -> Void,
          didKeep: @escaping (LinkPreviewPresentation) -> Void, didClose: @escaping (LinkPreviewPresentation) -> Void,
@@ -265,8 +265,32 @@ final class LinkPreviewPresentation {
         self.focusNote = focusNote
     }
 
+    func beginPreparing() {
+        guard !isClosed, observers.isEmpty, let window = sourceWindow else { return }
+        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
+                               (NSWindow.willMoveNotification, window as AnyObject),
+                               (NSWindow.didResizeNotification, window as AnyObject),
+                               (NSWindow.willCloseNotification, window as AnyObject),
+                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
+            let observer = NotificationCenter.default.addObserver(
+                forName: name, object: object, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dismissIfTransient() }
+            }
+            observers.append(observer)
+        }
+    }
+
+    func isAttached(to view: WKWebView) -> Bool {
+        sourceView === view && sourceWindow === view.window
+    }
+
     func show() {
+        guard !isClosed, !isPresented else { return }
+        preparationTimeoutTask?.cancel()
+        preparationTimeoutTask = nil
         guard let window = sourceWindow, let root = window.contentView else { close(); return }
+        beginPreparing()
         let content = NSHostingView(rootView: LinkPreviewCard(preview: self))
         content.focusRingType = .none
         self.content = content
@@ -284,15 +308,6 @@ final class LinkPreviewPresentation {
         root.addSubview(glass, positioned: .above, relativeTo: nil)
         resize(height: state.contentHeight)
         guard !isClosed else { return }
-        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
-                               (NSWindow.willMoveNotification, window as AnyObject),
-                               (NSWindow.didResizeNotification, window as AnyObject),
-                               (NSWindow.willCloseNotification, window as AnyObject),
-                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
-            observers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.dismissIfTransient() }
-            })
-        }
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel, .mouseMoved]) { [weak self] event in
             guard let self, !self.isClosed else { return event }
             if event.type == .keyDown,
@@ -393,6 +408,7 @@ final class LinkPreviewPresentation {
         cancelDismiss()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
         panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.orderFront(nil)
@@ -425,6 +441,7 @@ final class LinkPreviewPresentation {
         isClosed = true
         task?.cancel(); task = nil
         imageTask?.cancel(); imageTask = nil
+        preparationTimeoutTask?.cancel(); preparationTimeoutTask = nil
         cancelDismiss()
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
         observers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -495,17 +512,22 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     private var enabled = UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey)
     private let modifierFlags: () -> NSEvent.ModifierFlags
     private let summaryProvider: (@Sendable (URL) async throws -> LinkSummary)?
+    private let waitForPreparationDeadline: @Sendable () async throws -> Void
     private var settingsObserver: NSObjectProtocol?
     private(set) var current: LinkPreviewPresentation?
     private var notes: [UUID: LinkPreviewPresentation] = [:]
     private var cache: [URL: (Date, LinkSummary, NSImage?)] = [:]
-    var presentedPreview: LinkPreviewState? { current?.state }
+    var presentedPreview: LinkPreviewState? { current?.isPresented == true ? current?.state : nil }
     var keptNotes: [LinkPreviewState] { notes.values.map(\.state) }
 
     init(observesSettings: Bool = true, modifierFlags: @escaping () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags },
-         summaryProvider: (@Sendable (URL) async throws -> LinkSummary)? = nil) {
+         summaryProvider: (@Sendable (URL) async throws -> LinkSummary)? = nil,
+         waitForPreparationDeadline: @escaping @Sendable () async throws -> Void = {
+             try await Task.sleep(for: .seconds(5))
+         }) {
         self.modifierFlags = modifierFlags
         self.summaryProvider = summaryProvider
+        self.waitForPreparationDeadline = waitForPreparationDeadline
         super.init()
         guard observesSettings else { return }
         settingsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -548,7 +570,10 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         guard enabled, message.frameInfo.isMainFrame, let view = message.webView,
               let body = message.body as? [String: Any] else { return }
         if body["leave"] as? Bool == true {
-            if current?.sourceView === view { current?.scheduleDismiss() }
+            if let current, current.sourceView === view {
+                if current.isPresented { current.scheduleDismiss() }
+                else { current.close() }
+            }
             return
         }
         guard modifierFlags().contains(.shift), view.window?.isKeyWindow == true,
@@ -594,11 +619,11 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             self?.notes[preview.state.id] = nil
         })
         current = preview
-        preview.show()
+        preview.beginPreparing()
         if let (date, result, image) = cache[request.url], Date().timeIntervalSince(date) < 300 {
             preview.state.result = result
             preview.state.image = image
-            preview.state.isLoading = false
+            preview.show()
         } else {
             startLoading(preview, from: request.url)
         }
@@ -606,26 +631,39 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
 
     private func startLoading(_ preview: LinkPreviewPresentation, from url: URL) {
         let summarize = summaryProvider
+        let waitForDeadline = waitForPreparationDeadline
         preview.task = Task { [weak self, weak preview] in
             guard let self, let preview, !Task.isCancelled, !preview.isClosed else { return }
             await self.load(preview, from: url, summarize: summarize)
+        }
+        preview.preparationTimeoutTask = Task { [weak preview] in
+            do { try await waitForDeadline() }
+            catch { return }
+            guard !Task.isCancelled, let preview, !preview.isClosed, !preview.isPresented else { return }
+            preview.close()
         }
     }
 
     private func load(_ preview: LinkPreviewPresentation, from url: URL,
                       summarize: (@Sendable (URL) async throws -> LinkSummary)?) async {
+        defer { preview.task = nil }
         let state = preview.state
         do {
             let result = try await summary(for: preview, url: url, summarize: summarize)
-            guard !Task.isCancelled, !preview.isClosed else { return }
+            guard !Task.isCancelled, !preview.isClosed, isUsable(result) else {
+                preview.close()
+                return
+            }
             cacheResult(result, image: state.image, for: url)
+            guard await canReveal(preview) else {
+                preview.close()
+                return
+            }
             state.result = result
-            state.isLoading = false
-        } catch is CancellationError { }
-        catch {
-            guard !Task.isCancelled, !preview.isClosed else { return }
-            state.error = "Preview unavailable. Open the page to read it."
-            state.isLoading = false
+            preview.show()
+        } catch {
+            guard !preview.isClosed else { return }
+            preview.close()
         }
     }
 
@@ -636,20 +674,41 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         let document = try await LinkPreviewFetcher.shared.document(at: url)
         guard !Task.isCancelled, !preview.isClosed else { throw CancellationError() }
         if let imageURL = document.imageURL { loadImage(imageURL, for: preview, url: url) }
-        return try await LocalIntelligence.shared.summarize(text: document.text, url: url) { [weak preview] partial in
-            await MainActor.run {
-                guard let preview, !preview.isClosed else { return }
-                preview.state.result = partial
+        return try await LocalIntelligence.shared.summarize(text: document.text, url: url)
+    }
+
+    private func canReveal(_ preview: LinkPreviewPresentation) async -> Bool {
+        guard enabled, current === preview, modifierFlags().contains(.shift),
+              let view = preview.sourceView, preview.isAttached(to: view), view.window?.isKeyWindow == true,
+              !view.isHiddenOrHasHiddenAncestor else { return false }
+        // Injected providers are test seams. Production asks the isolated hover
+        // tracker again so a queued leave cannot race a completed summary onto screen.
+        guard summaryProvider == nil else { return true }
+        let url = preview.state.url.absoluteString
+        guard let encoded = try? JSONSerialization.data(withJSONObject: url, options: .fragmentsAllowed),
+              let literal = String(data: encoded, encoding: .utf8) else { return false }
+        let active = await withCheckedContinuation { continuation in
+            view.evaluateJavaScript("window.browserLinkPreviewIsActive?.(\(literal)) === true",
+                                    in: nil, in: Self.world) { result in
+                continuation.resume(returning: (try? result.get()) as? Bool == true)
             }
         }
+        return active && enabled && current === preview && !preview.isClosed && modifierFlags().contains(.shift)
+            && preview.isAttached(to: view) && view.window?.isKeyWindow == true && !view.isHiddenOrHasHiddenAncestor
+    }
+
+    private func isUsable(_ result: LinkSummary) -> Bool {
+        !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func loadImage(_ imageURL: URL, for preview: LinkPreviewPresentation, url: URL) {
         preview.imageTask = Task { [weak self, weak preview] in
+            guard let preview else { return }
+            defer { preview.imageTask = nil }
             guard let data = try? await LinkPreviewFetcher.shared.imageData(at: imageURL),
-                  let preview, !Task.isCancelled, !preview.isClosed else { return }
-            preview.state.image = NSImage(data: data)
-            if let cached = self?.cache[url] { self?.cache[url] = (cached.0, cached.1, preview.state.image) }
+                  !Task.isCancelled, !preview.isClosed, let image = NSImage(data: data) else { return }
+            if !preview.isPresented { preview.state.image = image }
+            if let cached = self?.cache[url] { self?.cache[url] = (cached.0, cached.1, image) }
         }
     }
 
@@ -663,6 +722,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
       if (window.browserSetLinkPreviews) return;
       let enabled = false, link = null, timer = null, sent = false;
       const post = data => window.webkit.messageHandlers.browserLinkPreview.postMessage(data);
+      window.browserLinkPreviewIsActive = href => enabled && sent && !document.hidden && link?.href === href;
       function clear() { clearTimeout(timer); if (sent) post({leave: true}); sent = false; }
       function contentLink(target) {
         const candidate = target.closest?.('a[href]');

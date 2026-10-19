@@ -210,7 +210,7 @@ extension BrowserIntelligenceTests {
 
 
 extension BrowserIntelligenceTests {
-    func testPreviewHoverBridgeAndTextDragHitTargets() throws {
+    func testPreviewHoverBridgeAndTextDragHitTargets() async throws {
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
         let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.contentView = view
@@ -221,8 +221,10 @@ extension BrowserIntelligenceTests {
         let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/hover")!, sourceView: view,
             anchor: anchor, open: {}, didKeep: { _ in }, didClose: { _ in },
             focusNote: { dragFocusRequests.append($0) })
+        preview.state.result = LinkSummary(title: "Hover", summary: "Useful preview content.")
         defer { preview.close(); window.close() }
         preview.show()
+        try await waitUntil { preview.state.contentHeight != 150 }
         let glass = try XCTUnwrap(preview.glass)
         let host = try XCTUnwrap(preview.content)
         XCTAssertTrue(glass.window === window, "Hover glass samples the webpage in the same window")
@@ -291,6 +293,7 @@ extension BrowserIntelligenceTests {
         var closes = 0
         let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/tiny")!, sourceView: view,
             anchor: window.convertToScreen(NSRect(x: 10, y: 10, width: 40, height: 20)), open: {}, didKeep: { _ in }, didClose: { _ in closes += 1 })
+        preview.state.result = LinkSummary(title: "Tiny", summary: "Useful preview content.")
         preview.show()
         XCTAssertTrue(preview.isClosed)
         XCTAssertNil(preview.panel)
