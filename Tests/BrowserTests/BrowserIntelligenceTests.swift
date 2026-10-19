@@ -210,8 +210,351 @@ extension BrowserIntelligenceTests {
 
 
 extension BrowserIntelligenceTests {
+    func testPreviewHoverBridgeAndTextDragHitTargets() throws {
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        let anchor = window.convertToScreen(NSRect(x: 100, y: 460, width: 250, height: 20))
+        var dragFocusRequests: [LinkPreviewPanel] = []
+        let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/hover")!, sourceView: view,
+            anchor: anchor, open: {}, didKeep: { _ in }, didClose: { _ in },
+            focusNote: { dragFocusRequests.append($0) })
+        defer { preview.close(); window.close() }
+        preview.show()
+        let glass = try XCTUnwrap(preview.glass)
+        let host = try XCTUnwrap(preview.content)
+        XCTAssertTrue(glass.window === window, "Hover glass samples the webpage in the same window")
+        XCTAssertNil(preview.panel)
+        XCTAssertTrue(glass.contentView === host)
+        XCTAssertEqual(glass.style, .regular)
+        XCTAssertEqual(anchor.minY - preview.frame.maxY, 24, accuracy: 0.5)
+        XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: anchor.minY - 8)))
+        XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: (anchor.minY + preview.frame.maxY) / 2)))
+        XCTAssertFalse(preview.containsHoverPoint(NSPoint(x: anchor.maxX + 150, y: anchor.minY - 100)))
+        let parent = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 400))
+        let drag = PreviewDragView(preview: preview)
+        drag.frame = NSRect(x: 10, y: 10, width: 300, height: 250)
+        drag.excludingFooter = true
+        parent.addSubview(drag)
+        XCTAssertTrue(drag.hitTest(NSPoint(x: 100, y: 150)) === drag, "Summary text remains a drag target")
+        XCTAssertTrue(drag.hitTest(NSPoint(x: 15, y: 15)) === drag, "Empty padding remains a drag target")
+        XCTAssertNil(drag.hitTest(NSPoint(x: 290, y: 25)), "Open Page remains clickable")
+        let frame = preview.frame
+        let sourceFrame = window.frame
+        let tint = glass.tintColor
+        preview.beginDrag()
+        let panel = try XCTUnwrap(preview.panel)
+        XCTAssertEqual(dragFocusRequests.count, 1, "The note is focused before the first drag event is tracked")
+        XCTAssertTrue(dragFocusRequests.first === panel)
+        XCTAssertTrue(glass.window === panel)
+        XCTAssertTrue(glass.contentView === host, "Detaching keeps the same contextual content host")
+        let surface = try XCTUnwrap(panel.contentView)
+        XCTAssertFalse(surface === glass, "The panel's rounded alpha shape is independent of glass rendering")
+        XCTAssertTrue(glass.superview === surface)
+        XCTAssertEqual(surface.layer?.cornerRadius, glass.cornerRadius)
+        XCTAssertEqual(surface.layer?.masksToBounds, true)
+        XCTAssertEqual(surface.focusRingType, .none)
+        XCTAssertEqual(glass.focusRingType, .none)
+        preview.resize(height: 480)
+        XCTAssertEqual(panel.frame, frame, "Card does not jump while dragging")
+        preview.moveDuringDrag(to: NSPoint(x: frame.minX + 35, y: frame.minY - 20))
+        XCTAssertEqual(glass.tintColor, tint)
+        XCTAssertEqual(glass.style, .regular)
+        XCTAssertEqual(panel.frame.origin, NSPoint(x: frame.minX + 35, y: frame.minY - 20))
+        XCTAssertEqual(window.frame, sourceFrame, "Tearing off a card must never move the browser window")
+        preview.endDrag()
+        XCTAssertTrue(preview.state.isKept)
+        XCTAssertEqual(glass.frame, surface.bounds)
+        XCTAssertEqual(glass.tintColor, tint)
+        preview.beginDrag()
+        XCTAssertEqual(dragFocusRequests.count, 2, "An existing note also gains focus before tracking")
+        preview.endDrag()
+        XCTAssertEqual(dragFocusRequests.count, 2, "Dropping does not change focus or styling")
+
+        let menu = preview.actions.actionsMenu()
+        XCTAssertFalse(menu.allowsContextMenuPlugIns)
+        XCTAssertFalse(menu.automaticallyInsertsWritingToolsItems)
+        XCTAssertEqual(Array(menu.items.filter { !$0.isSeparatorItem }.map(\.title).prefix(3)), ["Open Page", "Copy Text", "Copy Link"])
+        preview.close()
+        XCTAssertNil(glass.superview)
+    }
+
+    func testTooSmallPreviewSourceDoesNotPresentAnAlreadyClosedPanel() throws {
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        var closes = 0
+        let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/tiny")!, sourceView: view,
+            anchor: window.convertToScreen(NSRect(x: 10, y: 10, width: 40, height: 20)), open: {}, didKeep: { _ in }, didClose: { _ in closes += 1 })
+        preview.show()
+        XCTAssertTrue(preview.isClosed)
+        XCTAssertNil(preview.panel)
+        XCTAssertEqual(closes, 1)
+        XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+    }
+
+    func testDraggedPreviewBecomesIndependentNoteAndFinishesWhileAnotherPreviewLoads() async throws {
+        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { url in
+            if url.path == "/first" { try await Task.sleep(for: .milliseconds(200)) }
+            return LinkSummary(title: url.lastPathComponent, summary: "A useful summary of \(url.lastPathComponent).", keyPoints: ["A specific fact."])
+        })
+        controller.setEnabled(true)
+        let tab = BrowserTab()
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        controller.install(in: view, tab: tab)
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { controller.setEnabled(false); window.close() }
+        view.loadHTMLString("<title>Notes fixture</title><p>Notes</p>", baseURL: URL(string: "https://example.com"))
+        try await waitUntil { !view.isLoading && view.title != nil }
+        func show(_ path: String) async {
+            let script = "window.webkit.messageHandlers.browserLinkPreview.postMessage({url:'https://example.com/\(path)',x:20,y:40,width:120,height:20});0"
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { _ in continuation.resume() }
+            }
+        }
+        await show("first")
+        try await waitUntil { controller.presentedPreview != nil }
+        let state = try XCTUnwrap(controller.presentedPreview)
+        let presentation = try XCTUnwrap(controller.current)
+        XCTAssertNil(presentation.panel)
+        XCTAssertTrue(presentation.glass?.window === window)
+        controller.keepPreview() // The native drag handle calls this after its movement threshold.
+        let notePanel = try XCTUnwrap(presentation.panel)
+        XCTAssertTrue(state.isKept)
+        XCTAssertNil(controller.presentedPreview)
+        XCTAssertNil(notePanel.parent)
+        XCTAssertTrue(notePanel.canBecomeKey)
+        controller.dismiss(for: view)
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
+        XCTAssertEqual(controller.keptNotes.map(\.id), [state.id])
+        await show("second")
+        try await waitUntil { controller.presentedPreview?.result?.title == "second" && state.result?.title == "first" }
+        XCTAssertEqual(controller.keptNotes.first?.result?.title, "first")
+        controller.keepPreview()
+        XCTAssertEqual(controller.keptNotes.count, 2)
+        controller.closeNote(id: state.id)
+        XCTAssertEqual(controller.keptNotes.count, 1)
+        XCTAssertFalse(notePanel.isVisible)
+        controller.setEnabled(false)
+        XCTAssertTrue(controller.keptNotes.isEmpty)
+    }
+
+    func testNoteCopyIncludesSummaryKeyPointsAndSource() throws {
+        let first = LinkPreviewState(url: URL(string: "https://example.com/article?part=2")!)
+        first.result = LinkSummary(title: "Oaxaca", summary: "A destination overview.", keyPoints: ["Visit Monte Alban.", "Explore the Zocalo."])
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        PreviewNoteActions.copyText(first, to: pasteboard)
+        let text = try XCTUnwrap(pasteboard.string(forType: .string))
+        for expected in ["Oaxaca", "A destination overview.", "• Visit Monte Alban.", "• Explore the Zocalo.", first.url.absoluteString] {
+            XCTAssertTrue(text.contains(expected), expected)
+        }
+        PreviewNoteActions.copyLink(first, to: pasteboard)
+        XCTAssertEqual(pasteboard.string(forType: .URL), first.url.absoluteString)
+        XCTAssertNil(pasteboard.string(forType: .string)?.range(of: "destination overview"))
+    }
+
+    func testOpenPreviewSelectsSourceRestoresWindowAndActivatesApplication() async throws {
+        let browser = BrowserModel()
+        let source = try XCTUnwrap(browser.activeTab)
+        source.restore()
+        browser.addTab(focusAddress: false)
+        let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = source.contentView
+        browser.window = window
+        defer { source.stopLoading(); window.close() }
+        let destination = URL(string: "data:text/html,<title>PreviewDestination</title>")!
+        var activations = 0
+        var fallbacks: [URL] = []
+        let pending = PreviewNoteActions.openPage(destination, from: source, activateApplication: {
+            XCTAssertEqual(source.url, destination)
+            activations += 1
+        }, openElsewhere: { fallbacks.append($0) })
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        await pending?.value
+        XCTAssertEqual(source.url, destination)
+        XCTAssertEqual(browser.activeTabID, source.id)
+        XCTAssertEqual(window.restoreRequests, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        XCTAssertTrue(window.requestedResponder === source.webView)
+        XCTAssertEqual(activations, 1)
+        XCTAssertTrue(fallbacks.isEmpty)
+    }
+
+    func testOpenPreviewPreservesLiveSourcePeek() async throws {
+        let browser = BrowserModel()
+        let opener = try XCTUnwrap(browser.activeTab)
+        let source = browser.openPeek(from: opener)
+        let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = source.contentView
+        browser.window = window
+        defer { browser.dismissPeek(); window.close() }
+        let destination = URL(string: "data:text/html,<title>PeekDestination</title>")!
+        var activations = 0
+        let pending = PreviewNoteActions.openPage(destination, from: source, activateApplication: {
+            XCTAssertEqual(source.url, destination)
+            activations += 1
+        }, openElsewhere: { _ in XCTFail("A live peek remains a valid destination") })
+        XCTAssertEqual(activations, 1)
+        await pending?.value
+        XCTAssertTrue(browser.peek?.tab === source)
+        XCTAssertEqual(browser.activeTabID, opener.id)
+        XCTAssertEqual(source.url, destination)
+        XCTAssertTrue(window.requestedResponder === source.webView)
+        XCTAssertEqual(activations, 1)
+    }
+
+    func testOpenPreviewRoutesElsewhereAfterSourceTabCloses() throws {
+        let browser = BrowserModel()
+        let source = try XCTUnwrap(browser.activeTab)
+        browser.closeTab(source.id)
+        let destination = URL(string: "https://example.com/preview")!
+        var activations = 0
+        var routed: [URL] = []
+        PreviewNoteActions.openPage(destination, from: source, activateApplication: { activations += 1 },
+                                    openElsewhere: { routed.append($0) })
+        XCTAssertEqual(routed, [destination])
+        XCTAssertEqual(activations, 1)
+        XCTAssertNotEqual(browser.activeTabID, source.id)
+    }
+
+    func testOpenPreviewStartsNavigationAndActivatesBeforeDestinationFinishes() async throws {
+        let handler = PreviewDelayedSchemeHandler()
+        let configuration = BrowserTab.makeConfiguration(includingExtensions: false)
+        configuration.setURLSchemeHandler(handler, forURLScheme: "preview-load")
+        let browser = BrowserModel(configuration: configuration, isPrivate: true)
+        let source = try XCTUnwrap(browser.activeTab)
+        let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = source.contentView
+        browser.window = window
+        defer { source.stopLoading(); window.close() }
+        var activations = 0
+        let destination = URL(string: "preview-load://fixture/destination")!
+        let pending = PreviewNoteActions.openPage(destination, from: source,
+            activateApplication: {
+                XCTAssertEqual(source.url, destination)
+                XCTAssertTrue(source.webView?.isLoading == true)
+                activations += 1
+            }, openElsewhere: { _ in XCTFail("The source is live") })
+        try await waitUntil { handler.pending != nil }
+        XCTAssertTrue(source.isLoading)
+        await pending?.value
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        XCTAssertEqual(window.restoreRequests, 1)
+        XCTAssertTrue(window.requestedResponder === source.webView)
+        handler.finish()
+        try await waitUntil { !source.isLoading }
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        XCTAssertEqual(window.restoreRequests, 1)
+    }
+
+    func testDeferredPreviewFocusRespectsLaterResponderAddressAndFindRequests() async throws {
+        for change in ["none", "responder", "address", "find"] {
+            let browser = BrowserModel()
+            let source = try XCTUnwrap(browser.activeTab)
+            let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                             styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            browser.window = window
+            defer { source.stopLoading(); window.close() }
+            let originalResponder = NSResponder()
+            let newResponder = NSResponder()
+            _ = window.makeFirstResponder(originalResponder)
+            let pending = PreviewNoteActions.openPage(URL(string: "data:text/html,<p>Focus</p>")!, from: source,
+                activateApplication: {}, openElsewhere: { _ in XCTFail("The source is live") })
+            XCTAssertNotNil(pending)
+            let waitingResponder = window.firstResponder
+            switch change {
+            case "responder": _ = window.makeFirstResponder(newResponder)
+            case "address": browser.requestAddressFocus()
+            case "find": source.findText = "fixture"; browser.showFindBar()
+            default: break
+            }
+            window.contentView = source.contentView
+            await pending?.value
+            let expected: NSResponder? = change == "none" ? source.webView : (change == "responder" ? newResponder : waitingResponder)
+            XCTAssertTrue(window.requestedResponder === expected, change)
+        }
+    }
+
+    func testPreviewDestinationAddressesExcludePrivateAndLocalNetworks() {
+        for address in ["127.0.0.1", "10.20.0.1", "172.16.0.1", "172.31.255.255", "192.168.2.1", "169.254.1.2", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "fe80::1", "fc00::1", "::ffff:127.0.0.1", "2001:db8::1", "invalid"] {
+            XCTAssertFalse(LinkPreviewFetcher.isPublicAddress(address), address)
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "172.32.0.1", "2606:4700:4700::1111"] {
+            XCTAssertTrue(LinkPreviewFetcher.isPublicAddress(address), address)
+        }
+    }
+
+    func testPreviewImagesUsePublisherMetadataAndRejectLocalOrExecutableURLs() throws {
+        let page = URL(string: "https://publisher.example.com/articles/travel")!
+        XCTAssertEqual(LinkPreviewFetcher.previewImage(in: "<meta content='/images/oaxaca.jpg?a=1&amp;b=2' property='og:image'>", relativeTo: page)?.absoluteString,
+                       "https://publisher.example.com/images/oaxaca.jpg?a=1&b=2")
+        XCTAssertEqual(LinkPreviewFetcher.previewImage(in: "<META CONTENT=//cdn.example.com/hero.webp NAME=twitter:image>", relativeTo: page)?.absoluteString,
+                       "https://cdn.example.com/hero.webp")
+        XCTAssertEqual(LinkPreviewFetcher.previewImage(in: "<meta property='og:image' content='http://127.0.0.1/private'><meta name='twitter:image' content='https://cdn.example.com/fallback.png'>", relativeTo: page)?.path,
+                       "/fallback.png")
+        for image in ["javascript:alert(1)", "data:image/png;base64,abc", "file:///tmp/image.png", "http://localhost/x", "https://server.local/x", ""] {
+            XCTAssertNil(LinkPreviewFetcher.previewImage(in: "<meta property='og:image' content='\(image)'>", relativeTo: page), image)
+        }
+        XCTAssertNil(LinkPreviewFetcher.previewImage(in: "<script>const image = 'https://example.com/hero.jpg'</script>", relativeTo: page))
+    }
+
+    func testLongPreviewFitsSmallPaneAndWindowDeactivationDismissesIt() async throws {
+        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { _ in
+            LinkSummary(title: "Travel", summary: "A guide to visiting Oaxaca and its surrounding towns.",
+                        keyPoints: Array(repeating: String(repeating: "A detailed fact about the destination. ", count: 4), count: 3))
+        })
+        controller.setEnabled(true)
+        let tab = BrowserTab()
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 260, height: 270))
+        controller.install(in: view, tab: tab)
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { controller.dismiss(for: view); window.close() }
+        view.loadHTMLString("<title>Small preview fixture</title><p>Travel links</p>", baseURL: URL(string: "https://example.com"))
+        try await waitUntil { !view.isLoading && view.title != nil }
+        let script = "window.webkit.messageHandlers.browserLinkPreview.postMessage({url:'https://example.com/travel',x:10,y:20,width:180,height:20});0"
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { _ in continuation.resume() }
+        }
+        try await waitUntil { controller.presentedPreview?.result != nil }
+        try await waitUntil { (controller.presentedPreview?.contentHeight ?? 0) > 300 }
+        let presentation = try XCTUnwrap(controller.current)
+        let glass = try XCTUnwrap(presentation.glass)
+        let bounds = window.convertToScreen(view.convert(view.bounds, to: nil))
+        XCTAssertTrue(glass.window === window)
+        XCTAssertTrue(bounds.contains(presentation.frame), "\(presentation.frame) outside \(bounds)")
+        XCTAssertLessThan(presentation.frame.width, 260)
+        XCTAssertLessThan(presentation.frame.height, try XCTUnwrap(controller.presentedPreview).contentHeight)
+        XCTAssertEqual(controller.presentedPreview?.result?.keyPoints.count, 3)
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        XCTAssertNil(controller.presentedPreview)
+        XCTAssertNil(glass.superview)
+        XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+    }
+
     func testNativePreviewMessageShowsSummaryAndNavigationDismissesIt() async throws {
-        guard BrowserIntelligence.unavailableReason == nil else { throw XCTSkip("On-device model unavailable on this runner") }
         let controller = LinkPreviewController(observesSettings: false, summaryProvider: { _ in
             LinkSummary(title: "Rust Ownership", summary: "Each value has one owner. Borrowing permits references without taking ownership.")
         })
@@ -259,6 +602,34 @@ extension BrowserIntelligenceTests {
 // without taking focus away from the user's running Release browser.
 @MainActor private final class PreviewFixtureWindow: NSWindow {
     override var isKeyWindow: Bool { true }
+}
+
+/// Record explicit activation requests without taking over the user's desktop.
+@MainActor private final class PreviewActionWindow: NSWindow {
+    private var minimized = true
+    var restoreRequests = 0
+    var frontRequests = 0
+    var requestedResponder: NSResponder?
+    override var isMiniaturized: Bool { minimized }
+    override var isKeyWindow: Bool { frontRequests > 0 }
+    override var firstResponder: NSResponder? { requestedResponder }
+    override func deminiaturize(_ sender: Any?) { minimized = false; restoreRequests += 1 }
+    override func makeKeyAndOrderFront(_ sender: Any?) { frontRequests += 1 }
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool { requestedResponder = responder; return true }
+}
+
+@MainActor private final class PreviewDelayedSchemeHandler: NSObject, @MainActor WKURLSchemeHandler {
+    private(set) var pending: (any WKURLSchemeTask)?
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) { pending = urlSchemeTask }
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) { pending = nil }
+    func finish() {
+        guard let pending, let url = pending.request.url else { return }
+        self.pending = nil
+        let data = Data("<title>Loaded destination</title><p>Ready</p>".utf8)
+        pending.didReceive(URLResponse(url: url, mimeType: "text/html", expectedContentLength: data.count, textEncodingName: "utf-8"))
+        pending.didReceive(data)
+        pending.didFinish()
+    }
 }
 
 extension BrowserIntelligenceTests {
