@@ -14,7 +14,7 @@
   const ids = new WeakMap();
   const roots = new Map();
   const observer = new MutationObserver(schedule);
-  const colorPattern = /rgba?\([^)]*\)|color\(srgb [^)]*\)/g;
+  const colorPattern = /(?:rgba?|color|lab|lch|oklab|oklch|hsl|hsla)\([^)]*\)/g;
   function createSheet(root) {
     // Constructed sheets use CSSOM, so a site's style-src CSP cannot block the
     // extension by rejecting an inline <style> text node.
@@ -105,11 +105,12 @@
     const bodyStyle = document.body && getComputedStyle(document.body);
     const base = [bodyStyle?.backgroundColor,rootStyle.backgroundColor].map(C.parse).find(color => color && color[3] >= 0.95);
     const canvas = base ? C.background(base,surface) : surface;
-    const output = new Map([[document,[`html{background-color:${C.css(canvas)}!important;color-scheme:dark!important}`]]]);
+    const scrollbar = `*{scrollbar-color:#747474 ${preferences.background}!important}*::-webkit-scrollbar-track{background-color:${preferences.background}!important}*::-webkit-scrollbar-thumb{background-color:#747474!important;border-color:${preferences.background}!important}`;
+    const output = new Map([[document,[`html{background-color:${C.css(canvas)}!important;color-scheme:dark!important}`,scrollbar]]]);
     const backdrops = new WeakMap();
     const imageBackdrops = new WeakMap();
     function walk(root, inherited) {
-      const rules = output.get(root) ?? [];
+      const rules = output.get(root) ?? [scrollbar];
       output.set(root,rules);
       for (const element of root.querySelectorAll("*")) {
         if (skip.has(element.tagName)) continue;

@@ -53,3 +53,12 @@ test('low-contrast chromatic text reaches AA without changing alpha', () => {
     }
   }
 });
+
+test('modern Lab colors retain readable foreground/background pairing', () => {
+  near(C.parse('lab(100 0 0)'),[1,1,1,1]);
+  const surface = C.parse('#121212');
+  const card = C.background(C.parse('lab(97.194298 1.38536 0.498641)'),surface);
+  const text = C.foreground(C.parse('lab(2.33353 10.3966 3.72023)'),card);
+  assert.ok(C.contrast(text,card) >= 4.5);
+  near(C.parse('lab(50% 0 0 / 25%)'),C.fromLab([50,0,0],0.25));
+});

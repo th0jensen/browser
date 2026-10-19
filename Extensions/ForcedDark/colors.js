@@ -40,14 +40,35 @@
     }
     return result;
   }
+  const parsedColors = new Map();
+  let colorContext;
+  function normalizedColor(value) {
+    if (parsedColors.has(value)) return parsedColors.get(value);
+    if (typeof document === "undefined" || !CSS.supports("color",value)) return null;
+    colorContext ??= document.createElement("canvas").getContext("2d",{willReadFrequently:true});
+    colorContext.clearRect(0,0,1,1);
+    colorContext.fillStyle = value;
+    colorContext.fillRect(0,0,1,1);
+    const result = [...colorContext.getImageData(0,0,1,1).data].map(x => x/255);
+    if (parsedColors.size >= 2048) parsedColors.clear();
+    parsedColors.set(value,result);
+    return result;
+  }
   function parse(value) {
     if (!value || value === "none") return null;
     if (value === "transparent") return [0,0,0,0];
     if (/^#[\da-f]{6}$/i.test(value)) return [1,3,5].map(i => parseInt(value.slice(i,i+2),16)/255).concat(1);
+    const lab = value.match(/^lab\(([^)]+)\)$/i);
+    if (lab) {
+      const parts = lab[1].split(/[\s\/]+/).filter(Boolean);
+      if (parts.length < 3) return null;
+      const values = parts.map((x,i) => parseFloat(x)*(x.endsWith("%") ? (i === 0 ? 1 : i < 3 ? 1.25 : 0.01) : 1));
+      return values.every(Number.isFinite) ? fromLab(values.slice(0,3),clamp(values[3] ?? 1)) : null;
+    }
     const match = value.match(/^(rgba?|color)\((.*)\)$/i);
-    if (!match) return null;
+    if (!match) return normalizedColor(value);
     const srgb = match[1] === "color" && match[2].startsWith("srgb ");
-    if (match[1] === "color" && !srgb) return null;
+    if (match[1] === "color" && !srgb) return normalizedColor(value);
     const parts = match[2].replace(/^srgb /, "").split(/[\s,\/]+/).filter(Boolean);
     if (parts.length < 3) return null;
     const values = parts.map((x,i) => clamp(parseFloat(x)/(x.endsWith("%") ? 100 : (i < 3 && !srgb ? 255 : 1))));
