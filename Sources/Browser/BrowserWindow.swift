@@ -607,7 +607,7 @@ struct BrowserWindow: View {
         ToolbarSpacer(.fixed, placement: .automatic)
         ForEach(browser.isPrivate ? [] : BrowserExtensions.shared.toolbarExtensions) { item in
             ToolbarItem(id: "extension.\(item.id.uuidString)", placement: .automatic) { ExtensionButton(item: item, browser: browser) }
-                .defaultCustomization(.hidden)
+                .defaultCustomization(item.bundledResource == nil ? .hidden : .visible)
                 .sharedBackgroundVisibility(.automatic)
         }
         Group {
