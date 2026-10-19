@@ -1,0 +1,3 @@
+# Run the bundled extensions' JavaScript regression suite.
+test:
+    node --test ForcedDark/tests/*.test.cjs

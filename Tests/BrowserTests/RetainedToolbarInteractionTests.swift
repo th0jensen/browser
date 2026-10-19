@@ -6,6 +6,36 @@ import XCTest
 
 @MainActor
 final class RetainedToolbarInteractionTests: XCTestCase {
+    func testRapidReloadStopChangesPreserveToolbarAndWindowControlFrames() async throws {
+        let fixture = try await fixture(layout: .vertical, compact: false)
+        defer { fixture.close() }
+        let window = fixture.window
+        let toolbar = try XCTUnwrap(window.toolbar)
+        let reload = try nativeButton("reload", in: window)
+        let items = toolbar.items.compactMap { $0.view }
+        let controls = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton]
+            .compactMap { window.standardWindowButton($0) }
+        window.layoutIfNeeded()
+        // Let the fixture's explicitly requested initial AppKit layout finish
+        // its alignment callback before taking the invariant reference frames.
+        try await Task.sleep(for: .milliseconds(100))
+        let frames = (items + controls).map { $0.convert($0.bounds, to: nil) }
+        for index in 0..<30 {
+            let loading = index.isMultiple(of: 2)
+            reload.update(.init(identifier: "reload", title: loading ? "Stop Loading" : "Reload",
+                                symbol: loading ? "xmark" : "arrow.clockwise", action: {}))
+            window.layoutIfNeeded()
+            for (view, expected) in zip(items + controls, frames) {
+                let actual = view.convert(view.bounds, to: nil)
+                if abs(actual.minX-expected.minX) > 0.5 || abs(actual.minY-expected.minY) > 0.5
+                    || abs(actual.width-expected.width) > 0.5 || abs(actual.height-expected.height) > 0.5 {
+                    XCTFail("Update \(index), \(view.identifier?.rawValue ?? String(describing: type(of: view))): \(actual), expected \(expected)")
+                }
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     func testNativeCommandsPreserveCanonicalCustomizationAcrossModelUpdatesAndLayoutChanges() async throws {
         let fixture = try await fixture(layout: .horizontal, compact: false)
         defer { fixture.close() }

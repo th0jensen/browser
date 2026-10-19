@@ -124,6 +124,7 @@ final class WindowChromeView: NSView {
     private var chromeWasVisible = true
     private var originalToolbarOrigin = NSPoint.zero
     private var alignmentIsScheduled = false
+    private var centeringTitlebarControls = false
     private var toolbarSeparators: [ObjectIdentifier: ToolbarSeparatorView] = [:]
     private var compactToolbar = false
     private var toolbarIsRevealed = true
@@ -377,6 +378,7 @@ final class WindowChromeView: NSView {
             }
         }
         let isFullScreen = window.styleMask.contains(.fullScreen)
+        centerTitlebarControls()
         scheduleAlignment()
         if let onFullScreenChange {
             DispatchQueue.main.async { onFullScreenChange(isFullScreen) }
@@ -402,6 +404,9 @@ final class WindowChromeView: NSView {
 
     /// Center native glass and hit regions together, including the page's top inset in the header.
     private func centerTitlebarControls() {
+        guard !centeringTitlebarControls else { return }
+        centeringTitlebarControls = true
+        defer { centeringTitlebarControls = false }
         guard let window else { clearToolbarSeparators(); restoreToolbarOrigin(); return }
         observeWindowControls(in: window)
         guard !window.styleMask.contains(.fullScreen) else { clearToolbarSeparators(); restoreToolbarOrigin(); return }
@@ -533,7 +538,12 @@ final class WindowChromeView: NSView {
             view.postsBoundsChangedNotifications = true
             for name in [NSView.frameDidChangeNotification, NSView.boundsDidChangeNotification] {
                 controlObservers.append(NotificationCenter.default.addObserver(forName: name, object: view, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.scheduleAlignment() }
+                    MainActor.assumeIsolated {
+                        // Native layout may reset these frames while a reload/stop
+                        // update is being drawn. Repair geometry before that paint.
+                        self?.centerTitlebarControls()
+                        self?.scheduleAlignment()
+                    }
                 })
             }
         }
