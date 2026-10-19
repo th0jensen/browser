@@ -9,10 +9,14 @@ final class FaviconTests: XCTestCase {
     /// A 1×1 PNG.
     private static let pixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 
-    func testIgnoresUnsupportedSchemes() {
+    func testIgnoresUnsupportedSchemesAndOversizedAddresses() {
         XCTAssertNil(FaviconCandidate(rel: "icon", href: "javascript:alert(1)", baseURL: page))
         XCTAssertNil(FaviconCandidate(rel: "icon", href: " ", baseURL: page))
         XCTAssertNotNil(FaviconCandidate(rel: "icon", href: "data:image/png;base64,AAAA", baseURL: page))
+        XCTAssertNil(FaviconCandidate(rel: "icon", href: "https://example.com/" + String(repeating: "x", count: 3_000),
+                                     baseURL: page))
+        XCTAssertNil(FaviconCandidate(rel: "icon", href: "data:image/png;base64," +
+                                     String(repeating: "A", count: FaviconData.maxDataURLCharacters), baseURL: page))
     }
 
     func testSkipsSVGIcons() {
@@ -99,6 +103,20 @@ final class FaviconTests: XCTestCase {
         XCTAssertNil(cache.entry(forHost: "example.org"))
     }
 
+    func testPageCandidateCollectionIsBoundedBeforeCrossingTheWebKitBridge() async throws {
+        let webView = WKWebView()
+        let icons = (0..<300).map { index in
+            "<link rel='icon' \(index == 250 ? "sizes='64x64'" : "") href='https://cdn.example.com/\(index).png'>"
+        }.joined()
+        webView.loadHTMLString("<head>\(icons)</head>", baseURL: page)
+        try await waitUntil { !webView.isLoading && webView.url == page }
+
+        let candidates = await FaviconStore.candidates(in: webView)
+        XCTAssertEqual(candidates.count, FaviconStore.maximumPageCandidates)
+        XCTAssertEqual(candidates.first?.url.lastPathComponent, "250.png")
+        XCTAssertEqual(candidates.last?.url.lastPathComponent, "30.png")
+    }
+
     func testReadsAndLoadsTheIconsOfAnOpenPage() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
         let originalCache = FaviconStore.cache
@@ -126,6 +144,39 @@ final class FaviconTests: XCTestCase {
 
 
 extension FaviconTests {
+    func testSharedMemoryCacheEvictsToItsCostAndCountBudgets() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
+        let originalCache = FaviconStore.cache
+        FaviconStore.cache = FaviconCache(directory: directory)
+        await FaviconStore.clear(since: .distantPast)
+        addTeardownBlock {
+            await FaviconStore.clear(since: .distantPast)
+            try? FileManager.default.removeItem(at: directory)
+            await MainActor.run { FaviconStore.cache = originalCache }
+        }
+        let source = FaviconCandidate(url: try XCTUnwrap(URL(string: "data:image/png;base64,\(Self.pixelPNG)")))
+        for index in 0..<FaviconStore.maximumMemoryIcons {
+            let page = try XCTUnwrap(URL(string: "https://favicon-\(index).example/page"))
+            let icon = await FaviconStore.icon(forPage: page, candidates: [source])
+            XCTAssertNotNil(icon)
+        }
+        XCTAssertNotNil(FaviconStore.cachedIcon(for: URL(string: "https://favicon-0.example/page")))
+        let count = FaviconStore.maximumMemoryIcons + 16
+        for index in FaviconStore.maximumMemoryIcons..<count {
+            let page = try XCTUnwrap(URL(string: "https://favicon-\(index).example/page"))
+            let icon = await FaviconStore.icon(forPage: page, candidates: [source])
+            XCTAssertNotNil(icon)
+        }
+
+        let usage = FaviconStore.memoryUsage
+        XCTAssertLessThanOrEqual(usage.icons, FaviconStore.maximumMemoryIcons)
+        XCTAssertLessThanOrEqual(usage.iconCost, FaviconStore.maximumMemoryIconCost)
+        XCTAssertNotNil(FaviconStore.cachedIcon(for: URL(string: "https://favicon-0.example/page")))
+        XCTAssertNil(FaviconStore.cachedIcon(for: URL(string: "https://favicon-1.example/page")))
+        XCTAssertNotNil(FaviconStore.cachedIcon(for: URL(string: "https://favicon-\(count - 1).example/page")))
+        await FaviconStore.clear(since: .distantPast)
+    }
+
     func testClearingCacheRejectsWritesFromRequestsStartedBeforeClear() throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: "FaviconTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
