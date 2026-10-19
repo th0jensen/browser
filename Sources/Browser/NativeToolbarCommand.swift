@@ -29,6 +29,7 @@ struct NativeToolbarCommand {
 final class NativeToolbarCommandButton: NSButton {
     weak var visibilityToolbar: NSToolbar?
     private var command: NativeToolbarCommand
+    private var updatingCommand = false
     private(set) var symbol: String?
     private(set) var displayMode = NSToolbar.DisplayMode.iconOnly
 
@@ -49,32 +50,48 @@ final class NativeToolbarCommandButton: NSButton {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     func update(_ command: NativeToolbarCommand, displayMode: NSToolbar.DisplayMode = .iconOnly) {
-        let sizeChanged = title != command.title || self.displayMode != displayMode
+        let previousSize = intrinsicContentSize
+        let wasUpdating = updatingCommand
+        updatingCommand = true
+        defer {
+            updatingCommand = wasUpdating
+            if !wasUpdating && intrinsicContentSize != previousSize { super.invalidateIntrinsicContentSize() }
+        }
         self.displayMode = displayMode
         self.command = command
         (cell as? CenteredToolbarButtonCell)?.horizontalOffset = command.identifier == "back" ? 2 : command.identifier == "forward" ? -2 : 0
         let commandID = NSUserInterfaceItemIdentifier(command.identifier)
         if identifier != commandID { identifier = commandID }
         if title != command.title {
-            title = command.title
+            cell?.title = command.title
+            needsDisplay = true
             setAccessibilityLabel(command.title)
         }
         if toolTip != command.help { toolTip = command.help }
         if isEnabled != command.isEnabled { isEnabled = command.isEnabled }
         if symbol != command.symbol {
             symbol = command.symbol
-            image = NSImage(systemSymbolName: command.symbol, accessibilityDescription: command.title)?
+            cell?.image = NSImage(systemSymbolName: command.symbol, accessibilityDescription: command.title)?
                 .withSymbolConfiguration(.init(pointSize: BrowserChrome.toolbarSymbolSize, weight: .regular))
+            needsDisplay = true
         }
-        // AppKit's title/image setters can choose a text position while constructing
-        // a toolbar item. Apply the requested presentation after both have changed.
+        // Update the owned cell directly: NSButton's title/image setters can
+        // change its presentation and synchronously reallocate the native toolbar.
+        // Text display modes still publish their final intrinsic size below.
         let position: NSControl.ImagePosition = switch displayMode {
         case .labelOnly: .noImage
         case .iconAndLabel: .imageAbove
         default: .imageOnly
         }
         if imagePosition != position { imagePosition = position }
-        if sizeChanged { invalidateIntrinsicContentSize() }
+
+    }
+
+    override func invalidateIntrinsicContentSize() {
+        // NSButton's title/image setters invalidate as well. Reload/Stop has the
+        // same icon-only dimensions, so preserve the toolbar's native allocation.
+        guard !updatingCommand else { return }
+        super.invalidateIntrinsicContentSize()
     }
 
     @objc private func activate() { guard isEnabled else { return }; command.action() }
