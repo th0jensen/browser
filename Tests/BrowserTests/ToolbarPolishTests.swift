@@ -262,44 +262,78 @@ final class ToolbarPolishTests: XCTestCase {
         XCTAssertFalse(adapter.toolbarAllowedItemIdentifiers(next).contains { $0.rawValue.hasPrefix("divider") })
     }
 
-    func testLegacyRepeatedDividersMigrateToNativeSpacesBeforeRestoringLayout() async throws {
+    func testInvalidSavedLayoutsResetToDefaultsOnOpenAndExternalChange() async throws {
         let source = PolishToolbarDelegate()
-        let toolbar = NSToolbar(identifier: "BrowserToolbar.tests.LegacyDividers.\(UUID())")
+        let adapter = ToolbarCustomizationAdapter(source: source)
+        let defaults: [NSToolbarItem.Identifier] = [.init("back"), .init("address"), .init("settings")]
+        let invalidOrders = [
+            ["back", "divider0", "address"],
+            ["back", "settings"],
+            ["back", "address", "back"],
+            ["address", "removedControl"],
+            ["address", ""]
+        ]
+        let invalidData = try invalidOrders.map { try JSONSerialization.data(withJSONObject: ["identifiers": $0]) }
+            + [Data("invalid JSON".utf8)]
+        for data in invalidData {
+            for externalChange in [false, true] {
+                let toolbar = NSToolbar(identifier: "BrowserToolbar.tests.InvalidLayout.\(UUID())")
+                toolbar.delegate = adapter
+                toolbar.itemIdentifiers = [.init("settings"), .init("address")]
+                let box = ToolbarDataBox()
+                let binding = Binding(get: { box.data }, set: { box.data = $0 })
+                let persistence = ToolbarLayoutPersistence()
+                if externalChange {
+                    persistence.update(toolbar: toolbar, binding: binding)
+                    await Task.yield()
+                }
+                box.data = data
+                persistence.update(toolbar: toolbar, binding: binding)
+                XCTAssertEqual(toolbar.itemIdentifiers, defaults)
+                await Task.yield()
+                let stored = try XCTUnwrap(JSONSerialization.jsonObject(with: box.data) as? [String: [String]])
+                XCTAssertEqual(stored["identifiers"], defaults.map(\.rawValue))
+                persistence.update(toolbar: toolbar, binding: binding)
+                XCTAssertEqual(toolbar.itemIdentifiers, defaults)
+            }
+        }
+    }
+
+    func testNativeConfigurationRejectsObsoleteLayoutsAndPreservesValidSpaces() throws {
+        let suite = "ToolbarConfigurationValidation-\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = "NSToolbar Configuration Validated"
+        defaults.set(["TB Item Identifiers": ["address", "divider0"]], forKey: key)
+        let obsolete = try JSONSerialization.data(withJSONObject: ["identifiers": ["back", "divider0", "address"]])
+        ToolbarLayoutPersistence.prepareNativeConfiguration(identifier: "Validated", data: obsolete, defaults: defaults)
+        XCTAssertNil(defaults.object(forKey: key), "An invalid order must not seed SwiftUI's native toolbar")
+        let valid = ["back", NSToolbarItem.Identifier.space.rawValue, "address",
+                     NSToolbarItem.Identifier.space.rawValue, NSToolbarItem.Identifier.flexibleSpace.rawValue,
+                     NSToolbarItem.Identifier.flexibleSpace.rawValue, "extension.saved"]
+        let data = try JSONSerialization.data(withJSONObject: ["identifiers": valid])
+        ToolbarLayoutPersistence.prepareNativeConfiguration(identifier: "Validated", data: data, defaults: defaults)
+        XCTAssertEqual(defaults.dictionary(forKey: key)?["TB Item Identifiers"] as? [String], valid)
+    }
+
+    func testFinishingCustomizationDoesNotOverwriteIncomingInvalidLayout() async throws {
+        let source = PolishToolbarDelegate()
+        let toolbar = NSToolbar(identifier: "BrowserToolbar.tests.InvalidIncomingLayout.\(UUID())")
         let adapter = ToolbarCustomizationAdapter(source: source)
         toolbar.delegate = adapter
-        toolbar.itemIdentifiers = [.init("back"), .init("address"), .init("settings")]
-        let legacy = ["back", "divider0", "address", "extension.saved", "divider1", "settings", "divider0"]
-        let expected = ["back", NSToolbarItem.Identifier.space.rawValue, "address", "extension.saved",
-                        NSToolbarItem.Identifier.space.rawValue, "settings", NSToolbarItem.Identifier.space.rawValue]
-        XCTAssertEqual(FullscreenToolbarPart.parts(for: legacy).map(\.content), [
-            .controls(["back"]), .space, .address, .controls(["extension.saved"]), .space,
-            .controls(["settings"]), .space
-        ], "Legacy separators must also split the fullscreen glass groups without drawing lines")
+        toolbar.itemIdentifiers = [.init("settings"), .init("address")]
         let box = ToolbarDataBox()
-        box.data = try JSONSerialization.data(withJSONObject: ["identifiers": legacy])
         let binding = Binding(get: { box.data }, set: { box.data = $0 })
         let persistence = ToolbarLayoutPersistence()
         persistence.update(toolbar: toolbar, binding: binding)
-        XCTAssertEqual(toolbar.itemIdentifiers.map(\.rawValue), expected)
-        XCTAssertEqual(toolbar.items.filter { $0.itemIdentifier == .space }.count, 3)
-        XCTAssertTrue(toolbar.items.filter { $0.itemIdentifier == .space }.allSatisfy { $0.view == nil })
         await Task.yield()
-        let written = try XCTUnwrap(JSONSerialization.jsonObject(with: box.data) as? [String: [String]])
-        XCTAssertEqual(written["identifiers"], expected)
-
-        // External saved-layout changes take the same migration path in an existing window.
-        let edited = ["divider2", "address", "divider0", "extension.saved"]
-        box.data = try JSONSerialization.data(withJSONObject: ["identifiers": edited])
+        let invalid = Data("invalid JSON".utf8)
+        box.data = invalid
+        persistence.finishCustomization()
+        await Task.yield()
+        XCTAssertEqual(box.data, invalid, "Done must allow the incoming order to be validated")
         persistence.update(toolbar: toolbar, binding: binding)
-        XCTAssertEqual(toolbar.itemIdentifiers, [.space, .init("address"), .space, .init("extension.saved")])
-        await Task.yield()
-
-        let suite = "LegacyDividerConfiguration-\(UUID())"
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let data = try JSONSerialization.data(withJSONObject: ["identifiers": legacy])
-        ToolbarLayoutPersistence.prepareNativeConfiguration(identifier: "Migrated", data: data, defaults: defaults)
-        XCTAssertEqual(defaults.dictionary(forKey: "NSToolbar Configuration Migrated")?["TB Item Identifiers"] as? [String], expected)
+        XCTAssertEqual(toolbar.itemIdentifiers, [.init("back"), .init("address"), .init("settings")])
     }
 
     func testNativePaletteUsesRepeatableFixedAndFlexibleSpaces() async throws {
@@ -411,7 +445,7 @@ final class ToolbarPolishTests: XCTestCase {
 @MainActor private final class PolishToolbarDelegate: NSObject, NSToolbarDelegate {
     var extensionsAvailable = true
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.init("back"), .init("address"), .init("settings"), .init("divider0"), .init("divider1"), .space, .space, .flexibleSpace]
+        [.init("back"), .init("address"), .init("settings"), .space, .space, .flexibleSpace]
             + (extensionsAvailable ? [.init("extension.saved")] : [])
     }
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.init("back"), .init("address"), .init("settings")] }

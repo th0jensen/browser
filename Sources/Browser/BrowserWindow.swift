@@ -25,8 +25,8 @@ struct BrowserWindow: View {
     @State private var addressBlurRequest = 0
     @State private var hoverCardTabID: UUID?
     @State private var isFullScreen = false
-    @AppStorage("toolbarLayout.vertical") private var verticalToolbarLayout = ToolbarLayoutPersistence.legacyData(for: .vertical)
-    @AppStorage("toolbarLayout.horizontal") private var horizontalToolbarLayout = ToolbarLayoutPersistence.legacyData(for: .horizontal)
+    @AppStorage("toolbarLayout.vertical") private var verticalToolbarLayout = Data()
+    @AppStorage("toolbarLayout.horizontal") private var horizontalToolbarLayout = Data()
     @State private var toolbarItemIdentifiers: [String] = []
     @State private var restoreAddressFocusAfterFullscreen = false
     @State private var chromeHover: ChromeHoverController

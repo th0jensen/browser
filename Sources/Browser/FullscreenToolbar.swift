@@ -37,7 +37,7 @@ struct FullscreenToolbarPart: Equatable, Identifiable {
             case "address": separator = .address
             case NSToolbarItem.Identifier.space.rawValue: separator = .space
             case NSToolbarItem.Identifier.flexibleSpace.rawValue: separator = .flexibleSpace
-            default: separator = identifier.hasPrefix("divider") ? .space : nil
+            default: separator = nil
             }
             if let separator {
                 flushControls()

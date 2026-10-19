@@ -16,10 +16,10 @@ final class ToolbarCustomizationAdapter: NSObject, NSToolbarDelegate {
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         var seen = Set<NSToolbarItem.Identifier>()
-        return ((source.toolbarAllowedItemIdentifiers?(toolbar) ?? []) + [.space, .flexibleSpace]).map(Self.canonical).filter { seen.insert($0).inserted }
+        return ((source.toolbarAllowedItemIdentifiers?(toolbar) ?? []) + [.space, .flexibleSpace]).filter { seen.insert($0).inserted }
     }
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        (source.toolbarDefaultItemIdentifiers?(toolbar) ?? []).map(Self.canonical)
+        source.toolbarDefaultItemIdentifiers?(toolbar) ?? []
     }
     func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         source.toolbarSelectableItemIdentifiers?(toolbar) ?? []
@@ -27,10 +27,6 @@ final class ToolbarCustomizationAdapter: NSObject, NSToolbarDelegate {
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier identifier: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar inserted: Bool) -> NSToolbarItem? {
         return source.toolbar?(toolbar, itemForItemIdentifier: identifier, willBeInsertedIntoToolbar: inserted)
-    }
-
-    static func canonical(_ identifier: NSToolbarItem.Identifier) -> NSToolbarItem.Identifier {
-        identifier.rawValue.hasPrefix("divider") ? .space : identifier
     }
 }
 

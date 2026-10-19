@@ -8,6 +8,7 @@ final class ToolbarLayoutPersistence {
     private struct Layout: Codable { var identifiers: [String] }
     private weak var toolbar: NSToolbar?
     private var saved: Layout?
+    private var needsDefaultLayout = false
     private var binding: Binding<Data>?
     var userIsEditing = false
     private var applying = false
@@ -19,25 +20,38 @@ final class ToolbarLayoutPersistence {
     func update(toolbar: NSToolbar, binding: Binding<Data>?) {
         guard let binding, !applying else { return }
         self.binding = binding
-        if self.toolbar === toolbar, pendingWrite == nil, !userIsEditing, !toolbar.customizationPaletteIsRunning,
-           lastReadData != binding.wrappedValue, let external = Self.decode(binding.wrappedValue) {
-            saved = external
-            lastReadData = binding.wrappedValue
-        }
-        if self.toolbar !== toolbar {
+        let data = binding.wrappedValue
+        if self.toolbar !== toolbar || (pendingWrite == nil && !userIsEditing && !toolbar.customizationPaletteIsRunning
+            && lastReadData != data) {
             self.toolbar = toolbar
-            lastReadData = binding.wrappedValue
-            saved = Self.decode(binding.wrappedValue)
-
+            lastReadData = data
+            saved = Self.decode(data)
+            needsDefaultLayout = !data.isEmpty && saved == nil
         }
         guard toolbar.items.contains(where: { $0.itemIdentifier.rawValue == "address" }) else { return }
+        let allowed = Set(toolbar.delegate?.toolbarAllowedItemIdentifiers?(toolbar).map { $0.rawValue } ?? [])
+        if let saved, saved.identifiers.contains(where: { !allowed.contains($0) && !$0.hasPrefix("extension.") }) {
+            self.saved = nil
+            needsDefaultLayout = true
+        }
+        if needsDefaultLayout {
+            guard !toolbar.customizationPaletteIsRunning,
+                  let defaults = toolbar.delegate?.toolbarDefaultItemIdentifiers?(toolbar),
+                  defaults.contains(.init("address")) else { return }
+            applying = true
+            toolbar.itemIdentifiers = defaults
+            applying = false
+            needsDefaultLayout = false
+            userIsEditing = false
+            capture(toolbar)
+            return
+        }
         if userIsEditing || toolbar.customizationPaletteIsRunning {
             capture(toolbar)
             userIsEditing = false
             return
         }
         guard let saved else { capture(toolbar); return }
-        let allowed = Set(toolbar.delegate?.toolbarAllowedItemIdentifiers?(toolbar).map { $0.rawValue } ?? [])
         let available = saved.identifiers.filter { allowed.contains($0) }.map { NSToolbarItem.Identifier($0) }
         guard available.contains(.init("address")) else { return }
         if available != toolbar.itemIdentifiers {
@@ -51,8 +65,8 @@ final class ToolbarLayoutPersistence {
     func capture(_ toolbar: NSToolbar) {
         guard !applying else { return }
         let allowed = Set(toolbar.delegate?.toolbarAllowedItemIdentifiers?(toolbar).map { $0.rawValue } ?? [])
-        var ids = Self.normalized(toolbar.itemIdentifiers.map(\.rawValue))
-        guard ids.contains("address") else { return }
+        var ids = toolbar.itemIdentifiers.map(\.rawValue)
+        guard Self.isValid(ids) else { return }
         // Preserve a disabled/missing extension at its previous relative location.
         for (index, id) in (saved?.identifiers ?? []).enumerated() where !allowed.contains(id) && !ids.contains(id) && id.hasPrefix("extension.") {
             let old = saved!.identifiers
@@ -79,7 +93,7 @@ final class ToolbarLayoutPersistence {
     }
 
     private func write(_ layout: Layout) {
-        guard let binding else { return }
+        guard let binding, binding.wrappedValue == lastReadData || binding.wrappedValue == pendingWrite else { return }
         if encodedIdentifiers != layout.identifiers {
             encodedData = try? JSONEncoder().encode(layout)
             encodedIdentifiers = encodedData == nil ? nil : layout.identifiers
@@ -105,35 +119,28 @@ final class ToolbarLayoutPersistence {
     /// list. Applying it afterward leaves SwiftUI's customization order stale.
     static func prepareNativeConfiguration(identifier: String, data: Data, defaults: UserDefaults = .standard) {
         let key = "NSToolbar Configuration " + identifier
-        guard defaults.object(forKey: key) == nil,
-              let layout = decode(data),
-              layout.identifiers.contains("address") else { return }
-        defaults.set(["TB Item Identifiers": normalized(layout.identifiers)], forKey: key)
-    }
-
-    static func legacyData(for layout: TabLayout, defaults: UserDefaults = .standard) -> Data {
-        guard !BrowserProfile.isTesting else { return Data() }
-        for name in ["BrowserToolbar.v5.\(layout.rawValue)", "BrowserToolbar.v4.\(layout.rawValue)",
-                     "BrowserToolbar.v3.\(layout.rawValue)", "BrowserToolbar"] {
-            if let config = defaults.dictionary(forKey: "NSToolbar Configuration " + name),
-               let ids = config["TB Item Identifiers"] as? [String], !ids.isEmpty,
-               let data = try? JSONEncoder().encode(Layout(identifiers: normalized(ids))) { return data }
+        guard let layout = decode(data) else {
+            if !data.isEmpty { defaults.removeObject(forKey: key) }
+            return
         }
-        return Data()
+        guard defaults.object(forKey: key) == nil else { return }
+        defaults.set(["TB Item Identifiers": layout.identifiers], forKey: key)
     }
 
-    static func normalized(_ ids: [String]) -> [String] {
+    private static func isValid(_ identifiers: [String]) -> Bool {
+        guard identifiers.contains("address") else { return false }
         var seen = Set<String>()
-        return ids.compactMap { id in
-            let canonical = ToolbarCustomizationAdapter.canonical(.init(id)).rawValue
-            if canonical == NSToolbarItem.Identifier.space.rawValue
-                || canonical == NSToolbarItem.Identifier.flexibleSpace.rawValue { return canonical }
-            return seen.insert(canonical).inserted ? canonical : nil
+        return identifiers.allSatisfy { id in
+            guard !id.isEmpty, !id.hasPrefix("divider") else { return false }
+            return id == NSToolbarItem.Identifier.space.rawValue
+                || id == NSToolbarItem.Identifier.flexibleSpace.rawValue
+                || seen.insert(id).inserted
         }
     }
 
     private static func decode(_ data: Data) -> Layout? {
-        guard let layout = try? JSONDecoder().decode(Layout.self, from: data) else { return nil }
-        return Layout(identifiers: normalized(layout.identifiers))
+        guard let layout = try? JSONDecoder().decode(Layout.self, from: data),
+              isValid(layout.identifiers) else { return nil }
+        return layout
     }
 }
