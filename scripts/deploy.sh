@@ -71,8 +71,9 @@ if [[ "$mode" == install ]]; then
     echo "Copied $app to $destination"
 elif [[ "$mode" == qa ]]; then
     qa_parent="$HOME/Library/Containers/$bundle_identifier/Data/Library/Application Support"
-    mkdir -p "$qa_parent"
-    qa_profile=$(mktemp -d "$qa_parent/BrowserQA.XXXXXX")
+    # The sandboxed app owns profile creation. The launching shell may not have
+    # permission to write inside its protected container.
+    qa_profile="$qa_parent/BrowserQA.$(uuidgen)"
     open -n "$destination" --args --qa-profile "$qa_profile"
     echo "Launched $destination with disposable QA profile: $qa_profile"
 else

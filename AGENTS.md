@@ -15,6 +15,8 @@ Keep the Debug QA browser on the laptop’s **Built-in Retina Display**, the use
 
 Launch ongoing QA with `--qa-profile` only. Avoid `-compactToolbar`, `-tabLayout`, or other UserDefaults command-line overrides: the argument domain takes priority over saved settings and can prevent UI preferences from changing during QA.
 
+The deployment script allocates a fresh UUID profile path; the Debug app creates the directory inside its own sandbox. Avoid creating that directory from the launching shell, which may lack access to the app’s protected container.
+
 # Commit attribution
 
 Include this trailer on commits made with this assistant, recording the model name:
