@@ -227,7 +227,6 @@ extension BrowserIntelligenceTests {
         XCTAssertNil(preview.panel)
         XCTAssertTrue(glass.contentView === host)
         XCTAssertEqual(glass.style, .clear)
-        XCTAssertNil(glass.tintColor)
         XCTAssertEqual(anchor.minY - preview.frame.maxY, 24, accuracy: 0.5)
         XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: anchor.minY - 8)))
         XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: (anchor.minY + preview.frame.maxY) / 2)))

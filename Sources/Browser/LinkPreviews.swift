@@ -268,6 +268,7 @@ final class LinkPreviewPresentation {
         self.content = content
         let glass = NSGlassEffectView()
         glass.style = .clear
+        glass.tintColor = NSColor.black.withAlphaComponent(0.12)
         glass.cornerRadius = 16
         glass.contentView = content
         self.glass = glass
