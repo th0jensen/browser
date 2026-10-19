@@ -376,6 +376,17 @@ final class BrowserExtensions: NSObject {
         isBusy = activeExtensionUpdates > 0
     }
 
+    func showBundledOptions(for item: InstalledExtension) async {
+        await restore()
+        guard item.bundledResource != nil, let browser = focusedBrowser ?? windows.allObjects.first,
+              let tab = browser.focusedPage, let context = contexts[item.id],
+              context.action(for: tab)?.isEnabled == true else { return }
+        browser.window?.makeKeyAndOrderFront(nil)
+        focus(browser)
+        context.userGesturePerformed(in: tab)
+        context.performAction(for: tab)
+    }
+
     func chooseImport() async {
         let panel = NSOpenPanel()
         panel.title = "Import Browser Extensions"

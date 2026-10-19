@@ -14,6 +14,10 @@ struct ExtensionSettings: View {
                                 Task { await extensions.setEnabled(item, enabled) }
                             }))
                             .disabled(extensions.isBusy || item.needsNativeMessaging || (item.ruleCount == 0 && !item.isEnabled))
+                            if item.bundledResource != nil {
+                                Button("Options…") { Task { await extensions.showBundledOptions(for: item) } }
+                                    .disabled(!item.isEnabled || extensions.isBusy)
+                            }
                             if item.sourceAppName == nil {
                                 Button("Remove", role: .destructive) { extensions.remove(item) }.disabled(extensions.isBusy)
                             }
