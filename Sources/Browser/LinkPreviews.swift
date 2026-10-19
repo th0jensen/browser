@@ -272,6 +272,7 @@ final class LinkPreviewPresentation {
         glass.style = .regular
         glass.tintColor = NSColor.black.withAlphaComponent(0.24)
         glass.cornerRadius = 16
+        glass.focusRingType = .none
         glass.contentView = content
         self.glass = glass
         // A separate NSPanel cannot reliably refract pixels from WKWebView in
@@ -368,7 +369,18 @@ final class LinkPreviewPresentation {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isReleasedWhenClosed = false
-        panel.contentView = glass
+        // Keep the window's alpha shape separate from the glass effect's layer
+        // tree. A glass root can leave a square outer edge after becoming key.
+        let surface = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        surface.focusRingType = .none
+        surface.wantsLayer = true
+        surface.layer?.backgroundColor = NSColor.clear.cgColor
+        surface.layer?.cornerRadius = glass.cornerRadius
+        surface.layer?.masksToBounds = true
+        glass.frame = surface.bounds
+        glass.autoresizingMask = [.width, .height]
+        surface.addSubview(glass)
+        panel.contentView = surface
         panel.closePreview = { [weak self] in self?.close() }
         panel.showPreviewMenu = { [weak self] event in self?.actions.present(with: event) }
         state.isKept = true
@@ -380,6 +392,8 @@ final class LinkPreviewPresentation {
         panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.orderFront(nil)
+        surface.layoutSubtreeIfNeeded()
+        panel.invalidateShadow()
         didKeep(self)
         if !isDragging { resize(height: state.contentHeight) }
     }
@@ -421,6 +435,8 @@ final class LinkPreviewPresentation {
             let x = min(max(panel.frame.minX, visible.minX), visible.maxX - state.cardWidth)
             let y = min(max(panel.frame.maxY - height, visible.minY), visible.maxY - height)
             panel.setFrame(NSRect(x: x, y: y, width: state.cardWidth, height: height), display: true)
+            panel.contentView?.layoutSubtreeIfNeeded()
+            panel.invalidateShadow()
             frame = panel.frame
             return
         }
