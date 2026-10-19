@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Forced Dark",
   "description": "Dark surfaces and readable text using Chromium’s CIELAB lightness inversion, while preserving images.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "permissions": ["storage", "nativeMessaging"],
   "host_permissions": ["http://*/*", "https://*/*"],
   "content_scripts": [{
