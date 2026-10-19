@@ -18,6 +18,7 @@ final class BrowserPerformanceTests: XCTestCase {
     private var windowInventoryBeforeClosure: [[String: Any]] = []
     private var closedHostWindowCount = 0
     private var outputDirectory: URL!
+    private weak var benchmarkWindow: NSWindow?
 
     func testBrowserBenchmarks() async throws {
         guard ProcessInfo.processInfo.environment["BROWSER_BENCHMARK"] == "1" else {
@@ -41,10 +42,10 @@ final class BrowserPerformanceTests: XCTestCase {
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
             return CGDisplayIsBuiltin(number.uint32Value) != 0
         }, "Benchmarks require the MacBook display")
-        let window = PerformanceWindow(contentRect: NSRect(x: screen.visibleFrame.midX - 550,
-                                                          y: screen.visibleFrame.midY - 380, width: 1100, height: 760),
+        let window = PerformanceWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
                                        styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
                                        backing: .buffered, defer: false, screen: screen)
+        benchmarkWindow = window
         window.titleVisibility = .hidden
         window.tabbingMode = .disallowed
         window.isReleasedWhenClosed = false
@@ -63,6 +64,8 @@ final class BrowserPerformanceTests: XCTestCase {
             other.close()
             closedHostWindowCount += 1
         }
+        window.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - window.frame.width / 2,
+                                      y: screen.visibleFrame.midY - window.frame.height / 2))
         NSApp.unhide(nil)
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
@@ -75,6 +78,10 @@ final class BrowserPerformanceTests: XCTestCase {
             try await settle(window: window, browser: browser) {
                 window.toolbar != nil && browser.window === window && window.occlusionState.contains(.visible)
             }
+            window.setContentSize(NSSize(width: 1100, height: 760))
+            window.setFrameOrigin(NSPoint(x: screen.visibleFrame.midX - window.frame.width / 2,
+                                          y: screen.visibleFrame.midY - window.frame.height / 2))
+            try await settle(window: window, browser: browser)
             print("BENCHMARK_WINDOW_PROTOCOL=floating/allSpaces/fullScreenAuxiliary level=\(window.level.rawValue) occlusion=\(window.occlusionState.rawValue) visible=\(window.occlusionState.contains(.visible)) key=\(window.isKeyWindow) appActive=\(NSApp.isActive) activationPolicy=\(NSApp.activationPolicy().rawValue) appRunning=\(NSApp.isRunning) onActiveSpace=\(window.isOnActiveSpace) windowNumber=\(window.windowNumber)")
             window.toolbar?.autosavesConfiguration = false
             window.makeFirstResponder(nil) // Stop the editor caret during idle windows.
@@ -279,11 +286,22 @@ final class BrowserPerformanceTests: XCTestCase {
         return end
     }
 
+    private func requireVisiblePlacement() throws {
+        guard let window = benchmarkWindow, let screen = window.screen,
+              let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+              CGDisplayIsBuiltin(number.uint32Value) != 0,
+              screen.visibleFrame.insetBy(dx: -1, dy: -1).contains(window.frame) else {
+            throw PerformanceFailure.system("Benchmark window must remain fully inside the MacBook display: \(String(describing: benchmarkWindow?.frame))")
+        }
+    }
+
     private func sample(_ name: String, definition: String, operation: () async throws -> Double) async throws {
         print("BENCHMARK_PHASE=\(name)")
         var values: [Double] = []
         for index in 0..<(warmups + repetitions) {
+            try requireVisiblePlacement()
             let seconds = try await operation()
+            try requireVisiblePlacement()
             if index >= warmups { values.append(seconds * 1000) }
         }
         appendMetric(name, definition: definition, samples: values)
@@ -322,6 +340,7 @@ final class BrowserPerformanceTests: XCTestCase {
     }
 
     private func idleResources(name: String, seconds: Double) async throws -> [String: Any] {
+        try requireVisiblePlacement()
         // Delay is a fixed idle measurement window, never a latency completion detector.
         try await Task.sleep(for: .seconds(1))
         let before = try Self.resources()
@@ -330,6 +349,7 @@ final class BrowserPerformanceTests: XCTestCase {
         try await Task.sleep(for: .seconds(seconds))
         let end = Self.now()
         let after = try Self.resources()
+        try requireVisiblePlacement()
         try writeResourcePhase(name: name, started: start, duration: seconds, status: "complete", ended: end)
         let cpu = after.cpu - before.cpu
         return ["name": name, "requested_wall_seconds": seconds, "actual_wall_seconds": end - start,
