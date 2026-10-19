@@ -299,7 +299,7 @@ extension BrowserIntelligenceTests {
     }
 
     func testDraggedPreviewBecomesIndependentNoteAndFinishesWhileAnotherPreviewLoads() async throws {
-        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { url in
+        let controller = LinkPreviewController(observesSettings: false, modifierFlags: { .shift }, summaryProvider: { url in
             if url.path == "/first" { try await Task.sleep(for: .milliseconds(200)) }
             return LinkSummary(title: url.lastPathComponent, summary: "A useful summary of \(url.lastPathComponent).", keyPoints: ["A specific fact."])
         })
@@ -519,7 +519,7 @@ extension BrowserIntelligenceTests {
     }
 
     func testLongPreviewFitsSmallPaneAndWindowDeactivationDismissesIt() async throws {
-        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { _ in
+        let controller = LinkPreviewController(observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
             LinkSummary(title: "Travel", summary: "A guide to visiting Oaxaca and its surrounding towns.",
                         keyPoints: Array(repeating: String(repeating: "A detailed fact about the destination. ", count: 4), count: 3))
         })
@@ -555,7 +555,8 @@ extension BrowserIntelligenceTests {
     }
 
     func testNativePreviewMessageShowsSummaryAndNavigationDismissesIt() async throws {
-        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { _ in
+        var modifierFlags = NSEvent.ModifierFlags()
+        let controller = LinkPreviewController(observesSettings: false, modifierFlags: { modifierFlags }, summaryProvider: { _ in
             LinkSummary(title: "Rust Ownership", summary: "Each value has one owner. Borrowing permits references without taking ownership.")
         })
         controller.setEnabled(true)
@@ -576,15 +577,23 @@ extension BrowserIntelligenceTests {
         XCTAssertTrue(view.window?.isKeyWindow == true)
         XCTAssertFalse(view.isHiddenOrHasHiddenAncestor)
         let script = "window.webkit.messageHandlers.browserLinkPreview.postMessage({url:'https://doc.rust-lang.org/book/',x:30,y:40,width:120,height:20});0"
-        let scriptError: String? = await withCheckedContinuation { continuation in
-            view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { result in
-                switch result {
-                case .success: continuation.resume(returning: nil)
-                case .failure(let error): continuation.resume(returning: error.localizedDescription)
+        func sendMessage() async -> String? {
+            await withCheckedContinuation { continuation in
+                view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { result in
+                    switch result {
+                    case .success: continuation.resume(returning: nil)
+                    case .failure(let error): continuation.resume(returning: error.localizedDescription)
+                    }
                 }
             }
         }
-        XCTAssertNil(scriptError)
+        let unmodifiedError = await sendMessage()
+        XCTAssertNil(unmodifiedError)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(controller.presentedPreview, "Native presentation must reject messages when Shift is not held")
+        modifierFlags.insert(.shift)
+        let shiftedError = await sendMessage()
+        XCTAssertNil(shiftedError)
         try await waitUntil { controller.presentedPreview?.result != nil }
         XCTAssertEqual(controller.presentedPreview?.result?.title, "Rust Ownership")
         controller.dismiss(for: view)
@@ -595,6 +604,76 @@ extension BrowserIntelligenceTests {
             view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { _ in continuation.resume() }
         }
         XCTAssertNil(controller.presentedPreview)
+    }
+
+    func testGoogleHoverPreviewRequiresShiftAndTextContent() async throws {
+        let controller = LinkPreviewController(observesSettings: false, modifierFlags: { .shift },
+                                               summaryProvider: { url in
+            LinkSummary(title: url.lastPathComponent, summary: "Previewed website content.")
+        })
+        controller.setEnabled(true)
+        let world = WKContentWorld.world(name: "BrowserLinkPreviews")
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.addUserScript(WKUserScript(source: """
+        window.__previewListeners = {};
+        const nativeAddEventListener = document.addEventListener.bind(document);
+        document.addEventListener = (type, listener, options) => {
+          window.__previewListeners[type] = listener;
+          return nativeAddEventListener(type, listener, options);
+        };
+        """, injectionTime: .atDocumentStart, forMainFrameOnly: true, in: world))
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600), configuration: configuration)
+        let tab = BrowserTab()
+        controller.install(in: view, tab: tab)
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable],
+                                          backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { controller.setEnabled(false); window.close() }
+        view.loadHTMLString("""
+        <title>Google results fixture</title>
+        <a id="text" href="https://example.com/article"><span id="textTarget">Website article</span></a>
+        <a id="image" href="https://example.com/image-result"><img id="imageTarget" alt="Image result"></a>
+        """, baseURL: URL(string: "https://www.google.com/search?q=preview"))
+        try await waitUntil { !view.isLoading && view.title == "Google results fixture" }
+
+        func hover(_ selector: String, shift: Bool) async -> String? {
+            let source = """
+            (() => {
+              const handler = window.__previewListeners?.mouseover;
+              if (typeof handler !== 'function') return 'missing mouseover listener';
+              try {
+                handler({isTrusted:true,target:document.querySelector('\(selector)'),shiftKey:\(shift)});
+                return null;
+              } catch (error) { return String(error?.stack || error); }
+            })()
+            """
+            return await withCheckedContinuation { continuation in
+                view.evaluateJavaScript(source, in: nil, in: world) { result in
+                    switch result {
+                    case .success(let value): continuation.resume(returning: value as? String)
+                    case .failure(let error): continuation.resume(returning: String(describing: (error as NSError).userInfo))
+                    }
+                }
+            }
+        }
+
+        var unmodifiedError = await hover("#textTarget", shift: false)
+        for _ in 0..<50 where unmodifiedError == "missing mouseover listener" {
+            try await Task.sleep(for: .milliseconds(20))
+            unmodifiedError = await hover("#textTarget", shift: false)
+        }
+        XCTAssertNil(unmodifiedError)
+        try await Task.sleep(for: .milliseconds(550))
+        XCTAssertNil(controller.presentedPreview, "Google links must not preview without Shift")
+        let imageError = await hover("#imageTarget", shift: true)
+        XCTAssertNil(imageError)
+        try await Task.sleep(for: .milliseconds(550))
+        XCTAssertNil(controller.presentedPreview, "Image links must not produce website previews")
+        let textError = await hover("#textTarget", shift: true)
+        XCTAssertNil(textError)
+        try await waitUntil { controller.presentedPreview?.result?.title == "article" }
     }
 }
 
