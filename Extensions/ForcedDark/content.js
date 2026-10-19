@@ -28,7 +28,7 @@
   }
   function schedule() {
     if (timer !== undefined) return;
-    timer = setTimeout(() => { timer = undefined; render(); },80);
+    timer = requestAnimationFrame(() => { timer = undefined; render(); });
   }
   function rule(element, declarations, pseudo = "") {
     if (!declarations.length) return "";
@@ -38,8 +38,34 @@
     return `[${attribute}="${id}"]${pseudo}{${declarations.join(";")}}`;
   }
   const declaration = (property,color) => `${property}:${C.css(color)}!important`;
+  function splitList(value) {
+    let depth = 0, start = 0;
+    const values = [];
+    for (let i = 0; i < value.length; i++) {
+      if (value[i] === "(") depth++;
+      if (value[i] === ")") depth--;
+      if (value[i] === "," && depth === 0) { values.push(value.slice(start,i).trim()); start = i+1; }
+    }
+    values.push(value.slice(start).trim());
+    return values;
+  }
+  function transitions(style) {
+    const properties = splitList(style.transitionProperty);
+    if (properties.length === 1 && properties[0] === "none") return null;
+    const duration = splitList(style.transitionDuration), delay = splitList(style.transitionDelay), easing = splitList(style.transitionTimingFunction);
+    const motion = "opacity transform translate scale rotate filter backdrop-filter box-shadow text-shadow clip-path width height min-width min-height max-width max-height margin padding inset border-width border-radius flex-grow flex-shrink flex-basis gap grid-template-columns grid-template-rows background-position background-size left right top bottom font-size font-weight line-height letter-spacing word-spacing visibility".split(" ");
+    return properties.flatMap((property,i) => {
+      const keep = property === "all" ? motion : /color|^(background|border|outline|fill|stroke|caret)$/i.test(property) ? [] : [property];
+      return keep.map(name => `${name} ${duration[i%duration.length]} ${easing[i%easing.length]} ${delay[i%delay.length]}`);
+    }).join(",") || "none";
+  }
   function properties(style, backdrop, imageBackdrop = false) {
     const result = [];
+    // An authored color transition would animate through the original bright
+    // color each time our sheet is temporarily disabled for measurement.
+    // Keep motion/geometry transitions, but publish color changes atomically.
+    const transition = transitions(style);
+    if (transition) result.push(`transition:${transition}!important`);
     const bg = C.parse(style.backgroundColor);
     const darkBG = C.background(bg,C.parse(preferences.background));
     if (bg && bg[3] > 0) result.push(declaration("background-color",darkBG));
