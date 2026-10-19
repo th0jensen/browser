@@ -135,6 +135,14 @@
   document.addEventListener("load",schedule,true);
   document.addEventListener("DOMContentLoaded",schedule,{once:true});
   for (const event of ["change","input","pointerup","focusin","focusout","transitionend"]) document.addEventListener(event,schedule,true);
+  // Recompute hover colors when crossing an interactive control, rather than
+  // rescanning for every child span/icon crossed while moving the pointer.
+  const control = node => node instanceof Element ? node.closest("a,button,input,select,textarea,summary,[role=button],[tabindex]") : null;
+  document.addEventListener("pointerover",event => {
+    const next = control(event.target), previous = control(event.relatedTarget);
+    if (next !== previous && (next || previous)) schedule();
+  },true);
+  document.addEventListener("pointerout",event => { if (!event.relatedTarget && control(event.target)) schedule(); },true);
   window.addEventListener("resize",schedule);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change",schedule);
   observer.observe(document,{subtree:true,childList:true,attributes:true});
