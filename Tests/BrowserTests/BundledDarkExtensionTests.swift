@@ -80,6 +80,10 @@ final class BundledDarkExtensionTests: XCTestCase {
         try await check(webView, "document.querySelector('#dynamic').getAttribute('style') === 'background:white'")
         _ = try await menuView.evaluateJavaScript("document.querySelector('#enabled').click(); 0")
         try await waitFor(webView, "getComputedStyle(document.body).backgroundColor === 'rgb(24, 28, 32)'")
+        _ = try await webView.evaluateJavaScript("document.body.style.backgroundColor = 'lab(97.194298 1.38536 0.498641)'; document.body.style.color = 'lab(2.33353 10.3966 3.72023)'; 0")
+        try await waitFor(webView, "getComputedStyle(document.body).backgroundColor.startsWith('rgb(')")
+        try await check(webView, "getComputedStyle(document.body).color !== 'lab(2.33353 10.3966 3.72023)'")
+        try await check(webView, "getComputedStyle(document.body).scrollbarColor !== 'auto'")
         webView.loadHTMLString("""
         <html><head><meta http-equiv="Content-Security-Policy" content="style-src 'nonce-fixture'">
         <style nonce="fixture">body { background:white; color:black; }</style></head>
