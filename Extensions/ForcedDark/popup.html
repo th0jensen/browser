@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forced Dark</title>
+  <link rel="stylesheet" href="popup.css">
+  <script src="colors.js" defer></script>
+  <script src="popup.js" defer></script>
+</head>
+<body>
+  <header><img src="icon.svg" width="30" height="30" alt=""><div><h1>Forced Dark</h1><p>A softer side of the web</p></div></header>
+  <label class="toggle"><span>Darken websites</span><input id="enabled" type="checkbox" role="switch" checked></label>
+  <section aria-labelledby="background-label">
+    <h2 id="background-label">Page background</h2>
+    <div class="swatches" role="group" aria-label="Background presets">
+      <button data-color="#121212" aria-label="Charcoal" title="Charcoal" style="--swatch:#121212"></button>
+      <button data-color="#181c20" aria-label="Slate" title="Slate" style="--swatch:#181c20"></button>
+      <button data-color="#17211c" aria-label="Forest" title="Forest" style="--swatch:#17211c"></button>
+      <button data-color="#211c19" aria-label="Warm" title="Warm" style="--swatch:#211c19"></button>
+      <button data-color="#000000" aria-label="Black" title="Black" style="--swatch:#000000"></button>
+    </div>
+    <label class="custom"><span>Custom color</span><input id="background" type="color" value="#121212" aria-label="Custom page background"><output id="hex">#121212</output></label>
+    <p id="status" role="status">Applies to all websites. Images keep their colors.</p>
+  </section>
+  <button id="reset" class="reset">Reset to charcoal</button>
+</body>
+</html>
