@@ -28,7 +28,8 @@
   function rule(element, declarations, pseudo = "") {
     if (!declarations.length) return "";
     let id = ids.get(element);
-    if (id === undefined) { id = ++nextID; ids.set(element,id); element.setAttribute(attribute,id); }
+    if (id === undefined) { id = ++nextID; ids.set(element,id); }
+    if (element.getAttribute(attribute) !== String(id)) element.setAttribute(attribute,id);
     return `[${attribute}="${id}"]${pseudo}{${declarations.join(";")}}`;
   }
   const declaration = (property,color) => `${property}:${C.css(color)}!important`;
@@ -89,15 +90,16 @@
         const backdrop = backdrops.get(parent) ?? inherited;
         const style = getComputedStyle(element);
         const bg = C.parse(style.backgroundColor);
-        const hasImage = style.backgroundImage.includes("url(") || ((bg?.[3] ?? 0) < 0.95 && imageBackdrops.get(parent));
+        const coveringImage = style.backgroundImage.includes("url(") && /cover|100%/.test(style.backgroundSize);
+        const hasImage = coveringImage || ((bg?.[3] ?? 0) < 0.95 && imageBackdrops.get(parent));
         const values = properties(style,backdrop,hasImage);
         backdrops.set(element,values.backdrop);
         imageBackdrops.set(element,hasImage);
         rules.push(rule(element,values.declarations));
         for (const pseudo of ["::before","::after","::marker","::placeholder"]) {
-          const pseudoStyle = getComputedStyle(element,pseudo);
           if (pseudo === "::placeholder" && !["INPUT","TEXTAREA"].includes(element.tagName)) continue;
           if (pseudo === "::marker" && style.display !== "list-item") continue;
+          const pseudoStyle = getComputedStyle(element,pseudo);
           if (["::before","::after"].includes(pseudo) && ["none","normal",""].includes(pseudoStyle.content)) continue;
           rules.push(rule(element,properties(pseudoStyle,values.backdrop,hasImage).declarations,pseudo));
         }
@@ -131,7 +133,7 @@
   // computed colors without changing an element's style attribute.
   document.addEventListener("load",schedule,true);
   document.addEventListener("DOMContentLoaded",schedule,{once:true});
-  for (const event of ["change","input","pointerover","pointerout","focusin","focusout","transitionend"]) document.addEventListener(event,schedule,true);
+  for (const event of ["change","input","pointerup","focusin","focusout","transitionend"]) document.addEventListener(event,schedule,true);
   window.addEventListener("resize",schedule);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change",schedule);
   observer.observe(document,{subtree:true,childList:true,attributes:true});

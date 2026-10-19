@@ -17,12 +17,14 @@ async function save(value) {
     display();
     return;
   }
+  for (const input of document.querySelectorAll("button,input")) input.disabled = true;
   try {
     await api.storage.local.set({forcedDark:value});
     current = value;
     display();
     status.textContent = "Saved. Open websites update automatically.";
   } catch { status.textContent = "Could not save. Please try again."; }
+  finally { for (const input of document.querySelectorAll("button,input")) input.disabled = false; }
 }
 // Avoid overwriting stored preferences before the asynchronous read completes.
 for (const input of document.querySelectorAll("button,input")) input.disabled = true;
