@@ -38,3 +38,5 @@ When optimized benchmarking is explicitly requested, `just benchmark` uses the R
 Extension sources live under `Extensions/`. Forced Dark is a Manifest V3 extension with a content script and action popup; its color math and preference validation are in `colors.js`. Run its JavaScript checks with `just --justfile Extensions/justfile test`. `BundledDarkExtensionTests` exercises actual WebKit injection, dynamic content, and popup preference updates through `just test`.
 
 Bundled resources are folder references in the shared app target. `BrowserExtensions.shared` registers them disabled by default and loads them directly from the app bundle. The persisted extension UUID preserves WebKit storage and enablement across app updates; do not replace it when updating bundled resources. An extension's popup is its own extension-origin web view and uses standard Web Extension storage APIs.
+
+Bundled action popups are also reachable through the extension’s Options button in Settings. Saved toolbar layouts can hide newly enabled extension buttons; add them through Customize Toolbar when needed.
