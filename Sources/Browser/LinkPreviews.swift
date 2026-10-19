@@ -1,10 +1,12 @@
 import AppKit
+import Darwin
+import ImageIO
 import Observation
 import SwiftUI
 import WebKit
 
 /// Fetches a single public document. No browser cookies, HTTP credentials, script
-/// execution, subresources, or disk cache are involved in preview generation.
+/// execution, or disk cache. Only the document’s declared preview image is fetched.
 actor LinkPreviewFetcher {
     static let shared = LinkPreviewFetcher()
     private let session: URLSession
@@ -20,11 +22,18 @@ actor LinkPreviewFetcher {
         session = URLSession(configuration: config, delegate: redirects, delegateQueue: nil)
     }
 
-    func text(at url: URL) async throws -> String {
-        guard Self.isPublicWebURL(url) else { throw IntelligenceError.message("This link cannot be previewed.") }
+    struct Document: Sendable {
+        let text: String
+        let imageURL: URL?
+    }
+
+    func document(at url: URL) async throws -> Document {
+        guard await Self.hasPublicDestination(url) else { throw IntelligenceError.message("This link cannot be previewed.") }
+        try Task.checkCancellation()
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.setValue("text/html,application/xhtml+xml,text/plain;q=0.8", forHTTPHeaderField: "Accept")
         let (bytes, response) = try await session.bytes(for: request)
+        defer { bytes.task.cancel() }
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let finalURL = response.url, Self.isPublicWebURL(finalURL),
               ["text/html", "application/xhtml+xml", "text/plain"].contains(response.mimeType?.lowercased() ?? "") else {
@@ -40,7 +49,65 @@ actor LinkPreviewFetcher {
         let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
         let text = Self.readableText(html)
         guard text.count >= 100 else { throw IntelligenceError.message("There isn’t enough readable text to preview this page.") }
-        return String(text.prefix(6500))
+        return Document(text: String(text.prefix(6500)), imageURL: Self.previewImage(in: html, relativeTo: finalURL))
+    }
+
+    /// Decode a bounded thumbnail, never an unbounded full-resolution webpage image.
+    func imageData(at url: URL) async throws -> Data? {
+        guard await Self.hasPublicDestination(url) else { return nil }
+        try Task.checkCancellation()
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.setValue("image/avif,image/webp,image/*;q=0.8", forHTTPHeaderField: "Accept")
+        let (bytes, response) = try await session.bytes(for: request)
+        defer { bytes.task.cancel() }
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let finalURL = response.url, Self.isPublicWebURL(finalURL),
+              response.mimeType?.hasPrefix("image/") == true,
+              response.expectedContentLength <= 2 * 1024 * 1024 else { return nil }
+        var data = Data()
+        for try await byte in bytes {
+            guard data.count < 2 * 1024 * 1024 else { return nil }
+            data.append(byte)
+        }
+        try Task.checkCancellation()
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 600
+              ] as CFDictionary), thumbnail.width >= 120, thumbnail.height >= 60 else { return nil }
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, thumbnail, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
+    }
+
+    nonisolated static func previewImage(in html: String, relativeTo page: URL) -> URL? {
+        // Attribute order and quoting differ across publishers. Never execute HTML.
+        let tags = try! NSRegularExpression(pattern: "(?is)<meta\\b[^>]*>")
+        let attributes = try! NSRegularExpression(pattern: #"([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#)
+        var values: [String: String] = [:]
+        for match in tags.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            let tag = (html as NSString).substring(with: match.range)
+            var attrs: [String: String] = [:]
+            for item in attributes.matches(in: tag, range: NSRange(tag.startIndex..., in: tag)) {
+                let key = (tag as NSString).substring(with: item.range(at: 1)).lowercased()
+                if let range = (2...4).map({ item.range(at: $0) }).first(where: { $0.location != NSNotFound }) {
+                    attrs[key] = (tag as NSString).substring(with: range)
+                }
+            }
+            if let key = attrs["property"] ?? attrs["name"], let content = attrs["content"] {
+                values[key.lowercased()] = content
+            }
+        }
+        for key in ["og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"] {
+            guard let value = values[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty,
+                  let url = URL(string: value.replacingOccurrences(of: "&amp;", with: "&"), relativeTo: page)?.absoluteURL,
+                  isPublicWebURL(url) else { continue }
+            return url
+        }
+        return nil
     }
 
     nonisolated static func isPublicWebURL(_ url: URL) -> Bool {
@@ -51,6 +118,48 @@ actor LinkPreviewFetcher {
         // Avoid local services and numeric/encoded IP hosts on incidental hover.
         if host.contains(":") || host.split(separator: ".").allSatisfy({ UInt($0) != nil }) { return false }
         return host != "localhost"
+    }
+
+    /// Hostname syntax alone cannot exclude local services behind a public DNS name.
+    /// Resolve off the main actor and check every address before requesting a document,
+    /// image, or redirect. URLSession still performs its own DNS lookup for TLS/HTTP.
+    nonisolated static func hasPublicDestination(_ url: URL) async -> Bool {
+        guard isPublicWebURL(url), let host = url.host() else { return false }
+        return await Task.detached(priority: .utility) {
+            var hints = addrinfo()
+            hints.ai_family = AF_UNSPEC
+            hints.ai_socktype = SOCK_STREAM
+            var addresses: UnsafeMutablePointer<addrinfo>?
+            guard getaddrinfo(host, nil, &hints, &addresses) == 0, let first = addresses else { return false }
+            defer { freeaddrinfo(first) }
+            var cursor: UnsafeMutablePointer<addrinfo>? = first
+            while let address = cursor {
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                guard getnameinfo(address.pointee.ai_addr, address.pointee.ai_addrlen,
+                                  &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0,
+                      isPublicAddress(String(decoding: buffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)) else { return false }
+                cursor = address.pointee.ai_next
+            }
+            return true
+        }.value
+    }
+
+    nonisolated static func isPublicAddress(_ value: String) -> Bool {
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, value, &ipv4) == 1 {
+            let bytes = withUnsafeBytes(of: ipv4.s_addr) { Array($0) }
+            let a = bytes[0], b = bytes[1]
+            return !(a == 0 || a == 10 || a == 127 || a >= 224 ||
+                     (a == 100 && (64...127).contains(b)) ||
+                     (a == 169 && b == 254) || (a == 172 && (16...31).contains(b)) ||
+                     (a == 192 && (b == 168 || b == 0)) || (a == 198 && (18...19).contains(b)))
+        }
+        var ipv6 = in6_addr()
+        guard inet_pton(AF_INET6, value, &ipv6) == 1 else { return false }
+        let bytes = withUnsafeBytes(of: ipv6) { Array($0) }
+        // Public global unicast only; mapped IPv4, loopback, link-local, ULA and
+        // multicast are excluded. Also exclude the documentation prefix.
+        return bytes[0] & 0xe0 == 0x20 && Array(bytes.prefix(4)) != [0x20, 0x01, 0x0d, 0xb8]
     }
 
     nonisolated static func readableText(_ html: String) -> String {
@@ -70,7 +179,10 @@ actor LinkPreviewFetcher {
 private final class PreviewRedirectPolicy: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
-        completionHandler(request.url.map(LinkPreviewFetcher.isPublicWebURL) == true ? request : nil)
+        Task {
+            let allowed = if let url = request.url { await LinkPreviewFetcher.hasPublicDestination(url) } else { false }
+            completionHandler(allowed ? request : nil)
+        }
     }
 }
 
@@ -78,6 +190,11 @@ private final class PreviewRedirectPolicy: NSObject, URLSessionTaskDelegate, Sen
 final class LinkPreviewState {
     let url: URL
     var result: LinkSummary?
+    var image: NSImage?
+    var isLoading = true
+    var cardWidth: CGFloat = 300
+    var contentHeight: CGFloat = 110
+    var maximumHeight: CGFloat = 420
     var error: String?
     init(url: URL) { self.url = url }
 }
@@ -86,43 +203,78 @@ private struct LinkPreviewCard: View {
     let state: LinkPreviewState
     let open: () -> Void
     let hover: (Bool) -> Void
+    let resize: (CGFloat) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "sparkles").font(.system(size: 11))
-                Text("5-second Preview").font(.system(size: 11, weight: .medium))
-                Spacer()
-                Text("On-device").font(.system(size: 10))
-            }.foregroundStyle(.secondary)
-            if let result = state.result {
-                Text(result.title).font(.system(size: 14, weight: .semibold)).lineLimit(3)
-                Text(result.summary).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
-            } else if let error = state.error {
-                Text(error).font(.system(size: 12)).foregroundStyle(.secondary)
-            } else {
-                VStack(alignment: .leading, spacing: 8) {
-                    RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.12)).frame(width: 185, height: 14)
-                    RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(height: 10)
-                    RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: 235, height: 10)
-                    RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: 155, height: 10)
-                }.padding(.vertical, 8).modifier(IntelligenceShimmer(active: true))
-                    .accessibilityLabel("Loading link preview")
-            }
+        ScrollView {
             Button(action: open) {
-                HStack {
-                    Text(state.url.host() ?? "Open page").lineLimit(1).truncationMode(.middle)
-                    Spacer()
-                    Image(systemName: "arrow.up.right")
-                }.font(.system(size: 11))
-            }.buttonStyle(.plain).foregroundStyle(.secondary)
-        }.padding(16).frame(width: 320, alignment: .leading).onHover(perform: hover)
+                VStack(alignment: .leading, spacing: 0) {
+                    if let image = state.image {
+                        Image(nsImage: image).resizable().scaledToFill()
+                            .frame(width: state.cardWidth, height: 100).clipped().accessibilityHidden(true)
+                    }
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let result = state.result {
+                            Text(result.summary).font(.system(size: 12, weight: .semibold))
+                                .fixedSize(horizontal: false, vertical: true)
+                            ForEach(Array(result.keyPoints.prefix(3).enumerated()), id: \.offset) { _, point in
+                                HStack(alignment: .top, spacing: 9) {
+                                    Circle().fill(.secondary.opacity(0.55)).frame(width: 4, height: 4).padding(.top, 6)
+                                    Text(point).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        if let error = state.error {
+                            Text(error).font(.system(size: 12)).foregroundStyle(.secondary)
+                        } else if state.isLoading && state.result == nil {
+                            VStack(alignment: .leading, spacing: 9) {
+                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.12)).frame(height: 11)
+                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: min(235, state.cardWidth - 28), height: 11)
+                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: min(170, state.cardWidth - 28), height: 11)
+                            }.padding(.vertical, 6).modifier(IntelligenceShimmer(active: !reduceMotion))
+                                .accessibilityLabel("Loading link preview")
+                        }
+                        HStack(spacing: 5) {
+                            if state.isLoading { ProgressView().controlSize(.mini).scaleEffect(0.7).frame(width: 10, height: 10) }
+                            Text(state.url.host()?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression) ?? "Open page")
+                                .lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            Image(systemName: "arrow.up.right").font(.system(size: 9, weight: .medium))
+                        }.font(.system(size: 10)).foregroundStyle(.secondary)
+                    }.padding(14)
+                }
+                .foregroundStyle(.primary)
+                .frame(width: state.cardWidth, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                state.contentHeight = $0
+                resize($0)
+            }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(width: state.cardWidth, height: min(state.contentHeight, state.maximumHeight))
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.08)))
+        .help("Open \(state.url.absoluteString)")
+        .onHover(perform: hover)
     }
 }
 
+/// A hover card never takes keyboard focus from the source page.
+private final class LinkPreviewPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
 /// Event-driven, isolated-world link tracking: no polling or model work until an
-/// enabled, intentional hover. One popover and a small memory-only cache per app.
+/// enabled, intentional hover. One hover panel and a small memory-only cache per app.
 @MainActor
-final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDelegate {
+final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     static let shared = LinkPreviewController()
     private static let messageName = "browserLinkPreview"
     private static let world = WKContentWorld.world(name: "BrowserLinkPreviews")
@@ -131,23 +283,22 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDe
     private let tabs = NSMapTable<WKWebView, BrowserTab>.weakToWeakObjects()
     private var enabled = UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey)
     private(set) var presentedPreview: LinkPreviewState?
-    private let summaryProvider: @Sendable (URL) async throws -> LinkSummary
+    private let summaryProvider: (@Sendable (URL) async throws -> LinkSummary)?
     private var settingsObserver: NSObjectProtocol?
     private var task: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
-    private var popover: NSPopover?
+    private var panel: NSPanel?
+    private var anchorInScreen = NSRect.zero
+    private var eventMonitor: Any?
+    private var presentationObservers: [NSObjectProtocol] = []
+    private var imageTask: Task<Void, Never>?
     private weak var sourceView: WKWebView?
     private var currentURL: URL?
     private var pointerInsideCard = false
     private var generation = UUID()
-    private var cache: [URL: (Date, LinkSummary)] = [:]
+    private var cache: [URL: (Date, LinkSummary, NSImage?)] = [:]
 
-    init(observesSettings: Bool = true, summaryProvider: @escaping @Sendable (URL) async throws -> LinkSummary = { url in
-        await LocalIntelligence.shared.prepare(.preview)
-        let text = try await LinkPreviewFetcher.shared.text(at: url)
-        try Task.checkCancellation()
-        return try await LocalIntelligence.shared.summarize(text: text, url: url)
-    }) {
+    init(observesSettings: Bool = true, summaryProvider: (@Sendable (URL) async throws -> LinkSummary)? = nil) {
         self.summaryProvider = summaryProvider
         super.init()
         guard observesSettings else { return }
@@ -191,75 +342,156 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDe
     private func dismiss() {
         generation = UUID()
         task?.cancel(); task = nil
+        imageTask?.cancel(); imageTask = nil
         dismissTask?.cancel(); dismissTask = nil
         currentURL = nil
         presentedPreview = nil
         sourceView = nil
         pointerInsideCard = false
-        let previous = popover; popover = nil
-        previous?.close()
-    }
-    func popoverDidClose(_ notification: Notification) {
-        if let closed = notification.object as? NSPopover, closed === popover { dismiss() }
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
+        presentationObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        presentationObservers.removeAll()
+        if let previous = panel {
+            panel = nil
+            previous.parent?.removeChildWindow(previous)
+            previous.orderOut(nil)
+        }
     }
     private func scheduleDismiss() {
-        dismissTask?.cancel()
+        guard dismissTask == nil else { return }
         dismissTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled, self?.pointerInsideCard == false else { return }
-            self?.dismiss()
+            guard !Task.isCancelled, let self else { return }
+            self.dismissTask = nil
+            guard !self.pointerInsideCard, self.panel?.frame.contains(NSEvent.mouseLocation) != true else { return }
+            self.dismiss()
         }
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard enabled, message.frameInfo.isMainFrame, let view = message.webView,
-              view.window?.isKeyWindow == true, !view.isHiddenOrHasHiddenAncestor,
               let body = message.body as? [String: Any] else { return }
         if body["leave"] as? Bool == true {
             if sourceView === view { scheduleDismiss() }
             return
         }
-        guard BrowserIntelligence.unavailableReason == nil,
+        guard view.window?.isKeyWindow == true, !view.isHiddenOrHasHiddenAncestor,
+              (summaryProvider != nil || BrowserIntelligence.unavailableReason == nil),
               let href = body["url"] as? String, let url = URL(string: href), LinkPreviewFetcher.isPublicWebURL(url),
               let x = body["x"] as? Double, let y = body["y"] as? Double,
               let width = body["width"] as? Double, let height = body["height"] as? Double,
               [x, y, width, height].allSatisfy(\.isFinite), width > 0, height > 0 else { return }
-        dismissTask?.cancel()
+        dismissTask?.cancel(); dismissTask = nil
         if currentURL == url && sourceView === view { return }
         dismiss()
         currentURL = url; sourceView = view
         let state = LinkPreviewState(url: url)
         presentedPreview = state
-        let native = NSPopover()
-        native.behavior = .semitransient
-        native.animates = false
-        native.delegate = self
+        guard let window = view.window else { dismiss(); return }
+        let localY = view.isFlipped ? y : view.bounds.height - y - height
+        let anchor = NSRect(x: x, y: localY, width: width, height: height).intersection(view.bounds)
+        guard !anchor.isEmpty else { dismiss(); return }
+        anchorInScreen = window.convertToScreen(view.convert(anchor, to: nil))
+        let native = LinkPreviewPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        native.appearance = window.effectiveAppearance
+        native.isOpaque = false
+        native.backgroundColor = .clear
+        native.hasShadow = true
+        native.hidesOnDeactivate = true
+        native.isReleasedWhenClosed = false
         let tab = tabs.object(forKey: view)
-        native.contentViewController = NSHostingController(rootView: LinkPreviewCard(state: state, open: { [weak self, weak tab] in
+        native.contentView = NSHostingView(rootView: LinkPreviewCard(state: state, open: { [weak self, weak tab] in
             self?.dismiss()
             tab?.load(url)
         }, hover: { [weak self] inside in
             self?.pointerInsideCard = inside
-            if inside { self?.dismissTask?.cancel() } else { self?.scheduleDismiss() }
-        }))
-        popover = native
-        let localY = view.isFlipped ? y : view.bounds.height - y - height
-        let anchor = NSRect(x: x, y: localY, width: min(width, 300), height: height).intersection(view.bounds)
-        guard !anchor.isEmpty else { dismiss(); return }
-        native.show(relativeTo: anchor, of: view, preferredEdge: .maxY)
-        if let (date, result) = cache[url], Date().timeIntervalSince(date) < 300 { state.result = result; return }
+            if inside { self?.dismissTask?.cancel(); self?.dismissTask = nil } else { self?.scheduleDismiss() }
+        }, resize: { [weak self] height in self?.resize(height: height) }))
+        panel = native
+        resize(height: 110)
+        window.addChildWindow(native, ordered: .above)
+        native.orderFront(nil)
+        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
+                               (NSWindow.willMoveNotification, window as AnyObject),
+                               (NSWindow.didResizeNotification, window as AnyObject),
+                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
+            presentationObservers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dismiss() }
+            })
+        }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel, .mouseMoved]) { [weak self, weak native, weak view] event in
+            guard let self else { return event }
+            if event.type == .keyDown && event.keyCode == 53 { self.dismiss(); return nil }
+            if event.type == .mouseMoved {
+                if event.window === native || self.anchorInScreen.insetBy(dx: -4, dy: -4).contains(NSEvent.mouseLocation) {
+                    self.dismissTask?.cancel(); self.dismissTask = nil
+                } else { self.scheduleDismiss() }
+            } else if event.window !== native { self.dismiss() }
+            if view?.window?.isKeyWindow != true { self.dismiss() }
+            return event
+        }
+        if let (date, result, image) = cache[url], Date().timeIntervalSince(date) < 300 {
+            state.result = result; state.image = image; state.isLoading = false
+            return
+        }
         let token = generation
         let summarize = summaryProvider
         task = Task { [weak self] in
             do {
-                let result = try await summarize(url)
+                let result: LinkSummary
+                if let summarize {
+                    result = try await summarize(url)
+                } else {
+                    await LocalIntelligence.shared.prepare(.preview)
+                    let document = try await LinkPreviewFetcher.shared.document(at: url)
+                    guard let self, !Task.isCancelled, self.generation == token else { return }
+                    if let imageURL = document.imageURL {
+                        self.imageTask = Task { [weak self] in
+                            guard let data = try? await LinkPreviewFetcher.shared.imageData(at: imageURL),
+                                  let self, !Task.isCancelled, self.generation == token else { return }
+                            state.image = NSImage(data: data)
+                            if let cached = self.cache[url] { self.cache[url] = (cached.0, cached.1, state.image) }
+                        }
+                    }
+                    result = try await LocalIntelligence.shared.summarize(text: document.text, url: url) { [weak self] partial in
+                        await MainActor.run {
+                            guard let self, self.generation == token else { return }
+                            state.result = partial
+                        }
+                    }
+                }
                 guard let self, !Task.isCancelled, self.generation == token else { return }
                 if self.cache.count >= 16, let oldest = self.cache.min(by: { $0.value.0 < $1.value.0 })?.key { self.cache[oldest] = nil }
-                self.cache[url] = (Date(), result)
+                self.cache[url] = (Date(), result, state.image)
                 state.result = result
+                state.isLoading = false
             } catch is CancellationError { }
-            catch { if !Task.isCancelled, self?.generation == token { state.error = "Preview unavailable. " + error.localizedDescription } }
+            catch {
+                if !Task.isCancelled, self?.generation == token {
+                    state.error = "Preview unavailable. Open the page to read it."
+                    state.isLoading = false
+                }
+            }
         }
+    }
+
+    private func resize(height: CGFloat) {
+        guard let panel, let sourceView, let state = presentedPreview, let window = sourceView.window else { return }
+        let visible = window.convertToScreen(sourceView.convert(sourceView.bounds, to: nil))
+            .intersection(window.screen?.visibleFrame ?? window.frame).insetBy(dx: 8, dy: 8)
+        guard visible.width >= 120, visible.height >= 70 else { dismiss(); return }
+        let width = min(300, visible.width)
+        let below = max(0, anchorInScreen.minY - visible.minY - 6)
+        let above = max(0, visible.maxY - anchorInScreen.maxY - 6)
+        let placeBelow = height <= below || below >= above
+        let maximumHeight = max(70, placeBelow ? below : above)
+        state.cardWidth = width
+        state.maximumHeight = maximumHeight
+        let height = min(max(height, 70), maximumHeight)
+        let x = min(max(anchorInScreen.minX, visible.minX), visible.maxX - width)
+        let preferredY = placeBelow ? anchorInScreen.minY - height - 6 : anchorInScreen.maxY + 6
+        let y = min(max(preferredY, visible.minY), visible.maxY - height)
+        panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
     }
 
     private static let script = """
@@ -291,7 +523,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDe
         if (!e.isTrusted || !link) return;
         if (!e.relatedTarget || !link.contains(e.relatedTarget)) { clear(); link = null; }
       }
-      function key(e) { if (e.isTrusted && e.key === 'Shift') { if (e.type === 'keydown' && !e.repeat) start(true); else if (e.type === 'keyup' && !automatic) clear(); } }
+      function key(e) { if (e.isTrusted && e.key === 'Escape') { stop(); return; } if (e.isTrusted && e.key === 'Shift') { if (e.type === 'keydown' && !e.repeat) start(true); else if (e.type === 'keyup' && !automatic && !sent) clear(); } }
       function stop() { clear(); link = null; }
       window.browserSetLinkPreviews = value => {
         if (enabled === value) return;
@@ -300,7 +532,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler, NSPopoverDe
         document[action]('mouseover', over, true); document[action]('mouseout', out, true);
         document[action]('keydown', key, true); document[action]('keyup', key, true);
         document[action]('scroll', stop, true); document[action]('mousedown', stop, true);
-        window[action]('blur', stop, true);
+        window[action]('blur', stop, true); document[action]('visibilitychange', stop, true);
         if (!value) stop();
       };
     })();

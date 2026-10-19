@@ -24,3 +24,9 @@ Co-authored-by: Codex (GPT-6.1 Sol) <noreply@openai.com>
 Keep benchmark measurements and before/after results in the task thread, not PR descriptions or committed reports.
 
 When optimized benchmarking is explicitly requested, `just benchmark` uses the Release-optimized `Benchmark` configuration and `dev.athas.browser.benchmark` identity in normal DerivedData. It runs only isolated XCTest fixtures, never deployment or profile migration, and must leave the installed browsers running. Ordinary GUI QA continues to use Debug.
+
+# Link previews
+
+`LinkPreviewController` tracks intentional link hovers in an isolated WebKit content world and presents a nonactivating child panel. Keep keyboard focus on the source page; dismiss and cancel work on navigation, window changes, deactivation, or leaving the link/card. The card measures its content and scrolls within the source pane’s available space.
+
+`LinkPreviewFetcher` uses an ephemeral, cookie-free session for bounded document and publisher-image requests. `LocalIntelligence` streams structured summaries through the shared model queue. `BrowserIntelligenceTests` injects a summary provider to check native presentation and cancellation without requiring an available on-device model; run these with `just test`.

@@ -210,8 +210,63 @@ extension BrowserIntelligenceTests {
 
 
 extension BrowserIntelligenceTests {
+    func testPreviewDestinationAddressesExcludePrivateAndLocalNetworks() {
+        for address in ["127.0.0.1", "10.20.0.1", "172.16.0.1", "172.31.255.255", "192.168.2.1", "169.254.1.2", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "fe80::1", "fc00::1", "::ffff:127.0.0.1", "2001:db8::1", "invalid"] {
+            XCTAssertFalse(LinkPreviewFetcher.isPublicAddress(address), address)
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "172.32.0.1", "2606:4700:4700::1111"] {
+            XCTAssertTrue(LinkPreviewFetcher.isPublicAddress(address), address)
+        }
+    }
+
+    func testPreviewImagesUsePublisherMetadataAndRejectLocalOrExecutableURLs() throws {
+        let page = URL(string: "https://publisher.example.com/articles/travel")!
+        XCTAssertEqual(LinkPreviewFetcher.previewImage(in: "<meta content='/images/oaxaca.jpg?a=1&amp;b=2' property='og:image'>", relativeTo: page)?.absoluteString,
+                       "https://publisher.example.com/images/oaxaca.jpg?a=1&b=2")
+        XCTAssertEqual(LinkPreviewFetcher.previewImage(in: "<META CONTENT=//cdn.example.com/hero.webp NAME=twitter:image>", relativeTo: page)?.absoluteString,
+                       "https://cdn.example.com/hero.webp")
+        XCTAssertEqual(LinkPreviewFetcher.previewImage(in: "<meta property='og:image' content='http://127.0.0.1/private'><meta name='twitter:image' content='https://cdn.example.com/fallback.png'>", relativeTo: page)?.path,
+                       "/fallback.png")
+        for image in ["javascript:alert(1)", "data:image/png;base64,abc", "file:///tmp/image.png", "http://localhost/x", "https://server.local/x", ""] {
+            XCTAssertNil(LinkPreviewFetcher.previewImage(in: "<meta property='og:image' content='\(image)'>", relativeTo: page), image)
+        }
+        XCTAssertNil(LinkPreviewFetcher.previewImage(in: "<script>const image = 'https://example.com/hero.jpg'</script>", relativeTo: page))
+    }
+
+    func testLongPreviewFitsSmallPaneAndWindowDeactivationDismissesIt() async throws {
+        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { _ in
+            LinkSummary(title: "Travel", summary: "A guide to visiting Oaxaca and its surrounding towns.",
+                        keyPoints: Array(repeating: String(repeating: "A detailed fact about the destination. ", count: 4), count: 3))
+        })
+        controller.setEnabled(true)
+        let tab = BrowserTab()
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 260, height: 270))
+        controller.install(in: view, tab: tab)
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { controller.dismiss(for: view); window.close() }
+        view.loadHTMLString("<title>Small preview fixture</title><p>Travel links</p>", baseURL: URL(string: "https://example.com"))
+        try await waitUntil { !view.isLoading && view.title != nil }
+        let script = "window.webkit.messageHandlers.browserLinkPreview.postMessage({url:'https://example.com/travel',x:10,y:20,width:180,height:20});0"
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { _ in continuation.resume() }
+        }
+        try await waitUntil { controller.presentedPreview?.result != nil }
+        try await waitUntil { (controller.presentedPreview?.contentHeight ?? 0) > 300 }
+        let panel = try XCTUnwrap(window.childWindows?.first)
+        let bounds = window.convertToScreen(view.convert(view.bounds, to: nil))
+        XCTAssertTrue(bounds.contains(panel.frame), "\(panel.frame) outside \(bounds)")
+        XCTAssertLessThan(panel.frame.width, 260)
+        XCTAssertLessThan(panel.frame.height, try XCTUnwrap(controller.presentedPreview).contentHeight)
+        XCTAssertEqual(controller.presentedPreview?.result?.keyPoints.count, 3)
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        XCTAssertNil(controller.presentedPreview)
+        XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+    }
+
     func testNativePreviewMessageShowsSummaryAndNavigationDismissesIt() async throws {
-        guard BrowserIntelligence.unavailableReason == nil else { throw XCTSkip("On-device model unavailable on this runner") }
         let controller = LinkPreviewController(observesSettings: false, summaryProvider: { _ in
             LinkSummary(title: "Rust Ownership", summary: "Each value has one owner. Borrowing permits references without taking ownership.")
         })
