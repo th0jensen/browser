@@ -62,6 +62,8 @@
     const properties = splitList(style.transitionProperty);
     if (properties.length === 1 && properties[0] === "none") return null;
     const duration = splitList(style.transitionDuration), delay = splitList(style.transitionDelay), easing = splitList(style.transitionTimingFunction);
+    if (duration.every(value => parseFloat(value) === 0) && delay.every(value => parseFloat(value) === 0)) return null;
+    if (!properties.some(property => /color|^(all|background|border|outline|fill|stroke|caret)$/i.test(property))) return null;
     const motion = "opacity transform translate scale rotate filter backdrop-filter box-shadow text-shadow clip-path width height min-width min-height max-width max-height margin padding inset border-width border-radius flex-grow flex-shrink flex-basis gap grid-template-columns grid-template-rows background-position background-size left right top bottom font-size font-weight line-height letter-spacing word-spacing visibility".split(" ");
     return properties.flatMap((property,i) => {
       const keep = property === "all" ? motion : /color|^(background|border|outline|fill|stroke|caret)$/i.test(property) ? [] : [property];
