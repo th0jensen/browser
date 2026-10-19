@@ -32,12 +32,15 @@ final class ContentBlocker {
     private(set) var isUpdating = false
     private(set) var lastError: String?
     /// Whether the installed rules reflect the current list and exceptions.
-    var isReady: Bool { installedSignature == Self.signature(exceptions: exceptions) }
+    var isReady: Bool { installedSignature == requestedSignature }
+    /// A store-less instance has no startup work; real stores require the current protection rules.
+    var isPreparedForNavigation: Bool { store == nil || isReady }
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private let store: WKContentRuleListStore?
     @ObservationIgnored private let ruleListCompiler: RuleListCompiler
     @ObservationIgnored private var ruleList: WKContentRuleList?
     private var installedSignature: String?
+    private var requestedSignature = ""
     @ObservationIgnored private let installedLists = NSMapTable<WKUserContentController, WKContentRuleList>.weakToStrongObjects()
     @ObservationIgnored private let controllers = NSHashTable<WKUserContentController>.weakObjects()
     @ObservationIgnored private var loading: Task<Void, Never>?
@@ -54,6 +57,7 @@ final class ContentBlocker {
         }
         isEnabled = defaults?.object(forKey: Self.enabledKey) as? Bool ?? true
         exceptions = defaults?.stringArray(forKey: Self.exceptionsKey) ?? []
+        requestedSignature = Self.signature(exceptions: exceptions)
         if store != nil { loadRuleList() }
     }
 
@@ -118,6 +122,7 @@ final class ContentBlocker {
     }
 
     private func saveExceptions() async {
+        requestedSignature = Self.signature(exceptions: exceptions)
         defaults?.set(exceptions, forKey: Self.exceptionsKey)
         await loadRuleList().value
     }
@@ -152,19 +157,19 @@ final class ContentBlocker {
     private func loadLatestRuleList() async {
         guard let store else { return }
         let exceptions = exceptions
-        let signature = Self.signature(exceptions: exceptions)
+        let signature = requestedSignature
         if installedSignature == signature { lastError = nil; return }
         if defaults?.string(forKey: Self.signatureKey) == signature,
            let list = try? await store.contentRuleList(forIdentifier: Self.identifier) {
-            guard signature == Self.signature(exceptions: self.exceptions) else { return }
+            guard signature == requestedSignature else { return }
             install(list, signature: signature)
             return
         }
         let encoded = await Self.encodedRules(exceptions: exceptions)
-        guard signature == Self.signature(exceptions: self.exceptions) else { return }
+        guard signature == requestedSignature else { return }
         do {
             let compiled = try await ruleListCompiler(Self.identifier, encoded)
-            guard signature == Self.signature(exceptions: self.exceptions) else {
+            guard signature == requestedSignature else {
                 // Compilation replaced the disk cache, but it is not the currently requested list.
                 defaults?.removeObject(forKey: Self.signatureKey)
                 return
@@ -176,7 +181,7 @@ final class ContentBlocker {
             defaults?.set(signature, forKey: Self.signatureKey)
             install(list, signature: signature)
         } catch {
-            if signature == Self.signature(exceptions: self.exceptions) {
+            if signature == requestedSignature {
                 lastError = "Tracker protection couldn’t be updated. " + error.localizedDescription
             }
         }
@@ -195,14 +200,18 @@ final class ContentBlocker {
     }
 
     private func apply(to controller: WKUserContentController) {
-        // The controller also holds extension-provided rules. Only replace our own list.
-        if let previous = installedLists.object(forKey: controller) {
+        // The controller also holds extension-provided rules. Only replace our own list,
+        // and leave an already-installed current list untouched on repeated attachment.
+        let desired = isEnabled ? ruleList : nil
+        let previous = installedLists.object(forKey: controller)
+        guard previous !== desired else { return }
+        if let previous {
             controller.remove(previous)
             installedLists.removeObject(forKey: controller)
         }
-        if isEnabled, let ruleList {
-            controller.add(ruleList)
-            installedLists.setObject(ruleList, forKey: controller)
+        if let desired {
+            controller.add(desired)
+            installedLists.setObject(desired, forKey: controller)
         }
     }
 }

@@ -531,6 +531,7 @@ struct TabHoverCard: View {
     let isActive: Bool
 
     static let width: CGFloat = 280
+    static let previewHeight: CGFloat = 156
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -540,7 +541,7 @@ struct TabHoverCard: View {
                 thumbnail
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .frame(width: Self.width, height: 156, alignment: .top)
+                    .frame(width: Self.width, height: Self.previewHeight, alignment: .top)
                     .clipped()
                 Divider()
             }

@@ -23,6 +23,7 @@ final class PeekTests: XCTestCase {
         let page = try browser.folders.savePage(url: home, title: "Pinned Home", in: nil)
         tab.folderPageID = page.id
         tab.isNewTab = false
+        tab.restore()
         tab.webView?.loadHTMLString("<title>Pinned Test</title><a id='external' href='https://external.invalid/article' \(blank ? "target='_blank'" : "")>External</a>", baseURL: home)
         try await waitForTitle("Pinned Test", in: tab)
         return tab

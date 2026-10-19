@@ -91,7 +91,7 @@ struct WindowChromeConfigurator: NSViewRepresentable {
         view.toolbarContextMenu = toolbarContextMenu
         view.savedToolbarConfiguration = savedToolbarConfiguration
         view.insetRevealedToolbar = insetRevealedToolbar
-        view.setNativeCommands(nativeCommands, displayMode: toolbarDisplayMode)
+        view.setNativeCommands(nativeCommands, displayMode: toolbarDisplayMode, applyImmediately: false)
         hoverController?.nativeToolbarPresenter = view
         view.update(layout: tabLayout, tabs: horizontalTabs, compactToolbar: compactToolbar,
                     toolbarIsRevealed: hoverController?.toolbarIsRevealed ?? toolbarIsRevealed)
@@ -124,6 +124,7 @@ final class WindowChromeView: NSView {
     private var chromeWasVisible = true
     private var originalToolbarOrigin = NSPoint.zero
     private var alignmentIsScheduled = false
+    private var toolbarSeparators: [ObjectIdentifier: ToolbarSeparatorView] = [:]
     private var compactToolbar = false
     private var toolbarIsRevealed = true
     private weak var observedToolbar: NSToolbar?
@@ -135,6 +136,8 @@ final class WindowChromeView: NSView {
     private var controlObservers: [NSObjectProtocol] = []
     private var observedControlViews: [ObjectIdentifier] = []
     private var nativeCommands: [String: NativeToolbarCommand] = [:]
+    private var nativeCommandsRevision: UInt64 = 0
+    private var appliedNativeCommandsRevision: UInt64?
     private var toolbarDisplayMode: NSToolbar.DisplayMode?
     private var nativeAdapters: [ObjectIdentifier: NativeToolbarCommandAdapter] = [:]
     var toolbarContextMenu: (@MainActor () -> NSMenu)?
@@ -143,6 +146,7 @@ final class WindowChromeView: NSView {
     isolated deinit {
         if let contextMenuMonitor { NSEvent.removeMonitor(contextMenuMonitor) }
         nativeAdapters.values.forEach { $0.restore() }
+        toolbarSeparators.values.forEach { $0.removeFromSuperview() }
         observers.forEach(NotificationCenter.default.removeObserver)
         controlObservers.forEach(NotificationCenter.default.removeObserver)
         toolbarItemObservers.forEach(NotificationCenter.default.removeObserver)
@@ -150,13 +154,18 @@ final class WindowChromeView: NSView {
 
     func refresh() { updateWindowState() }
 
-    func setNativeCommands(_ commands: [NativeToolbarCommand], displayMode: NSToolbar.DisplayMode? = nil) {
+    func setNativeCommands(_ commands: [NativeToolbarCommand], displayMode: NSToolbar.DisplayMode? = nil,
+                           applyImmediately: Bool = true) {
         toolbarDisplayMode = displayMode
         nativeCommands = Dictionary(commands.map { ($0.identifier, $0) }, uniquingKeysWith: { _, new in new })
-        applyNativeCommands()
+        nativeCommandsRevision &+= 1
+        // The representable configures the window next; apply there after any native
+        // toolbar changes. Direct callers still receive an immediate command update.
+        if applyImmediately { applyNativeCommands() }
     }
 
     func detachNativeCommands() {
+        clearToolbarSeparators()
         nativeCommands.removeAll()
         restoreNativeCommands()
         toolbarContextMenu = nil
@@ -179,6 +188,7 @@ final class WindowChromeView: NSView {
 
     private func applyNativeCommands() {
         let items = window?.toolbar?.items ?? []
+        let commandsChanged = appliedNativeCommandsRevision != nativeCommandsRevision
         let current = Set(items.filter { nativeCommands[$0.itemIdentifier.rawValue] != nil }.map(ObjectIdentifier.init))
         for key in Array(nativeAdapters.keys) where !current.contains(key) {
             nativeAdapters.removeValue(forKey: key)?.restore()
@@ -187,10 +197,18 @@ final class WindowChromeView: NSView {
             guard let command = nativeCommands[item.itemIdentifier.rawValue] else { continue }
             let key = ObjectIdentifier(item)
             let mode = toolbarDisplayMode ?? window?.toolbar?.displayMode ?? .iconOnly
-            if let adapter = nativeAdapters[key] { adapter.update(command, displayMode: mode) }
+            if let adapter = nativeAdapters[key] {
+                // AppKit update/resize notifications may follow the synchronous
+                // configuration pass. Repair a replacement SwiftUI host, but avoid
+                // reapplying every command when its native button is already current.
+                if commandsChanged || item.view !== adapter.button || adapter.button.displayMode != mode {
+                    adapter.update(command, displayMode: mode)
+                }
+            }
             else { nativeAdapters[key] = NativeToolbarCommandAdapter(item: item, command: command, displayMode: mode) }
             nativeAdapters[key]?.button.visibilityToolbar = window?.toolbar
         }
+        appliedNativeCommandsRevision = nativeCommandsRevision
     }
 
     /// The native pointer callback can reveal existing toolbar views immediately,
@@ -227,6 +245,7 @@ final class WindowChromeView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        clearToolbarSeparators()
         if let contextMenuMonitor { NSEvent.removeMonitor(contextMenuMonitor) }
         contextMenuMonitor = nil
         restoreNativeCommands()
@@ -383,12 +402,12 @@ final class WindowChromeView: NSView {
 
     /// Center native glass and hit regions together, including the page's top inset in the header.
     private func centerTitlebarControls() {
-        guard let window else { restoreToolbarOrigin(); return }
+        guard let window else { clearToolbarSeparators(); restoreToolbarOrigin(); return }
         observeWindowControls(in: window)
-        guard !window.styleMask.contains(.fullScreen) else { restoreToolbarOrigin(); return }
-        guard window.toolbar?.isVisible == true else { return }
+        guard !window.styleMask.contains(.fullScreen) else { clearToolbarSeparators(); restoreToolbarOrigin(); return }
+        guard window.toolbar?.isVisible == true else { clearToolbarSeparators(); return }
         positionWindowControls(in: window)
-        guard let branch = toolbarBranch(in: window) else { return }
+        guard let branch = toolbarBranch(in: window) else { clearToolbarSeparators(); return }
         if shiftedToolbar !== branch {
             restoreToolbarOrigin()
             shiftedToolbar = branch
@@ -403,7 +422,49 @@ final class WindowChromeView: NSView {
 
         // Moving the toolbar branch can also move its sibling controls on native relayout.
         positionWindowControls(in: window)
+        layoutToolbarSeparators(in: window, branch: branch)
         reportToolbarRegionHeight(in: window, branch: branch)
+    }
+
+    private func clearToolbarSeparators() {
+        toolbarSeparators.values.forEach { $0.removeFromSuperview() }
+        toolbarSeparators.removeAll()
+    }
+
+    /// System fixed spaces end glass groups but expose no custom view. Draw stock
+    /// separators between their neighboring controls without replacing AppKit's space views.
+    private func layoutToolbarSeparators(in window: NSWindow, branch: NSView) {
+        let items = window.toolbar?.visibleItems ?? []
+        var current = Set<ObjectIdentifier>()
+        for (index, item) in items.enumerated() where item.itemIdentifier == .space {
+            guard let left = items[..<index].lastIndex(where: { $0.view?.window === window }),
+                  let right = items[(index + 1)...].firstIndex(where: { $0.view?.window === window }),
+                  let leftView = items[left].view, let rightView = items[right].view else { continue }
+            let leading = leftView.convert(leftView.bounds, to: branch)
+            let trailing = rightView.convert(rightView.bounds, to: branch)
+            let spaceIndices = ((left + 1)..<right).filter {
+                items[$0].itemIdentifier == .space || items[$0].itemIdentifier == .flexibleSpace
+            }
+            guard let ordinal = spaceIndices.firstIndex(of: index), trailing.minX > leading.maxX else { continue }
+            let span = trailing.minX - leading.maxX
+            let flexibleCount = spaceIndices.filter { items[$0].itemIdentifier == .flexibleSpace }.count
+            let fixedWidth = flexibleCount == 0 ? span / CGFloat(spaceIndices.count) : min(20, span / CGFloat(spaceIndices.count))
+            let flexibleWidth = flexibleCount == 0 ? 0 : max(0, span - fixedWidth * CGFloat(spaceIndices.count - flexibleCount)) / CGFloat(flexibleCount)
+            let precedingWidth = spaceIndices.prefix(ordinal).reduce(CGFloat.zero) {
+                $0 + (items[$1].itemIdentifier == .flexibleSpace ? flexibleWidth : fixedWidth)
+            }
+            let key = ObjectIdentifier(item)
+            current.insert(key)
+            let separator = toolbarSeparators[key] ?? ToolbarSeparatorView()
+            toolbarSeparators[key] = separator
+            if separator.superview !== branch { branch.addSubview(separator) }
+            let frame = NSRect(x: leading.maxX + precedingWidth + fixedWidth / 2 - 0.5,
+                               y: (leading.midY + trailing.midY) / 2 - 10, width: 1, height: 20)
+            if separator.frame != frame { separator.frame = frame }
+        }
+        for key in Array(toolbarSeparators.keys) where !current.contains(key) {
+            toolbarSeparators.removeValue(forKey: key)?.removeFromSuperview()
+        }
     }
 
     private func reportToolbarRegionHeight(in window: NSWindow, branch: NSView) {
@@ -486,11 +547,10 @@ final class WindowChromeView: NSView {
                 customizationToolbar = toolbar
             }
             if delegate !== customizationAdapter,
-               delegate.toolbarAllowedItemIdentifiers?(toolbar).contains(where: { $0.rawValue.hasPrefix("divider") }) == true {
+               delegate.toolbarAllowedItemIdentifiers?(toolbar).contains(.init("address")) == true {
                 customizationAdapter = ToolbarCustomizationAdapter(source: delegate)
                 toolbar.delegate = customizationAdapter
             }
-            customizationAdapter?.replaceNonrepeatableDividers(in: toolbar)
         }
         guard observedToolbar !== window.toolbar else { return }
         toolbarObservations.removeAll()
@@ -634,7 +694,6 @@ final class WindowChromeView: NSView {
         "sidebar": "Sidebar", "layout": "Tab Layout", "pinSidebar": "Pin Sidebar",
         "back": "Back", "forward": "Forward", "reload": "Reload", "address": "Address and Search", "folders": "Folders",
         "downloads": "Downloads", "pins": "Essential Tabs", "settings": "Settings", "newTab": "New Tab",
-        "divider0": "Divider", "divider1": "Divider", "divider2": "Divider", "divider3": "Divider"
     ]
 
     private static func applyPendingAddressFocus(in view: NSView) {

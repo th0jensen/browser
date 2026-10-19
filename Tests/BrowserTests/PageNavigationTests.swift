@@ -7,6 +7,7 @@ final class PageNavigationTests: XCTestCase {
     func testNewAddressInvalidatesAnAwaitingDecisionOnTheSameWebView() throws {
         let browser = BrowserModel()
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let view = try XCTUnwrap(tab.webView)
         let pending = PageNavigationRequest(tab: tab, webView: view)
         XCTAssertTrue(pending.isCurrent)
@@ -24,6 +25,7 @@ final class PageNavigationTests: XCTestCase {
     func testClosedTabCannotResumeNavigationEvenWhenItsWebViewIsRetained() throws {
         let browser = BrowserModel()
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let view = try XCTUnwrap(tab.webView)
         let pending = PageNavigationRequest(tab: tab, webView: view)
 
@@ -36,6 +38,7 @@ final class PageNavigationTests: XCTestCase {
     func testClosedAndReopenedWindowRejectsItsOldNavigationDecision() throws {
         let browser = BrowserModel()
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let view = try XCTUnwrap(tab.webView)
         let pending = PageNavigationRequest(tab: tab, webView: view)
 

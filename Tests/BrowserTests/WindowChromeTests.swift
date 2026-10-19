@@ -89,11 +89,42 @@ final class WindowChromeTests: XCTestCase {
         let allowedItems = try XCTUnwrap(delegate.toolbarAllowedItemIdentifiers?(toolbar))
         XCTAssertTrue(allowedItems.contains(.space), "Native palette: \(allowedItems)")
         XCTAssertTrue(allowedItems.contains(.flexibleSpace))
-        XCTAssertTrue(allowedItems.contains { $0.rawValue.contains("divider") })
-        XCTAssertFalse(defaultItems.contains(.space))
+        XCTAssertFalse(allowedItems.contains { $0.rawValue.hasPrefix("divider") })
+        XCTAssertEqual(defaultItems.filter { $0 == .space }.count, 2, "Default fixed spaces must separate glass groups")
         XCTAssertFalse(defaultItems.contains(.flexibleSpace), "The default must let the address field use spare width")
         XCTAssertFalse(defaultItems.contains { $0.rawValue.contains("divider") })
         let order = toolbar.items.map { $0.itemIdentifier.rawValue }
+        let leadingGroupEnd = try XCTUnwrap(defaultItems.firstIndex(of: .init("layout")))
+        let downloadsIndex = try XCTUnwrap(defaultItems.firstIndex(of: .init("downloads")))
+        XCTAssertEqual(defaultItems[leadingGroupEnd + 1], .space)
+        XCTAssertEqual(defaultItems[downloadsIndex + 1], .space)
+        func separators(in view: NSView) -> [NSBox] {
+            if view.identifier?.rawValue == "BrowserToolbarSeparator", let line = view as? NSBox { return [line] }
+            return view.subviews.flatMap { separators(in: $0) }
+        }
+        let lines = separators(in: try XCTUnwrap(window.contentView?.superview))
+        XCTAssertEqual(lines.count, 2)
+        for line in lines {
+            XCTAssertEqual(line.boxType, .separator)
+            XCTAssertTrue(line.window === window)
+            XCTAssertFalse(line.isHiddenOrHasHiddenAncestor)
+            XCTAssertGreaterThan(line.visibleRect.width, 0)
+            XCTAssertGreaterThan(line.frame.height, line.frame.width)
+        }
+        func glassGroup(for identifier: String) -> NSGlassEffectView? {
+            var view = toolbar.items.first { $0.itemIdentifier.rawValue == identifier }?.view
+            while let current = view {
+                if let glass = current as? NSGlassEffectView { return glass }
+                view = current.superview
+            }
+            return nil
+        }
+        let leadingGlass = try XCTUnwrap(glassGroup(for: "layout"))
+        let navigationGlass = try XCTUnwrap(glassGroup(for: "back"))
+        let downloadsGlass = try XCTUnwrap(glassGroup(for: "downloads"))
+        let settingsGlass = try XCTUnwrap(glassGroup(for: "settings"))
+        XCTAssertFalse(leadingGlass === navigationGlass)
+        XCTAssertFalse(downloadsGlass === settingsGlass)
         for navigation in ["back", "forward", "reload"] {
             XCTAssertLessThan(try XCTUnwrap(order.firstIndex { $0.contains(navigation) }),
                               try XCTUnwrap(order.firstIndex { $0.contains("address") }))
@@ -203,8 +234,7 @@ final class WindowChromeTests: XCTestCase {
         let customizedToolbar = try XCTUnwrap(window.toolbar)
         let source = try XCTUnwrap(customizedToolbar.delegate)
         let originalDefaults = try XCTUnwrap(source.toolbarDefaultItemIdentifiers?(customizedToolbar))
-        let divider = try XCTUnwrap(source.toolbarAllowedItemIdentifiers?(customizedToolbar).first { $0.rawValue.contains("divider") })
-        customizedToolbar.insertItem(withItemIdentifier: divider, at: customizedToolbar.items.count)
+        customizedToolbar.insertItem(withItemIdentifier: .space, at: customizedToolbar.items.count)
         XCTAssertEqual(source.toolbarDefaultItemIdentifiers?(customizedToolbar), originalDefaults,
                        "Customization must not redefine the app's default set")
         customizedToolbar.itemIdentifiers = originalDefaults

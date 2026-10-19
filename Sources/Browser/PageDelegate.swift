@@ -20,9 +20,19 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             guard let tab else { return .cancel }
             let request = PageNavigationRequest(tab: tab, webView: webView)
             // The restored window can lay out immediately while its first navigation waits for protection.
-            async let protection: Void = ContentBlocker.shared.prepare()
-            if tab.browser?.isPrivate != true { await BrowserExtensions.shared.prepare() }
-            await protection
+            let protection = ContentBlocker.shared
+            let extensions = tab.browser?.isPrivate == true ? nil : BrowserExtensions.shared
+            let needsProtection = !protection.isPreparedForNavigation
+            let needsExtensions = extensions?.isPreparedForNavigation == false
+            if needsProtection && needsExtensions {
+                async let rules: Void = protection.prepare()
+                await extensions?.prepare()
+                await rules
+            } else if needsProtection {
+                await protection.prepare()
+            } else if needsExtensions {
+                await extensions?.prepare()
+            }
             guard request.isCurrent else { return .cancel }
             if tab.browser?.isPrivate != true { BrowserExtensions.shared.updateRules(in: webView) }
         }

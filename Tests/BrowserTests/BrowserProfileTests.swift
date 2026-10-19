@@ -1,6 +1,7 @@
 import XCTest
 @testable import Browser
 
+#if DEBUG
 @MainActor
 final class BrowserProfileTests: XCTestCase {
     func testDebugUsesItsOwnApplicationIdentityAndNonpersistentWebsiteData() {
@@ -29,3 +30,4 @@ final class BrowserProfileTests: XCTestCase {
         XCTAssertNotEqual(rejected.path, "/tmp/release-container/profile")
     }
 }
+#endif

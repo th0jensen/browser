@@ -25,8 +25,8 @@ struct BrowserWindow: View {
     @State private var addressBlurRequest = 0
     @State private var hoverCardTabID: UUID?
     @State private var isFullScreen = false
-    @AppStorage("toolbarLayout.vertical") private var verticalToolbarLayout = ToolbarLayoutPersistence.legacyData(for: .vertical)
-    @AppStorage("toolbarLayout.horizontal") private var horizontalToolbarLayout = ToolbarLayoutPersistence.legacyData(for: .horizontal)
+    @AppStorage("toolbarLayout.vertical") private var verticalToolbarLayout = Data()
+    @AppStorage("toolbarLayout.horizontal") private var horizontalToolbarLayout = Data()
     @State private var toolbarItemIdentifiers: [String] = []
     @State private var restoreAddressFocusAfterFullscreen = false
     @State private var chromeHover: ChromeHoverController
@@ -587,6 +587,7 @@ struct BrowserWindow: View {
                 .defaultCustomization(.hidden)
                 .sharedBackgroundVisibility(.automatic)
         }
+        ToolbarSpacer(.fixed, placement: .automatic)
         Group {
             ToolbarItem(id: "back", placement: .automatic) { navigationButton(.back) }
             ToolbarItem(id: "forward", placement: .automatic) { navigationButton(.forward) }
@@ -603,6 +604,7 @@ struct BrowserWindow: View {
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(id: "downloads", placement: .automatic) { toolbarComponent(.downloads) }
             .sharedBackgroundVisibility(.automatic)
+        ToolbarSpacer(.fixed, placement: .automatic)
         ForEach(browser.isPrivate ? [] : BrowserExtensions.shared.toolbarExtensions) { item in
             ToolbarItem(id: "extension.\(item.id.uuidString)", placement: .automatic) { ExtensionButton(item: item, browser: browser) }
                 .defaultCustomization(.hidden)
@@ -620,14 +622,6 @@ struct BrowserWindow: View {
             ToolbarItem(id: "newTab", placement: .automatic) { toolbarComponent(.newTab) }
                 .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
                 .sharedBackgroundVisibility(.automatic)
-        }
-        Group {
-            ToolbarItem(id: "divider0", placement: .automatic) {
-                Rectangle().fill(.separator).frame(width: 1, height: 20)
-                    .accessibilityLabel("Divider")
-            }
-            .defaultCustomization(.hidden)
-            .sharedBackgroundVisibility(.hidden)
         }
     }
 

@@ -7,7 +7,7 @@ import WebKit
 @Observable
 final class BrowserTab: NSObject, Identifiable {
     let id = UUID()
-    /// The page's web view, or `nil` while the tab is suspended to free its memory.
+    /// The page’s web view, allocated on first navigation and released while a page is suspended.
     private(set) var webView: WKWebView?
     /// Hosts the web view, and the Web Inspector when it's docked, so both move together between windows and tabs.
     let contentView = NSView()
@@ -85,6 +85,13 @@ final class BrowserTab: NSObject, Identifiable {
         install(WKWebView(frame: .zero, configuration: configuration))
     }
 
+    /// The native New Tab page needs no WebKit process until an address is opened.
+    init(newTabIn browser: BrowserModel) {
+        self.browser = browser
+        super.init()
+        pageDelegate.tab = self
+    }
+
     /// A suspended tab for a page's saved history, such as a duplicated or reopened tab, which loads when it's selected.
     init(url: URL?, title: String, interactionState: Any?, browser: BrowserModel? = nil,
          restoresVisit: Bool = false) {
@@ -103,7 +110,7 @@ final class BrowserTab: NSObject, Identifiable {
     func didAttachToBrowser() { updateFavicon() }
 
     var isSuspended: Bool {
-        webView == nil
+        !isNewTab && webView == nil
     }
 
     /// The tab's history and scroll position, whether or not it's suspended.
@@ -189,7 +196,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// Recreates a suspended tab's web view with its history and scroll position, or loads its address.
     /// A pop-up gets a fresh configuration too, since its tie to the opener can't be restored.
     func restore() {
-        guard isSuspended else { return }
+        guard webView == nil else { return }
         invalidateNavigation()
         let context = browser?.isPrivate == true ? nil : url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
         extensionOrigin = context?.baseURL
@@ -522,8 +529,12 @@ final class BrowserTab: NSObject, Identifiable {
         }
         let capturedURL = webView.url
         let configuration = WKSnapshotConfiguration()
-        configuration.rect = webView.bounds
-        configuration.snapshotWidth = 520
+        // Capture only the region rendered by the hover card, at its point size.
+        // WebKit supplies the backing-scale pixels for Retina without an oversized bitmap.
+        var region = webView.bounds
+        region.size.height = min(region.height, region.width * TabHoverCard.previewHeight / TabHoverCard.width)
+        configuration.rect = region
+        configuration.snapshotWidth = NSNumber(value: Double(TabHoverCard.width))
         configuration.afterScreenUpdates = afterScreenUpdates
         webView.takeSnapshot(with: configuration) { [weak self, weak webView] image, _ in
             guard let self else { return }

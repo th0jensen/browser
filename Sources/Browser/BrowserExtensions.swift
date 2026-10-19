@@ -27,6 +27,11 @@ final class BrowserExtensions: NSObject {
     typealias ExtensionReader = @MainActor (URL) async throws -> WKWebExtension
     typealias RuleListCompiler = @MainActor (String, String) async throws -> WKContentRuleList?
 
+    private final class AppliedRules {
+        var revision: UInt64 = 0
+        var lists: [UUID: WKContentRuleList] = [:]
+    }
+
     private struct PendingLoad {
         let revision: UInt64
         let task: Task<Void, Error>
@@ -46,6 +51,8 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private var toolbarIcons: [UUID: NSImage] = [:]
     @ObservationIgnored private var contexts: [UUID: WKWebExtensionContext] = [:]
     @ObservationIgnored private var ruleLists: [UUID: WKContentRuleList] = [:]
+    @ObservationIgnored private var ruleListRevision: UInt64 = 0
+    @ObservationIgnored private let appliedRules = NSMapTable<WKUserContentController, AppliedRules>.weakToStrongObjects()
     @ObservationIgnored private var pendingLoads: [UUID: PendingLoad] = [:]
     @ObservationIgnored private var loadRevisions: [UUID: UInt64] = [:]
     @ObservationIgnored private let extensionReader: ExtensionReader?
@@ -55,6 +62,8 @@ final class BrowserExtensions: NSObject {
     @ObservationIgnored private let directory: URL
     @ObservationIgnored private var restoration: Task<Void, Never>?
     @ObservationIgnored private var preparation: Task<Void, Never>?
+    @ObservationIgnored private var didPrepare = false
+    var isPreparedForNavigation: Bool { didPrepare }
     @ObservationIgnored private let applicationDirectories: [URL]
     @ObservationIgnored private var popupPresentation: ChromePopoverPresentation?
     @ObservationIgnored private weak var popupBrowser: BrowserModel?
@@ -91,6 +100,8 @@ final class BrowserExtensions: NSObject {
                 }
             }
         } catch { lastError = error.localizedDescription }
+        // No startup runtime work is necessary when there are no enabled extensions.
+        didPrepare = !installed.contains(where: \.isEnabled)
     }
 
     func restore() async {
@@ -102,8 +113,12 @@ final class BrowserExtensions: NSObject {
 
     /// Restore known enabled extensions before navigating; application discovery can finish afterward.
     func prepare() async {
+        guard !didPrepare else { return }
         if let preparation { await preparation.value; return }
-        let task = Task { await restoreEnabled() }
+        let task = Task {
+            await restoreEnabled()
+            didPrepare = true
+        }
         preparation = task
         await task.value
     }
@@ -241,7 +256,7 @@ final class BrowserExtensions: NSObject {
 
     func configure(_ configuration: WKWebViewConfiguration) {
         if configuration.webExtensionController == nil { configuration.webExtensionController = controller }
-        for list in ruleLists.values { configuration.userContentController.add(list) }
+        applyRules(to: configuration.userContentController)
     }
 
     func register(_ browser: BrowserModel) {
@@ -291,7 +306,37 @@ final class BrowserExtensions: NSObject {
     }
 
     func updateRules(in webView: WKWebView) {
-        for list in ruleLists.values { webView.configuration.userContentController.add(list) }
+        applyRules(to: webView.configuration.userContentController)
+    }
+
+    private func applyRules(to controller: WKUserContentController) {
+        let applied: AppliedRules
+        if let existing = appliedRules.object(forKey: controller) {
+            guard existing.revision != ruleListRevision else { return }
+            applied = existing
+        } else {
+            applied = AppliedRules()
+            appliedRules.setObject(applied, forKey: controller)
+        }
+        // Keep other providers' lists intact and reconcile only changed extension lists.
+        for (id, previous) in applied.lists where ruleLists[id] !== previous {
+            controller.remove(previous)
+        }
+        for (id, current) in ruleLists where applied.lists[id] !== current {
+            controller.add(current)
+        }
+        applied.lists = ruleLists
+        applied.revision = ruleListRevision
+    }
+
+    private func updateAllRules() {
+        // Configurations may be prepared before their window registers, and popups can share controllers.
+        for controller in appliedRules.keyEnumerator().allObjects.compactMap({ $0 as? WKUserContentController }) {
+            applyRules(to: controller)
+        }
+        for browser in windows.allObjects {
+            for tab in browser.tabs { if let webView = tab.webView { updateRules(in: webView) } }
+        }
     }
 
     private func persist() throws {
@@ -500,11 +545,10 @@ final class BrowserExtensions: NSObject {
             try validateLoad(item.id, revision: revision)
             guard let list else { throw ExtensionFailure("WebKit did not compile the content-blocker rules.") }
             ruleLists[item.id] = list
+            ruleListRevision &+= 1
             activeRuleCounts[item.id] = count
             actionRevision += 1
-            for browser in windows.allObjects {
-                for tab in browser.tabs { if let webView = tab.webView { webView.configuration.userContentController.add(list) } }
-            }
+            updateAllRules()
         }
     }
 
@@ -517,10 +561,9 @@ final class BrowserExtensions: NSObject {
         }
         actionRevision += 1
         activeRuleCounts[item.id] = nil
-        if let list = ruleLists.removeValue(forKey: item.id) {
-            for browser in windows.allObjects {
-                for tab in browser.tabs { tab.webView?.configuration.userContentController.remove(list) }
-            }
+        if ruleLists.removeValue(forKey: item.id) != nil {
+            ruleListRevision &+= 1
+            updateAllRules()
         }
     }
 

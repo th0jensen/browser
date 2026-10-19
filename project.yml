@@ -1,4 +1,8 @@
 name: Browser
+configs:
+  Debug: debug
+  Release: release
+  Benchmark: release
 options:
   bundleIdPrefix: dev.athas
   deploymentTarget:
@@ -62,6 +66,13 @@ targetTemplates:
           PRODUCT_NAME: Browser-Debug
           PRODUCT_MODULE_NAME: Browser
           INFOPLIST_KEY_CFBundleDisplayName: Browser Debug
+          BROWSER_APP_ICON: Browser_Debug.icns
+          EXCLUDED_SOURCE_FILE_NAMES: Browser_Release.icns
+        Benchmark:
+          PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser.benchmark
+          PRODUCT_NAME: Browser-Benchmark
+          PRODUCT_MODULE_NAME: Browser
+          INFOPLIST_KEY_CFBundleDisplayName: Browser Benchmark
           BROWSER_APP_ICON: Browser_Debug.icns
           EXCLUDED_SOURCE_FILE_NAMES: Browser_Release.icns
         Release:
@@ -151,6 +162,8 @@ targets:
       configs:
         Debug:
           TEST_HOST: $(BUILT_PRODUCTS_DIR)/Browser-Debug.app/Contents/MacOS/Browser-Debug
+        Benchmark:
+          TEST_HOST: $(BUILT_PRODUCTS_DIR)/Browser-Benchmark.app/Contents/MacOS/Browser-Benchmark
   BrowserExtensionFixture:
     type: app-extension
     platform: macOS

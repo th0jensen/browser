@@ -96,6 +96,7 @@ private final class NativeFindFixture {
         let tab = try XCTUnwrap(browser.activeTab)
         self.tab = tab
         tab.isNewTab = false
+        tab.restore()
         browser.consumedAddressFocusRequest = browser.addressFocusRequest
         let webView = try XCTUnwrap(tab.webView)
         self.webView = webView

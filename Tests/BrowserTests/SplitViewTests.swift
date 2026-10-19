@@ -6,6 +6,7 @@ final class SplitViewTests: XCTestCase {
     private func fixture(_ count: Int = 5) -> BrowserModel {
         let model = BrowserModel()
         for _ in 1..<count { model.addTab(focusAddress: false) }
+        model.tabs.forEach { $0.restore() }
         return model
     }
 

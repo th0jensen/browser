@@ -118,8 +118,10 @@ final class BrowserExtensionTests: XCTestCase {
         let fixture = try makeSafariApp()
         let store = BrowserExtensions(directory: storage, persistent: false, applicationDirectories: [fixture.applications])
 
+        XCTAssertFalse(store.isPreparedForNavigation)
         await store.prepare()
 
+        XCTAssertTrue(store.isPreparedForNavigation)
         XCTAssertTrue(store.context(for: item)?.isLoaded == true)
         XCTAssertEqual(store.installed.count, 1, "Navigation must not wait for scanning other applications")
         await store.restore()
@@ -178,10 +180,12 @@ final class BrowserExtensionTests: XCTestCase {
         })
         let preparation = Task { await store.prepare() }
         try await gate.waitUntil { gate.requests == 1 }
+        XCTAssertFalse(store.isPreparedForNavigation, "Pending startup restoration must not take the ready path")
         await store.setEnabled(item, false)
         gate.resumeAll()
         await preparation.value
 
+        XCTAssertTrue(store.isPreparedForNavigation)
         XCTAssertFalse(try XCTUnwrap(store.installed.first).isEnabled)
         XCTAssertNil(store.context(for: item))
         XCTAssertNil(store.errors[item.id], "A superseded load must not publish a stale error")
@@ -270,19 +274,33 @@ final class BrowserExtensionTests: XCTestCase {
         let item = try XCTUnwrap(store.installed.first)
         let browser = BrowserModel()
         store.register(browser)
+        browser.activeTab?.restore()
         let existing = try XCTUnwrap(browser.activeTab?.webView)
         await store.setEnabled(item, true)
         XCTAssertNil(store.errors[item.id])
 
         let configuration = WKWebViewConfiguration()
+        let controller = ExtensionRuleRecordingController()
+        configuration.userContentController = controller
         store.configure(configuration)
         XCTAssertTrue(configuration.webExtensionController === store.controller)
         let fresh = WKWebView(frame: .zero, configuration: configuration)
+        store.configure(configuration)
+        store.updateRules(in: fresh)
+        store.updateRules(in: fresh)
+        XCTAssertEqual(controller.additions, [item.id.uuidString], "Repeated navigation must not reinstall unchanged rules")
+        XCTAssertTrue(controller.removals.isEmpty)
         try await assertDisplay("none", in: existing)
         try await assertDisplay("none", in: fresh)
 
         await store.setEnabled(item, false)
+        XCTAssertEqual(controller.removals, [item.id.uuidString])
         try await assertDisplay("block", in: existing)
+        try await assertDisplay("block", in: fresh)
+        await store.setEnabled(item, true)
+        XCTAssertEqual(controller.additions, [item.id.uuidString, item.id.uuidString])
+        try await assertDisplay("none", in: fresh)
+        await store.setEnabled(item, false)
         store.unregister(browser)
     }
 
@@ -334,6 +352,7 @@ final class BrowserExtensionTests: XCTestCase {
 
         // Also covers registering an already-created page after rule restoration.
         let browser = BrowserModel()
+        browser.activeTab?.restore()
         restored.register(browser)
         defer { restored.unregister(browser) }
         try await assertDisplay("none", in: XCTUnwrap(browser.activeTab?.webView))
@@ -402,6 +421,7 @@ final class BrowserExtensionTests: XCTestCase {
         browser.addTab()
         let verifier = try XCTUnwrap(browser.activeTab)
         verifier.isNewTab = false
+        verifier.restore()
         let webView = try XCTUnwrap(verifier.webView)
         webView.loadHTMLString("<html><body>Verification fixture</body></html>", baseURL: URL(string: "https://example.com/")!)
         var reply: String?
@@ -466,6 +486,22 @@ final class BrowserExtensionTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
         }
         XCTFail("Expected advertisement display to be \(expected)")
+    }
+}
+
+@MainActor
+private final class ExtensionRuleRecordingController: WKUserContentController {
+    private(set) var additions: [String] = []
+    private(set) var removals: [String] = []
+
+    override func add(_ contentRuleList: WKContentRuleList) {
+        additions.append(contentRuleList.identifier)
+        super.add(contentRuleList)
+    }
+
+    override func remove(_ contentRuleList: WKContentRuleList) {
+        removals.append(contentRuleList.identifier)
+        super.remove(contentRuleList)
     }
 }
 
