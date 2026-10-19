@@ -5,7 +5,7 @@ import SwiftUI
 enum PreviewNoteActions {
     @discardableResult
     static func openPage(_ url: URL, from tab: BrowserTab?,
-                         activateApplication: () -> Void = { NSApp.activate() },
+                         activateApplication: @escaping () -> Void = { NSApp.activate() },
                          openElsewhere: (URL) -> Void = { ExternalURLRouter.shared.open([$0]) }) -> Task<Void, Never>? {
         guard let tab, let browser = tab.browser, !browser.isClosed,
               browser.tab(withID: tab.id) === tab, let window = browser.window else {
@@ -20,31 +20,47 @@ enum PreviewNoteActions {
             browser.activeTabID = tab.id
         }
         tab.load(url)
-        if window.isMiniaturized { window.deminiaturize(nil) }
-        window.makeKeyAndOrderFront(nil)
-        activateApplication()
-        let target = browser.focusedPage
-        if target?.webView?.window === window {
-            target?.focusPage()
-            return nil
-        } else {
-            // A structurally different tab may join its native host on the next
-            // SwiftUI update. Never override a subsequent user focus request.
-            let focusResponder = window.firstResponder
-            let addressRequest = browser.addressFocusRequest
-            let findRequest = browser.findFocusRequest
-            let findVisible = target?.isFindBarVisible ?? false
-            return Task { @MainActor [weak browser, weak target, weak window, weak focusResponder] in
-                for _ in 0..<20 {
-                    guard !Task.isCancelled, let browser, let target, let window, !browser.isClosed,
-                          browser.focusedPage === target, browser.window === window,
-                          window.isKeyWindow, window.firstResponder === focusResponder,
-                          browser.addressFocusRequest == addressRequest,
-                          browser.findFocusRequest == findRequest,
-                          target.isFindBarVisible == findVisible else { return }
-                    if target.webView?.window === window { target.focusPage(); return }
-                    try? await Task.sleep(for: .milliseconds(25))
-                }
+        guard let webView = tab.webView else { return nil }
+        // Clear the background window's old responder so swapping its page host
+        // cannot look like a later user focus change. This does not activate it.
+        _ = window.makeFirstResponder(nil)
+        let focusResponder = window.firstResponder
+        let addressRequest = browser.addressFocusRequest
+        let findRequest = browser.findFocusRequest
+        let findVisible = tab.isFindBarVisible
+        return Task { @MainActor [weak browser, weak tab, weak webView, weak window, weak focusResponder] in
+            @MainActor func requestIsCurrent() -> Bool {
+                guard !Task.isCancelled, let browser, let tab, let webView, let window else { return false }
+                return !browser.isClosed && browser.tab(withID: tab.id) === tab
+                    && browser.focusedPage === tab && tab.webView === webView && browser.window === window
+                    && window.firstResponder === focusResponder
+                    && browser.addressFocusRequest == addressRequest && browser.findFocusRequest == findRequest
+                    && tab.isFindBarVisible == findVisible
+            }
+            // Keep the note usable and the browser in the background until the
+            // destination finishes, including a terminal load error.
+            let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+            while webView?.isLoading == true {
+                guard requestIsCurrent(), ContinuousClock.now < deadline else { return }
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            guard requestIsCurrent(), let browser, let tab, let webView, let window else { return }
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+            activateApplication()
+            if webView.window === window { tab.focusPage(); return }
+            // SwiftUI may attach a structurally different tab after activation.
+            // Stop if the user makes a later selection or focus request.
+            let activatedResponder = window.firstResponder
+            for _ in 0..<20 {
+                guard !Task.isCancelled, !browser.isClosed, browser.focusedPage === tab,
+                      browser.window === window, window.isKeyWindow,
+                      window.firstResponder === activatedResponder,
+                      browser.addressFocusRequest == addressRequest,
+                      browser.findFocusRequest == findRequest,
+                      tab.isFindBarVisible == findVisible else { return }
+                if webView.window === window { tab.focusPage(); return }
+                try? await Task.sleep(for: .milliseconds(25))
             }
         }
     }

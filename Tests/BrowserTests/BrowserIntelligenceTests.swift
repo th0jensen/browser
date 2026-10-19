@@ -363,7 +363,7 @@ extension BrowserIntelligenceTests {
         XCTAssertNil(pasteboard.string(forType: .string)?.range(of: "destination overview"))
     }
 
-    func testOpenPreviewSelectsSourceRestoresWindowAndActivatesApplication() throws {
+    func testOpenPreviewSelectsSourceRestoresWindowAndActivatesApplication() async throws {
         let browser = BrowserModel()
         let source = try XCTUnwrap(browser.activeTab)
         source.restore()
@@ -377,8 +377,13 @@ extension BrowserIntelligenceTests {
         let destination = URL(string: "data:text/html,<title>PreviewDestination</title>")!
         var activations = 0
         var fallbacks: [URL] = []
-        PreviewNoteActions.openPage(destination, from: source, activateApplication: { activations += 1 },
-                                    openElsewhere: { fallbacks.append($0) })
+        let pending = PreviewNoteActions.openPage(destination, from: source, activateApplication: {
+            XCTAssertFalse(source.isLoading)
+            activations += 1
+        }, openElsewhere: { fallbacks.append($0) })
+        XCTAssertEqual(activations, 0)
+        XCTAssertEqual(window.frontRequests, 0)
+        await pending?.value
         XCTAssertEqual(source.url, destination)
         XCTAssertEqual(browser.activeTabID, source.id)
         XCTAssertEqual(window.restoreRequests, 1)
@@ -388,7 +393,7 @@ extension BrowserIntelligenceTests {
         XCTAssertTrue(fallbacks.isEmpty)
     }
 
-    func testOpenPreviewPreservesLiveSourcePeek() throws {
+    func testOpenPreviewPreservesLiveSourcePeek() async throws {
         let browser = BrowserModel()
         let opener = try XCTUnwrap(browser.activeTab)
         let source = browser.openPeek(from: opener)
@@ -400,8 +405,12 @@ extension BrowserIntelligenceTests {
         defer { browser.dismissPeek(); window.close() }
         let destination = URL(string: "data:text/html,<title>PeekDestination</title>")!
         var activations = 0
-        PreviewNoteActions.openPage(destination, from: source, activateApplication: { activations += 1 },
-                                    openElsewhere: { _ in XCTFail("A live peek remains a valid destination") })
+        let pending = PreviewNoteActions.openPage(destination, from: source, activateApplication: {
+            XCTAssertFalse(source.isLoading)
+            activations += 1
+        }, openElsewhere: { _ in XCTFail("A live peek remains a valid destination") })
+        XCTAssertEqual(activations, 0)
+        await pending?.value
         XCTAssertTrue(browser.peek?.tab === source)
         XCTAssertEqual(browser.activeTabID, opener.id)
         XCTAssertEqual(source.url, destination)
@@ -423,6 +432,37 @@ extension BrowserIntelligenceTests {
         XCTAssertNotEqual(browser.activeTabID, source.id)
     }
 
+    func testOpenPreviewWaitsForDestinationLoadBeforeActivatingBrowser() async throws {
+        let handler = PreviewDelayedSchemeHandler()
+        let configuration = BrowserTab.makeConfiguration(includingExtensions: false)
+        configuration.setURLSchemeHandler(handler, forURLScheme: "preview-load")
+        let browser = BrowserModel(configuration: configuration, isPrivate: true)
+        let source = try XCTUnwrap(browser.activeTab)
+        let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = source.contentView
+        browser.window = window
+        defer { source.stopLoading(); window.close() }
+        var activations = 0
+        let pending = PreviewNoteActions.openPage(URL(string: "preview-load://fixture/destination")!, from: source,
+            activateApplication: {
+                XCTAssertFalse(source.isLoading)
+                activations += 1
+            }, openElsewhere: { _ in XCTFail("The source is live") })
+        try await waitUntil { handler.pending != nil }
+        XCTAssertTrue(source.isLoading)
+        XCTAssertEqual(activations, 0)
+        XCTAssertEqual(window.frontRequests, 0)
+        XCTAssertEqual(window.restoreRequests, 0)
+        handler.finish()
+        await pending?.value
+        XCTAssertFalse(source.isLoading)
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        XCTAssertEqual(window.restoreRequests, 1)
+    }
+
     func testDeferredPreviewFocusRespectsLaterResponderAddressAndFindRequests() async throws {
         for change in ["none", "responder", "address", "find"] {
             let browser = BrowserModel()
@@ -438,6 +478,7 @@ extension BrowserIntelligenceTests {
             let pending = PreviewNoteActions.openPage(URL(string: "data:text/html,<p>Focus</p>")!, from: source,
                 activateApplication: {}, openElsewhere: { _ in XCTFail("The source is live") })
             XCTAssertNotNil(pending)
+            let waitingResponder = window.firstResponder
             switch change {
             case "responder": _ = window.makeFirstResponder(newResponder)
             case "address": browser.requestAddressFocus()
@@ -446,7 +487,7 @@ extension BrowserIntelligenceTests {
             }
             window.contentView = source.contentView
             await pending?.value
-            let expected: NSResponder? = change == "none" ? source.webView : (change == "responder" ? newResponder : originalResponder)
+            let expected: NSResponder? = change == "none" ? source.webView : (change == "responder" ? newResponder : waitingResponder)
             XCTAssertTrue(window.requestedResponder === expected, change)
         }
     }
@@ -572,6 +613,20 @@ extension BrowserIntelligenceTests {
     override func deminiaturize(_ sender: Any?) { minimized = false; restoreRequests += 1 }
     override func makeKeyAndOrderFront(_ sender: Any?) { frontRequests += 1 }
     override func makeFirstResponder(_ responder: NSResponder?) -> Bool { requestedResponder = responder; return true }
+}
+
+@MainActor private final class PreviewDelayedSchemeHandler: NSObject, @MainActor WKURLSchemeHandler {
+    private(set) var pending: (any WKURLSchemeTask)?
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) { pending = urlSchemeTask }
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) { pending = nil }
+    func finish() {
+        guard let pending, let url = pending.request.url else { return }
+        self.pending = nil
+        let data = Data("<title>Loaded destination</title><p>Ready</p>".utf8)
+        pending.didReceive(URLResponse(url: url, mimeType: "text/html", expectedContentLength: data.count, textEncodingName: "utf-8"))
+        pending.didReceive(data)
+        pending.didFinish()
+    }
 }
 
 extension BrowserIntelligenceTests {
