@@ -27,6 +27,10 @@ When optimized benchmarking is explicitly requested, `just benchmark` uses the R
 
 # Link previews
 
-`LinkPreviewController` tracks intentional link hovers in an isolated WebKit content world and presents a nonactivating child panel. Keep keyboard focus on the source page; dismiss and cancel work on navigation, window changes, deactivation, or leaving the link/card. The card measures its content and scrolls within the source pane’s available space.
+`LinkPreviewController` tracks intentional link hovers in an isolated WebKit content world. Transient cards use a native `NSGlassEffectView` overlay in the source window so the glass can sample webpage content. Keep keyboard focus on the source page; dismiss and cancel transient cards on navigation, window changes, deactivation, or leaving the link/card. Dragging a transient card’s image, text, or padding reparents the same content into an independently owned floating note. Notes survive those events until closed and last for the current app session.
+
+Only kept notes show the title bar and controls. A hover bridge and grace period allow pointer travel between the source link and preview. The clear Liquid Glass card measures its content and scrolls within the available space. Drag tracking uses local AppKit events in screen coordinates; the initiating event can belong to the source window after the card detaches.
 
 `LinkPreviewFetcher` uses an ephemeral, cookie-free session for bounded document and publisher-image requests. `LocalIntelligence` streams structured summaries through the shared model queue. `BrowserIntelligenceTests` injects a summary provider to check native presentation and cancellation without requiring an available on-device model; run these with `just test`.
+
+`LinkPreviewCard` owns presentation and native drag handles. `PreviewNoteEntity` exports the summary, key points, and source URL through App Intents/Transferable. Both menu entry points present from the same annotated `PreviewContentView`, which implements AppKit's read-only text requestor for contextual system actions. Suspend hover dismissal during menu tracking. Keep Copy, Share, and Siri context consistent; do not add a private Siri launcher.

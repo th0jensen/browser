@@ -1,4 +1,5 @@
 import AppKit
+import AppIntents
 import Darwin
 import ImageIO
 import Observation
@@ -188,91 +189,270 @@ private final class PreviewRedirectPolicy: NSObject, URLSessionTaskDelegate, Sen
 
 @MainActor @Observable
 final class LinkPreviewState {
+    let id = UUID()
     let url: URL
     var result: LinkSummary?
     var image: NSImage?
     var isLoading = true
+    var isKept = false
     var cardWidth: CGFloat = 300
-    var contentHeight: CGFloat = 110
+    var contentHeight: CGFloat = 150
     var maximumHeight: CGFloat = 420
     var error: String?
     init(url: URL) { self.url = url }
-}
 
-private struct LinkPreviewCard: View {
-    let state: LinkPreviewState
-    let open: () -> Void
-    let hover: (Bool) -> Void
-    let resize: (CGFloat) -> Void
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        ScrollView {
-            Button(action: open) {
-                VStack(alignment: .leading, spacing: 0) {
-                    if let image = state.image {
-                        Image(nsImage: image).resizable().scaledToFill()
-                            .frame(width: state.cardWidth, height: 100).clipped().accessibilityHidden(true)
-                    }
-                    VStack(alignment: .leading, spacing: 10) {
-                        if let result = state.result {
-                            Text(result.summary).font(.system(size: 12, weight: .semibold))
-                                .fixedSize(horizontal: false, vertical: true)
-                            ForEach(Array(result.keyPoints.prefix(3).enumerated()), id: \.offset) { _, point in
-                                HStack(alignment: .top, spacing: 9) {
-                                    Circle().fill(.secondary.opacity(0.55)).frame(width: 4, height: 4).padding(.top, 6)
-                                    Text(point).font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
-                                }
-                            }
-                        }
-                        if let error = state.error {
-                            Text(error).font(.system(size: 12)).foregroundStyle(.secondary)
-                        } else if state.isLoading && state.result == nil {
-                            VStack(alignment: .leading, spacing: 9) {
-                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.12)).frame(height: 11)
-                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: min(235, state.cardWidth - 28), height: 11)
-                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: min(170, state.cardWidth - 28), height: 11)
-                            }.padding(.vertical, 6).modifier(IntelligenceShimmer(active: !reduceMotion))
-                                .accessibilityLabel("Loading link preview")
-                        }
-                        HStack(spacing: 5) {
-                            if state.isLoading { ProgressView().controlSize(.mini).scaleEffect(0.7).frame(width: 10, height: 10) }
-                            Text(state.url.host()?.replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression) ?? "Open page")
-                                .lineLimit(1).truncationMode(.middle)
-                            Spacer()
-                            Image(systemName: "arrow.up.right").font(.system(size: 9, weight: .medium))
-                        }.font(.system(size: 10)).foregroundStyle(.secondary)
-                    }.padding(14)
-                }
-                .foregroundStyle(.primary)
-                .frame(width: state.cardWidth, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
-                state.contentHeight = $0
-                resize($0)
-            }
-        }
-        .scrollBounceBehavior(.basedOnSize)
-        .frame(width: state.cardWidth, height: min(state.contentHeight, state.maximumHeight))
-        .background(Color(nsColor: .windowBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.08)))
-        .help("Open \(state.url.absoluteString)")
-        .onHover(perform: hover)
+    var contextText: String {
+        var parts = [result?.title, result?.summary].compactMap { $0 }.filter { !$0.isEmpty }
+        if let points = result?.keyPoints, !points.isEmpty { parts.append(points.map { "• " + $0 }.joined(separator: "\n")) }
+        parts.append(url.absoluteString)
+        return parts.joined(separator: "\n\n")
     }
 }
 
-/// A hover card never takes keyboard focus from the source page.
-private final class LinkPreviewPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+/// Only detached notes need a window; hover glass lives above the webpage in the
+/// source window so the native effect can sample the page without taking focus.
+final class LinkPreviewPanel: NSPanel {
+    var kept = false
+    var closePreview: (() -> Void)?
+    var showPreviewMenu: ((NSEvent) -> Void)?
+    override var canBecomeKey: Bool { kept }
     override var canBecomeMain: Bool { false }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .rightMouseDown, let showPreviewMenu { showPreviewMenu(event); return }
+        super.sendEvent(event)
+    }
+    override func performClose(_ sender: Any?) { closePreview?() }
+    override func cancelOperation(_ sender: Any?) { closePreview?() }
 }
 
-/// Event-driven, isolated-world link tracking: no polling or model work until an
-/// enabled, intentional hover. One hover panel and a small memory-only cache per app.
+/// Each card owns its work and native events. Detaching never transfers a running
+/// task to another card, so navigation and subsequent hovers cannot erase a note.
+@MainActor
+final class LinkPreviewPresentation {
+    let state: LinkPreviewState
+    private(set) var panel: LinkPreviewPanel?
+    private(set) var glass: NSGlassEffectView?
+    private(set) var content: PreviewContentView?
+    private(set) var frame = NSRect.zero // Screen coordinates, for either presentation.
+    private(set) var isClosed = false
+    weak var sourceView: WKWebView?
+    private weak var sourceWindow: NSWindow?
+    private let anchor: NSRect
+    private let openPage: () -> Void
+    private let didKeep: (LinkPreviewPresentation) -> Void
+    private let didClose: (LinkPreviewPresentation) -> Void
+    private var eventMonitor: Any?
+    private var observers: [NSObjectProtocol] = []
+    private var dismissTask: Task<Void, Never>?
+    private var pointerInside = false
+    private var interactionDepth = 0
+    private var isDragging = false
+    lazy var actions = PreviewNoteMenuPresenter(preview: self)
+    var task: Task<Void, Never>?
+    var imageTask: Task<Void, Never>?
+
+    init(url: URL, sourceView: WKWebView, anchor: NSRect, open: @escaping () -> Void,
+         didKeep: @escaping (LinkPreviewPresentation) -> Void, didClose: @escaping (LinkPreviewPresentation) -> Void) {
+        state = LinkPreviewState(url: url)
+        self.sourceView = sourceView
+        sourceWindow = sourceView.window
+        self.anchor = anchor
+        openPage = open
+        self.didKeep = didKeep
+        self.didClose = didClose
+    }
+
+    func show() {
+        guard let window = sourceWindow, let root = window.contentView else { close(); return }
+        LinkPreviewContextStore.shared.register(state)
+        let content = PreviewContentView(preview: self)
+        self.content = content
+        let glass = NSGlassEffectView()
+        glass.style = .clear
+        glass.cornerRadius = 16
+        glass.contentView = content
+        self.glass = glass
+        // A separate NSPanel cannot reliably refract pixels from WKWebView in
+        // another window. Keep the transient effect in the page's view hierarchy.
+        root.addSubview(glass, positioned: .above, relativeTo: nil)
+        resize(height: state.contentHeight)
+        guard !isClosed else { return }
+        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
+                               (NSWindow.willMoveNotification, window as AnyObject),
+                               (NSWindow.didResizeNotification, window as AnyObject),
+                               (NSWindow.willCloseNotification, window as AnyObject),
+                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dismissIfTransient() }
+            })
+        }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel, .mouseMoved]) { [weak self] event in
+            guard let self, !self.isClosed else { return event }
+            if event.type == .keyDown,
+               event.window === self.panel || (!self.state.isKept && event.window === self.sourceWindow),
+               event.keyCode == 53 || (self.state.isKept && event.window === self.panel && event.charactersIgnoringModifiers == "w" && event.modifierFlags.contains(.command)) {
+                self.close(); return nil
+            }
+            let screenPoint = event.window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+            let inCard = event.window === self.glass?.window && self.frame.contains(screenPoint)
+            if event.type == .rightMouseDown, inCard {
+                self.actions.present(with: event)
+                return nil
+            }
+            guard !self.state.isKept, self.interactionDepth == 0 else { return event }
+            if event.type == .mouseMoved {
+                if self.containsHoverPoint(NSEvent.mouseLocation) {
+                    self.cancelDismiss()
+                } else { self.scheduleDismiss() }
+            } else if !inCard { self.close() }
+            return event
+        }
+    }
+
+    func open() {
+        if !state.isKept { close() }
+        openPage()
+    }
+
+    func hover(_ inside: Bool) {
+        pointerInside = inside
+        if inside { cancelDismiss() } else { scheduleDismiss() }
+    }
+
+    func cancelDismiss() { dismissTask?.cancel(); dismissTask = nil }
+
+    func scheduleDismiss() {
+        guard !state.isKept, interactionDepth == 0, dismissTask == nil else { return }
+        dismissTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled, let self else { return }
+            self.dismissTask = nil
+            guard !self.pointerInside, !self.containsHoverPoint(NSEvent.mouseLocation) else { return }
+            self.dismissIfTransient()
+        }
+    }
+
+    /// A small buffer around the link/card and a bridge across the gap let the
+    /// pointer travel naturally without keeping unrelated page areas alive.
+    func containsHoverPoint(_ point: NSPoint) -> Bool {
+        guard !isClosed else { return false }
+        if anchor.insetBy(dx: -24, dy: -14).contains(point) || frame.insetBy(dx: -12, dy: -12).contains(point) { return true }
+        let left = max(anchor.minX, frame.minX) - 12
+        let right = min(anchor.maxX, frame.maxX) + 12
+        guard right > left else { return false }
+        let bottom = min(anchor.maxY, frame.maxY)
+        let top = max(anchor.minY, frame.minY)
+        return NSRect(x: left, y: bottom - 12, width: right - left, height: max(0, top - bottom) + 24).contains(point)
+    }
+
+    func beginInteraction() { interactionDepth += 1; cancelDismiss() }
+    func endInteraction() {
+        interactionDepth = max(0, interactionDepth - 1)
+        if !state.isKept && sourceWindow?.isKeyWindow != true { dismissIfTransient() }
+        else { scheduleDismiss() }
+    }
+    private func dismissIfTransient() { if !state.isKept && interactionDepth == 0 { close() } }
+
+    /// Called only after a real drag crosses the movement threshold, or explicitly
+    /// through Keep as Note. A simple press does not convert a hover into a note.
+    func keep() {
+        guard !isClosed, !state.isKept, let glass else { return }
+        let appearance = glass.effectiveAppearance
+        glass.removeFromSuperview()
+        let panel = LinkPreviewPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        self.panel = panel
+        panel.appearance = appearance
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isReleasedWhenClosed = false
+        panel.contentView = glass
+        panel.closePreview = { [weak self] in self?.close() }
+        panel.showPreviewMenu = { [weak self] event in self?.actions.present(with: event) }
+        state.isKept = true
+        panel.kept = true
+        panel.title = state.result?.title ?? state.url.host() ?? "Preview Note"
+        cancelDismiss()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        panel.hidesOnDeactivate = false
+        panel.level = .floating
+        panel.orderFront(nil)
+        didKeep(self)
+        if !isDragging { resize(height: state.contentHeight) }
+    }
+
+    func beginDrag() { isDragging = true; keep() }
+
+    func moveDuringDrag(to origin: NSPoint) {
+        guard isDragging, let panel else { return }
+        panel.setFrameOrigin(origin)
+        frame = panel.frame
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        task?.cancel(); task = nil
+        imageTask?.cancel(); imageTask = nil
+        cancelDismiss()
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+        LinkPreviewContextStore.shared.remember(state)
+        glass?.removeFromSuperview()
+        glass = nil
+        content = nil
+        if let previous = panel {
+            panel = nil
+            previous.parent?.removeChildWindow(previous)
+            previous.orderOut(nil)
+        }
+        didClose(self)
+    }
+
+    func resize(height: CGFloat) {
+        guard !isClosed, !isDragging, let glass else { return }
+        if state.isKept, let panel {
+            let visible = (panel.screen?.visibleFrame ?? sourceWindow?.screen?.visibleFrame ?? panel.frame).insetBy(dx: 8, dy: 8)
+            state.maximumHeight = min(520, visible.height)
+            let height = min(max(height, 106), state.maximumHeight)
+            let x = min(max(panel.frame.minX, visible.minX), visible.maxX - state.cardWidth)
+            let y = min(max(panel.frame.maxY - height, visible.minY), visible.maxY - height)
+            panel.setFrame(NSRect(x: x, y: y, width: state.cardWidth, height: height), display: true)
+            frame = panel.frame
+            return
+        }
+        guard let sourceView, let window = sourceWindow else { close(); return }
+        let visible = window.convertToScreen(sourceView.convert(sourceView.bounds, to: nil))
+            .intersection(window.screen?.visibleFrame ?? window.frame).insetBy(dx: 8, dy: 8)
+        guard visible.width >= 120, visible.height >= 106 else { close(); return }
+        let width = min(300, visible.width)
+        let below = max(0, anchor.minY - visible.minY - 24)
+        let above = max(0, visible.maxY - anchor.maxY - 24)
+        let placeBelow = height <= below || below >= above
+        let maximumHeight = max(106, placeBelow ? below : above)
+        state.cardWidth = width
+        state.maximumHeight = maximumHeight
+        let height = min(max(height, 106), maximumHeight)
+        let x = min(max(anchor.minX, visible.minX), visible.maxX - width)
+        let preferredY = placeBelow ? anchor.minY - height - 24 : anchor.maxY + 24
+        let y = min(max(preferredY, visible.minY), visible.maxY - height)
+        frame = NSRect(x: x, y: y, width: width, height: height)
+        if let root = glass.superview {
+            glass.frame = root.convert(window.convertFromScreen(frame), from: nil)
+        }
+    }
+
+    func endDrag() {
+        isDragging = false
+        if let panel { frame = panel.frame }
+        resize(height: state.contentHeight)
+    }
+}
+
+/// Event-driven isolated-world tracking. Kept notes own independent lifetimes;
+/// only the current transient preview follows source-page hover/navigation events.
 @MainActor
 final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     static let shared = LinkPreviewController()
@@ -282,28 +462,20 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     private let views = NSHashTable<WKWebView>.weakObjects()
     private let tabs = NSMapTable<WKWebView, BrowserTab>.weakToWeakObjects()
     private var enabled = UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey)
-    private(set) var presentedPreview: LinkPreviewState?
     private let summaryProvider: (@Sendable (URL) async throws -> LinkSummary)?
     private var settingsObserver: NSObjectProtocol?
-    private var task: Task<Void, Never>?
-    private var dismissTask: Task<Void, Never>?
-    private var panel: NSPanel?
-    private var anchorInScreen = NSRect.zero
-    private var eventMonitor: Any?
-    private var presentationObservers: [NSObjectProtocol] = []
-    private var imageTask: Task<Void, Never>?
-    private weak var sourceView: WKWebView?
-    private var currentURL: URL?
-    private var pointerInsideCard = false
-    private var generation = UUID()
+    private(set) var current: LinkPreviewPresentation?
+    private var notes: [UUID: LinkPreviewPresentation] = [:]
     private var cache: [URL: (Date, LinkSummary, NSImage?)] = [:]
+    var presentedPreview: LinkPreviewState? { current?.state }
+    var keptNotes: [LinkPreviewState] { notes.values.map(\.state) }
 
     init(observesSettings: Bool = true, summaryProvider: (@Sendable (URL) async throws -> LinkSummary)? = nil) {
         self.summaryProvider = summaryProvider
         super.init()
         guard observesSettings else { return }
         settingsObserver = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.refreshSetting() }
+            Task { @MainActor in self?.setEnabled(UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey)) }
         }
     }
 
@@ -318,14 +490,10 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: Self.world))
     }
 
-    private func refreshSetting() {
-        setEnabled(UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey))
-    }
-
     func setEnabled(_ next: Bool) {
         guard next != enabled else { return }
         enabled = next
-        if !next { dismiss() }
+        if !next { current?.close(); Array(notes.values).forEach { $0.close() } }
         for controller in controllers.allObjects {
             let others = controller.userScripts.filter { !$0.source.hasPrefix(Self.script) }
             controller.removeAllUserScripts()
@@ -338,41 +506,15 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         }
     }
 
-    func dismiss(for view: WKWebView) { if sourceView === view { dismiss() } }
-    private func dismiss() {
-        generation = UUID()
-        task?.cancel(); task = nil
-        imageTask?.cancel(); imageTask = nil
-        dismissTask?.cancel(); dismissTask = nil
-        currentURL = nil
-        presentedPreview = nil
-        sourceView = nil
-        pointerInsideCard = false
-        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
-        presentationObservers.forEach { NotificationCenter.default.removeObserver($0) }
-        presentationObservers.removeAll()
-        if let previous = panel {
-            panel = nil
-            previous.parent?.removeChildWindow(previous)
-            previous.orderOut(nil)
-        }
-    }
-    private func scheduleDismiss() {
-        guard dismissTask == nil else { return }
-        dismissTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(250))
-            guard !Task.isCancelled, let self else { return }
-            self.dismissTask = nil
-            guard !self.pointerInsideCard, self.panel?.frame.contains(NSEvent.mouseLocation) != true else { return }
-            self.dismiss()
-        }
-    }
+    func dismiss(for view: WKWebView) { if current?.sourceView === view { current?.close() } }
+    func keepPreview() { current?.keep() }
+    func closeNote(id: UUID) { notes[id]?.close() }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard enabled, message.frameInfo.isMainFrame, let view = message.webView,
               let body = message.body as? [String: Any] else { return }
         if body["leave"] as? Bool == true {
-            if sourceView === view { scheduleDismiss() }
+            if current?.sourceView === view { current?.scheduleDismiss() }
             return
         }
         guard view.window?.isKeyWindow == true, !view.isHiddenOrHasHiddenAncestor,
@@ -381,117 +523,71 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
               let x = body["x"] as? Double, let y = body["y"] as? Double,
               let width = body["width"] as? Double, let height = body["height"] as? Double,
               [x, y, width, height].allSatisfy(\.isFinite), width > 0, height > 0 else { return }
-        dismissTask?.cancel(); dismissTask = nil
-        if currentURL == url && sourceView === view { return }
-        dismiss()
-        currentURL = url; sourceView = view
-        let state = LinkPreviewState(url: url)
-        presentedPreview = state
-        guard let window = view.window else { dismiss(); return }
+        if current?.state.url == url && current?.sourceView === view { current?.cancelDismiss(); return }
+        current?.close()
+        guard let window = view.window else { return }
         let localY = view.isFlipped ? y : view.bounds.height - y - height
         let anchor = NSRect(x: x, y: localY, width: width, height: height).intersection(view.bounds)
-        guard !anchor.isEmpty else { dismiss(); return }
-        anchorInScreen = window.convertToScreen(view.convert(anchor, to: nil))
-        let native = LinkPreviewPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        native.appearance = window.effectiveAppearance
-        native.isOpaque = false
-        native.backgroundColor = .clear
-        native.hasShadow = true
-        native.hidesOnDeactivate = true
-        native.isReleasedWhenClosed = false
+        guard !anchor.isEmpty else { return }
+        let screenAnchor = window.convertToScreen(view.convert(anchor, to: nil))
         let tab = tabs.object(forKey: view)
-        native.contentView = NSHostingView(rootView: LinkPreviewCard(state: state, open: { [weak self, weak tab] in
-            self?.dismiss()
-            tab?.load(url)
-        }, hover: { [weak self] inside in
-            self?.pointerInsideCard = inside
-            if inside { self?.dismissTask?.cancel(); self?.dismissTask = nil } else { self?.scheduleDismiss() }
-        }, resize: { [weak self] height in self?.resize(height: height) }))
-        panel = native
-        resize(height: 110)
-        window.addChildWindow(native, ordered: .above)
-        native.orderFront(nil)
-        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
-                               (NSWindow.willMoveNotification, window as AnyObject),
-                               (NSWindow.didResizeNotification, window as AnyObject),
-                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
-            presentationObservers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.dismiss() }
-            })
-        }
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel, .mouseMoved]) { [weak self, weak native, weak view] event in
-            guard let self else { return event }
-            if event.type == .keyDown && event.keyCode == 53 { self.dismiss(); return nil }
-            if event.type == .mouseMoved {
-                if event.window === native || self.anchorInScreen.insetBy(dx: -4, dy: -4).contains(NSEvent.mouseLocation) {
-                    self.dismissTask?.cancel(); self.dismissTask = nil
-                } else { self.scheduleDismiss() }
-            } else if event.window !== native { self.dismiss() }
-            if view?.window?.isKeyWindow != true { self.dismiss() }
-            return event
-        }
+        let preview = LinkPreviewPresentation(url: url, sourceView: view, anchor: screenAnchor, open: { [weak tab] in
+            if let tab, tab.browser?.isClosed != true { tab.load(url); tab.browser?.window?.makeKeyAndOrderFront(nil) }
+            else { ExternalURLRouter.shared.open([url]) }
+        }, didKeep: { [weak self] note in
+            self?.notes[note.state.id] = note
+            if self?.current === note { self?.current = nil }
+        }, didClose: { [weak self] preview in
+            if self?.current === preview { self?.current = nil }
+            self?.notes[preview.state.id] = nil
+        })
+        current = preview
+        preview.show()
         if let (date, result, image) = cache[url], Date().timeIntervalSince(date) < 300 {
-            state.result = result; state.image = image; state.isLoading = false
+            preview.state.result = result; preview.state.image = image; preview.state.isLoading = false
             return
         }
-        let token = generation
         let summarize = summaryProvider
-        task = Task { [weak self] in
+        preview.task = Task { [weak self, weak preview] in
+            guard let preview, !Task.isCancelled, !preview.isClosed else { return }
+            let state = preview.state
             do {
                 let result: LinkSummary
-                if let summarize {
-                    result = try await summarize(url)
-                } else {
+                if let summarize { result = try await summarize(url) }
+                else {
                     await LocalIntelligence.shared.prepare(.preview)
                     let document = try await LinkPreviewFetcher.shared.document(at: url)
-                    guard let self, !Task.isCancelled, self.generation == token else { return }
+                    guard !Task.isCancelled, !preview.isClosed else { return }
                     if let imageURL = document.imageURL {
-                        self.imageTask = Task { [weak self] in
+                        preview.imageTask = Task { [weak self, weak preview] in
                             guard let data = try? await LinkPreviewFetcher.shared.imageData(at: imageURL),
-                                  let self, !Task.isCancelled, self.generation == token else { return }
+                                  let preview, !Task.isCancelled, !preview.isClosed else { return }
                             state.image = NSImage(data: data)
-                            if let cached = self.cache[url] { self.cache[url] = (cached.0, cached.1, state.image) }
+                            if let cached = self?.cache[url] { self?.cache[url] = (cached.0, cached.1, state.image) }
                         }
                     }
-                    result = try await LocalIntelligence.shared.summarize(text: document.text, url: url) { [weak self] partial in
+                    result = try await LocalIntelligence.shared.summarize(text: document.text, url: url) { [weak preview] partial in
                         await MainActor.run {
-                            guard let self, self.generation == token else { return }
+                            guard let preview, !preview.isClosed else { return }
                             state.result = partial
                         }
                     }
                 }
-                guard let self, !Task.isCancelled, self.generation == token else { return }
-                if self.cache.count >= 16, let oldest = self.cache.min(by: { $0.value.0 < $1.value.0 })?.key { self.cache[oldest] = nil }
-                self.cache[url] = (Date(), result, state.image)
+                guard !Task.isCancelled, !preview.isClosed else { return }
+                if let self {
+                    if self.cache.count >= 16, let oldest = self.cache.min(by: { $0.value.0 < $1.value.0 })?.key { self.cache[oldest] = nil }
+                    self.cache[url] = (Date(), result, state.image)
+                }
                 state.result = result
                 state.isLoading = false
             } catch is CancellationError { }
             catch {
-                if !Task.isCancelled, self?.generation == token {
+                if !Task.isCancelled, !preview.isClosed {
                     state.error = "Preview unavailable. Open the page to read it."
                     state.isLoading = false
                 }
             }
         }
-    }
-
-    private func resize(height: CGFloat) {
-        guard let panel, let sourceView, let state = presentedPreview, let window = sourceView.window else { return }
-        let visible = window.convertToScreen(sourceView.convert(sourceView.bounds, to: nil))
-            .intersection(window.screen?.visibleFrame ?? window.frame).insetBy(dx: 8, dy: 8)
-        guard visible.width >= 120, visible.height >= 70 else { dismiss(); return }
-        let width = min(300, visible.width)
-        let below = max(0, anchorInScreen.minY - visible.minY - 6)
-        let above = max(0, visible.maxY - anchorInScreen.maxY - 6)
-        let placeBelow = height <= below || below >= above
-        let maximumHeight = max(70, placeBelow ? below : above)
-        state.cardWidth = width
-        state.maximumHeight = maximumHeight
-        let height = min(max(height, 70), maximumHeight)
-        let x = min(max(anchorInScreen.minX, visible.minX), visible.maxX - width)
-        let preferredY = placeBelow ? anchorInScreen.minY - height - 6 : anchorInScreen.maxY + 6
-        let y = min(max(preferredY, visible.minY), visible.maxY - height)
-        panel.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
     }
 
     private static let script = """

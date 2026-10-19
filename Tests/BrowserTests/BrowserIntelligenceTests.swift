@@ -1,5 +1,8 @@
 import XCTest
 import AppKit
+import AppIntents
+import CoreTransferable
+import UniformTypeIdentifiers
 import SwiftUI
 import WebKit
 @testable import Browser
@@ -210,6 +213,155 @@ extension BrowserIntelligenceTests {
 
 
 extension BrowserIntelligenceTests {
+    func testPreviewHoverBridgeAndTextDragHitTargets() throws {
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        let anchor = window.convertToScreen(NSRect(x: 100, y: 460, width: 250, height: 20))
+        let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/hover")!, sourceView: view,
+            anchor: anchor, open: {}, didKeep: { _ in }, didClose: { _ in })
+        defer { preview.close(); window.close() }
+        preview.show()
+        let glass = try XCTUnwrap(preview.glass)
+        let host = try XCTUnwrap(preview.content)
+        XCTAssertTrue(glass.window === window, "Hover glass samples the webpage in the same window")
+        XCTAssertNil(preview.panel)
+        XCTAssertTrue(glass.contentView === host)
+        XCTAssertEqual(glass.style, .clear)
+        XCTAssertNil(glass.tintColor)
+        XCTAssertEqual(anchor.minY - preview.frame.maxY, 24, accuracy: 0.5)
+        XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: anchor.minY - 8)))
+        XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: (anchor.minY + preview.frame.maxY) / 2)))
+        XCTAssertFalse(preview.containsHoverPoint(NSPoint(x: anchor.maxX + 150, y: anchor.minY - 100)))
+        let parent = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 400))
+        let drag = PreviewDragView(preview: preview)
+        drag.frame = NSRect(x: 10, y: 10, width: 300, height: 250)
+        drag.excludingFooter = true
+        parent.addSubview(drag)
+        XCTAssertTrue(drag.hitTest(NSPoint(x: 100, y: 150)) === drag, "Summary text remains a drag target")
+        XCTAssertTrue(drag.hitTest(NSPoint(x: 15, y: 15)) === drag, "Empty padding remains a drag target")
+        XCTAssertNil(drag.hitTest(NSPoint(x: 290, y: 25)), "Open Page remains clickable")
+        let frame = preview.frame
+        let sourceFrame = window.frame
+        preview.beginDrag()
+        let panel = try XCTUnwrap(preview.panel)
+        XCTAssertTrue(glass.window === panel)
+        XCTAssertTrue(glass.contentView === host, "Detaching keeps the same contextual content host")
+        preview.resize(height: 480)
+        XCTAssertEqual(panel.frame, frame, "Card does not jump while dragging")
+        preview.moveDuringDrag(to: NSPoint(x: frame.minX + 35, y: frame.minY - 20))
+        XCTAssertEqual(panel.frame.origin, NSPoint(x: frame.minX + 35, y: frame.minY - 20))
+        XCTAssertEqual(window.frame, sourceFrame, "Tearing off a card must never move the browser window")
+        preview.endDrag()
+        XCTAssertTrue(preview.state.isKept)
+
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        preview.state.result = LinkSummary(title: "Oaxaca", summary: "Visit the ancient city.", keyPoints: ["Monte Alban."])
+        XCTAssertTrue(host.validRequestor(forSendType: .string, returnType: nil) as? PreviewContentView === host)
+        XCTAssertTrue(host.writeSelection(to: pasteboard, types: [.string]))
+        XCTAssertEqual(pasteboard.string(forType: .string), preview.state.contextText)
+        XCTAssertFalse(host.writeSelection(to: pasteboard, types: [.tiff]))
+        preview.close()
+        XCTAssertNil(glass.superview)
+    }
+
+    func testTooSmallPreviewSourceDoesNotPresentAnAlreadyClosedPanel() throws {
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
+        var closes = 0
+        let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/tiny")!, sourceView: view,
+            anchor: window.convertToScreen(NSRect(x: 10, y: 10, width: 40, height: 20)), open: {}, didKeep: { _ in }, didClose: { _ in closes += 1 })
+        preview.show()
+        XCTAssertTrue(preview.isClosed)
+        XCTAssertNil(preview.panel)
+        XCTAssertEqual(closes, 1)
+        XCTAssertTrue(window.childWindows?.isEmpty ?? true)
+    }
+
+    func testDraggedPreviewBecomesIndependentNoteAndFinishesWhileAnotherPreviewLoads() async throws {
+        let controller = LinkPreviewController(observesSettings: false, summaryProvider: { url in
+            if url.path == "/first" { try await Task.sleep(for: .milliseconds(200)) }
+            return LinkSummary(title: url.lastPathComponent, summary: "A useful summary of \(url.lastPathComponent).", keyPoints: ["A specific fact."])
+        })
+        controller.setEnabled(true)
+        let tab = BrowserTab()
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        controller.install(in: view, tab: tab)
+        let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.contentView = view
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        defer { controller.setEnabled(false); window.close() }
+        view.loadHTMLString("<title>Notes fixture</title><p>Notes</p>", baseURL: URL(string: "https://example.com"))
+        try await waitUntil { !view.isLoading && view.title != nil }
+        func show(_ path: String) async {
+            let script = "window.webkit.messageHandlers.browserLinkPreview.postMessage({url:'https://example.com/\(path)',x:20,y:40,width:120,height:20});0"
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                view.evaluateJavaScript(script, in: nil, in: .world(name: "BrowserLinkPreviews")) { _ in continuation.resume() }
+            }
+        }
+        await show("first")
+        try await waitUntil { controller.presentedPreview != nil }
+        let state = try XCTUnwrap(controller.presentedPreview)
+        let presentation = try XCTUnwrap(controller.current)
+        XCTAssertNil(presentation.panel)
+        XCTAssertTrue(presentation.glass?.window === window)
+        controller.keepPreview() // The native drag handle calls this after its movement threshold.
+        let notePanel = try XCTUnwrap(presentation.panel)
+        XCTAssertTrue(state.isKept)
+        XCTAssertNil(controller.presentedPreview)
+        XCTAssertNil(notePanel.parent)
+        XCTAssertTrue(notePanel.canBecomeKey)
+        controller.dismiss(for: view)
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
+        XCTAssertEqual(controller.keptNotes.map(\.id), [state.id])
+        await show("second")
+        try await waitUntil { controller.presentedPreview?.result?.title == "second" && state.result?.title == "first" }
+        XCTAssertEqual(controller.keptNotes.first?.result?.title, "first")
+        controller.keepPreview()
+        XCTAssertEqual(controller.keptNotes.count, 2)
+        controller.closeNote(id: state.id)
+        XCTAssertEqual(controller.keptNotes.count, 1)
+        XCTAssertFalse(notePanel.isVisible)
+        controller.setEnabled(false)
+        XCTAssertTrue(controller.keptNotes.isEmpty)
+    }
+
+    func testNoteCopyAndSiriEntityUseTheSameTextAndSourceAfterClosing() async throws {
+        let first = LinkPreviewState(url: URL(string: "https://example.com/article?part=2")!)
+        first.result = LinkSummary(title: "Oaxaca", summary: "A destination overview.", keyPoints: ["Visit Monte Alban.", "Explore the Zocalo."])
+        let second = LinkPreviewState(url: URL(string: "https://example.com/another")!)
+        second.result = LinkSummary(title: "Another", summary: "A different note.")
+        let store = LinkPreviewContextStore.shared
+        store.register(first); store.register(second)
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        PreviewNoteActions.copyText(first, to: pasteboard)
+        let text = try XCTUnwrap(pasteboard.string(forType: .string))
+        for expected in ["Oaxaca", "A destination overview.", "• Visit Monte Alban.", "• Explore the Zocalo.", first.url.absoluteString] {
+            XCTAssertTrue(text.contains(expected), expected)
+        }
+        store.remember(first)
+        let resolved = try await PreviewNoteQuery().entities(for: [second.id, first.id])
+        XCTAssertEqual(resolved.map(\.id), [second.id, first.id])
+        XCTAssertEqual(resolved.last?.text, text)
+        XCTAssertEqual(resolved.last?.url, first.url)
+        let entity = try XCTUnwrap(resolved.last)
+        let exported = try await entity.exported(as: .utf8PlainText)
+        XCTAssertEqual(String(data: exported, encoding: .utf8), text)
+        PreviewNoteActions.copyLink(first, to: pasteboard)
+        XCTAssertEqual(pasteboard.string(forType: .URL), first.url.absoluteString)
+        XCTAssertNil(pasteboard.string(forType: .string)?.range(of: "destination overview"))
+    }
+
     func testPreviewDestinationAddressesExcludePrivateAndLocalNetworks() {
         for address in ["127.0.0.1", "10.20.0.1", "172.16.0.1", "172.31.255.255", "192.168.2.1", "169.254.1.2", "100.64.0.1", "0.0.0.0", "224.0.0.1", "::1", "fe80::1", "fc00::1", "::ffff:127.0.0.1", "2001:db8::1", "invalid"] {
             XCTAssertFalse(LinkPreviewFetcher.isPublicAddress(address), address)
@@ -255,14 +407,17 @@ extension BrowserIntelligenceTests {
         }
         try await waitUntil { controller.presentedPreview?.result != nil }
         try await waitUntil { (controller.presentedPreview?.contentHeight ?? 0) > 300 }
-        let panel = try XCTUnwrap(window.childWindows?.first)
+        let presentation = try XCTUnwrap(controller.current)
+        let glass = try XCTUnwrap(presentation.glass)
         let bounds = window.convertToScreen(view.convert(view.bounds, to: nil))
-        XCTAssertTrue(bounds.contains(panel.frame), "\(panel.frame) outside \(bounds)")
-        XCTAssertLessThan(panel.frame.width, 260)
-        XCTAssertLessThan(panel.frame.height, try XCTUnwrap(controller.presentedPreview).contentHeight)
+        XCTAssertTrue(glass.window === window)
+        XCTAssertTrue(bounds.contains(presentation.frame), "\(presentation.frame) outside \(bounds)")
+        XCTAssertLessThan(presentation.frame.width, 260)
+        XCTAssertLessThan(presentation.frame.height, try XCTUnwrap(controller.presentedPreview).contentHeight)
         XCTAssertEqual(controller.presentedPreview?.result?.keyPoints.count, 3)
         NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
         XCTAssertNil(controller.presentedPreview)
+        XCTAssertNil(glass.superview)
         XCTAssertTrue(window.childWindows?.isEmpty ?? true)
     }
 
