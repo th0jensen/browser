@@ -21,10 +21,15 @@
     else root.style.removeProperty(loadingBackground);
   }
   let timer;
+  let scheduledAt;
   let nextID = 0;
   const ids = new WeakMap();
   const roots = new Map();
-  const observer = new MutationObserver(schedule);
+  // Dynamic applications add whole subtrees for new content. Text edits and
+  // attribute churn do not require another document-wide computed-style pass.
+  const observer = new MutationObserver(records => {
+    if (records.some(record => [...record.addedNodes].some(node => node.nodeType === 1))) schedule();
+  });
   const colorPattern = /(?:rgba?|color|lab|lch|oklab|oklch|hsl|hsla)\([^)]*\)/g;
   function createSheet(root) {
     // Constructed sheets use CSSOM, so a site's style-src CSP cannot block the
@@ -35,20 +40,21 @@
     return sheet;
   }
   function observe() {
-    for (const root of roots.keys()) observer.observe(root, {subtree:true,childList:true,attributes:true,characterData:true});
+    for (const root of roots.keys()) observer.observe(root, {subtree:true,childList:true});
   }
-  function schedule() {
-    if (timer !== undefined) return;
-    // Hidden/occluded WebKit views can suspend animation frames entirely. The
-    // timer keeps background tabs correct; visible tabs recolor before paint.
-    const run = () => {
-      cancelAnimationFrame(frame);
+  function schedule(immediate = false) {
+    const now = Date.now();
+    if (scheduledAt === undefined) scheduledAt = now;
+    clearTimeout(timer);
+    // Wait for a short quiet period, but still update applications which stream
+    // new nodes continuously. Never perform a full page scan on every frame.
+    const delay = immediate === true ? 0 : Math.max(0,Math.min(120,scheduledAt+750-now));
+    timer = setTimeout(() => {
       clearTimeout(timer);
       timer = undefined;
+      scheduledAt = undefined;
       render();
-    };
-    const frame = requestAnimationFrame(run);
-    timer = setTimeout(run,100);
+    },delay);
   }
   function rule(element, declarations, pseudo = "") {
     if (!declarations.length) return "";
@@ -176,29 +182,20 @@
   api.storage.local.get("forcedDark").then(value => {
     preferences = C.settings(value.forcedDark);
     paintLoadingCanvas();
-    schedule();
-  }).catch(schedule);
+    schedule(true);
+  }).catch(() => schedule(true));
   api.storage.onChanged.addListener((changes,area) => {
     if (area !== "local" || !changes.forcedDark) return;
     preferences = C.settings(changes.forcedDark.newValue);
     paintLoadingCanvas();
-    schedule();
+    schedule(true);
   });
-  // Stylesheets, media queries, form states and viewport changes can alter
-  // computed colors without changing an element's style attribute.
-  document.addEventListener("load",schedule,true);
+  // Page and viewport milestones may alter inherited styles. Ordinary pointer,
+  // input and attribute activity must stay on the page's fast path.
+  window.addEventListener("load",schedule,{once:true});
   document.addEventListener("DOMContentLoaded",schedule,{once:true});
-  for (const event of ["change","input","pointerup","focusin","focusout","transitionend"]) document.addEventListener(event,schedule,true);
-  // Recompute hover colors when crossing an interactive control, rather than
-  // rescanning for every child span/icon crossed while moving the pointer.
-  const control = node => node instanceof Element ? node.closest("a,button,input,select,textarea,summary,[role=button],[tabindex]") : null;
-  document.addEventListener("pointerover",event => {
-    const next = control(event.target), previous = control(event.relatedTarget);
-    if (next !== previous && (next || previous)) schedule();
-  },true);
-  document.addEventListener("pointerout",event => { if (!event.relatedTarget && control(event.target)) schedule(); },true);
   window.addEventListener("resize",schedule);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change",schedule);
-  observer.observe(document,{subtree:true,childList:true,attributes:true});
-  schedule();
+  observer.observe(document,{subtree:true,childList:true});
+  schedule(true);
 })();
