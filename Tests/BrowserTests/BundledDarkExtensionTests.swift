@@ -41,6 +41,7 @@ final class BundledDarkExtensionTests: XCTestCase {
         browser.addTab()
         let page = try XCTUnwrap(browser.activeTab)
         page.isNewTab = false
+        page.restore()
         let webView = try XCTUnwrap(page.webView)
         webView.loadHTMLString("""
         <html><head><style>
