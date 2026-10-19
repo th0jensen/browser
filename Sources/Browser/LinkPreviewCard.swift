@@ -1,4 +1,3 @@
-import AppIntents
 import AppKit
 import SwiftUI
 
@@ -81,7 +80,6 @@ struct LinkPreviewCard: View {
         .frame(width: state.cardWidth, height: min(state.contentHeight, state.maximumHeight))
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .focusEffectDisabled()
-        .appEntityIdentifier(EntityIdentifier(for: PreviewNoteEntity.self, identifier: state.id))
         .onHover { preview.hover($0) }
     }
 }

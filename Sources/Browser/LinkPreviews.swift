@@ -1,5 +1,4 @@
 import AppKit
-import AppIntents
 import Darwin
 import ImageIO
 import Observation
@@ -232,7 +231,7 @@ final class LinkPreviewPresentation {
     let state: LinkPreviewState
     private(set) var panel: LinkPreviewPanel?
     private(set) var glass: NSGlassEffectView?
-    private(set) var content: PreviewContentView?
+    private(set) var content: NSHostingView<LinkPreviewCard>?
     private(set) var frame = NSRect.zero // Screen coordinates, for either presentation.
     private(set) var isClosed = false
     weak var sourceView: WKWebView?
@@ -264,8 +263,8 @@ final class LinkPreviewPresentation {
 
     func show() {
         guard let window = sourceWindow, let root = window.contentView else { close(); return }
-        LinkPreviewContextStore.shared.register(state)
-        let content = PreviewContentView(preview: self)
+        let content = NSHostingView(rootView: LinkPreviewCard(preview: self))
+        content.focusRingType = .none
         self.content = content
         let glass = NSGlassEffectView()
         glass.style = .clear
@@ -399,7 +398,6 @@ final class LinkPreviewPresentation {
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
-        LinkPreviewContextStore.shared.remember(state)
         glass?.removeFromSuperview()
         glass = nil
         content = nil

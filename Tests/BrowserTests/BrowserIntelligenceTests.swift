@@ -1,8 +1,5 @@
 import XCTest
 import AppKit
-import AppIntents
-import CoreTransferable
-import UniformTypeIdentifiers
 import SwiftUI
 import WebKit
 @testable import Browser
@@ -257,13 +254,10 @@ extension BrowserIntelligenceTests {
         preview.endDrag()
         XCTAssertTrue(preview.state.isKept)
 
-        let pasteboard = NSPasteboard.withUniqueName()
-        defer { pasteboard.releaseGlobally() }
-        preview.state.result = LinkSummary(title: "Oaxaca", summary: "Visit the ancient city.", keyPoints: ["Monte Alban."])
-        XCTAssertTrue(host.validRequestor(forSendType: .string, returnType: nil) as? PreviewContentView === host)
-        XCTAssertTrue(host.writeSelection(to: pasteboard, types: [.string]))
-        XCTAssertEqual(pasteboard.string(forType: .string), preview.state.contextText)
-        XCTAssertFalse(host.writeSelection(to: pasteboard, types: [.tiff]))
+        let menu = preview.actions.actionsMenu()
+        XCTAssertFalse(menu.allowsContextMenuPlugIns)
+        XCTAssertFalse(menu.automaticallyInsertsWritingToolsItems)
+        XCTAssertEqual(Array(menu.items.filter { !$0.isSeparatorItem }.map(\.title).prefix(3)), ["Open Page", "Copy Text", "Copy Link"])
         preview.close()
         XCTAssertNil(glass.superview)
     }
@@ -335,13 +329,9 @@ extension BrowserIntelligenceTests {
         XCTAssertTrue(controller.keptNotes.isEmpty)
     }
 
-    func testNoteCopyAndSiriEntityUseTheSameTextAndSourceAfterClosing() async throws {
+    func testNoteCopyIncludesSummaryKeyPointsAndSource() throws {
         let first = LinkPreviewState(url: URL(string: "https://example.com/article?part=2")!)
         first.result = LinkSummary(title: "Oaxaca", summary: "A destination overview.", keyPoints: ["Visit Monte Alban.", "Explore the Zocalo."])
-        let second = LinkPreviewState(url: URL(string: "https://example.com/another")!)
-        second.result = LinkSummary(title: "Another", summary: "A different note.")
-        let store = LinkPreviewContextStore.shared
-        store.register(first); store.register(second)
         let pasteboard = NSPasteboard.withUniqueName()
         defer { pasteboard.releaseGlobally() }
         PreviewNoteActions.copyText(first, to: pasteboard)
@@ -349,14 +339,6 @@ extension BrowserIntelligenceTests {
         for expected in ["Oaxaca", "A destination overview.", "• Visit Monte Alban.", "• Explore the Zocalo.", first.url.absoluteString] {
             XCTAssertTrue(text.contains(expected), expected)
         }
-        store.remember(first)
-        let resolved = try await PreviewNoteQuery().entities(for: [second.id, first.id])
-        XCTAssertEqual(resolved.map(\.id), [second.id, first.id])
-        XCTAssertEqual(resolved.last?.text, text)
-        XCTAssertEqual(resolved.last?.url, first.url)
-        let entity = try XCTUnwrap(resolved.last)
-        let exported = try await entity.exported(as: .utf8PlainText)
-        XCTAssertEqual(String(data: exported, encoding: .utf8), text)
         PreviewNoteActions.copyLink(first, to: pasteboard)
         XCTAssertEqual(pasteboard.string(forType: .URL), first.url.absoluteString)
         XCTAssertNil(pasteboard.string(forType: .string)?.range(of: "destination overview"))
