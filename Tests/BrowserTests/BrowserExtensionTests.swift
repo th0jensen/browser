@@ -16,10 +16,11 @@ final class BrowserExtensionTests: XCTestCase {
         try FileManager.default.removeItem(at: directory)
     }
 
-    private func makeExtension(permissions: [String] = []) throws -> URL {
+    private func makeExtension(name: String = "Test Extension", description: String = "Browser integration fixture",
+                               permissions: [String] = []) throws -> URL {
         let folder = directory.appending(path: "source")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let manifest: [String: Any] = ["manifest_version": 3, "name": "Test Extension", "description": "Browser integration fixture",
+        let manifest: [String: Any] = ["manifest_version": 3, "name": name, "description": description,
                                        "version": "1.0", "permissions": permissions]
         try JSONSerialization.data(withJSONObject: manifest).write(to: folder.appending(path: "manifest.json"))
         return folder
@@ -55,6 +56,39 @@ final class BrowserExtensionTests: XCTestCase {
         XCTAssertFalse(store.installed[0].isEnabled)
         XCTAssertNotNil(store.errors[item.id])
         XCTAssertNil(store.context(for: item))
+    }
+
+    func testForcedDarkNativeMessageSetsAndClearsWebViewCanvasColor() async throws {
+        let source = try makeExtension(name: "Forced Dark", description: BrowserExtensions.forcedDarkDescription,
+                                       permissions: ["storage", "nativeMessaging"])
+        let webExtension = try await WKWebExtension(resourceBaseURL: source)
+        let context = WKWebExtensionContext(for: webExtension)
+        let suite = "BrowserExtensionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = BrowserExtensions(directory: directory.appending(path: "installed"), persistent: false,
+                                      appearanceDefaults: defaults)
+        try await store.importResources(from: source)
+        XCTAssertFalse(try XCTUnwrap(store.installed.first).needsNativeMessaging)
+        let webView = WKWebView()
+        let originalBackground = webView.underPageBackgroundColor
+
+        try store.handleForcedDarkMessage(["type": "appearance", "enabled": true, "background": "#17211c"],
+                                          applicationIdentifier: BrowserExtensions.forcedDarkApplicationIdentifier,
+                                          context: context)
+        store.applyPageBackground(to: webView)
+        let color = try XCTUnwrap(webView.underPageBackgroundColor?.usingColorSpace(.sRGB))
+        XCTAssertEqual(color.redComponent, 23.0 / 255, accuracy: 0.001)
+        XCTAssertEqual(color.greenComponent, 33.0 / 255, accuracy: 0.001)
+        XCTAssertEqual(color.blueComponent, 28.0 / 255, accuracy: 0.001)
+        XCTAssertEqual(defaults.string(forKey: "ForcedDarkUnderPageBackground"), "#17211c")
+
+        try store.handleForcedDarkMessage(["type": "appearance", "enabled": false, "background": "#17211c"],
+                                          applicationIdentifier: BrowserExtensions.forcedDarkApplicationIdentifier,
+                                          context: context)
+        store.applyPageBackground(to: webView)
+        XCTAssertEqual(webView.underPageBackgroundColor, originalBackground)
+        XCTAssertNil(defaults.string(forKey: "ForcedDarkUnderPageBackground"))
     }
 
     func testPreviouslyEnabledExtensionLoadsAndSeesBrowserTabs() async throws {

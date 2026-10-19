@@ -127,6 +127,7 @@ final class BrowserTab: NSObject, Identifiable {
         webView.allowsLinkPreview = true
         webView.frame = contentView.bounds
         webView.autoresizingMask = [.width, .height]
+        if browser?.isPrivate != true { BrowserExtensions.shared.applyPageBackground(to: webView) }
         contentView.addSubview(webView)
         webView.navigationDelegate = pageDelegate
         webView.uiDelegate = pageDelegate
