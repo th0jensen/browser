@@ -3,6 +3,52 @@ import SwiftUI
 
 @MainActor
 enum PreviewNoteActions {
+    @discardableResult
+    static func openPage(_ url: URL, from tab: BrowserTab?,
+                         activateApplication: () -> Void = { NSApp.activate() },
+                         openElsewhere: (URL) -> Void = { ExternalURLRouter.shared.open([$0]) }) -> Task<Void, Never>? {
+        guard let tab, let browser = tab.browser, !browser.isClosed,
+              browser.tab(withID: tab.id) === tab, let window = browser.window else {
+            openElsewhere(url)
+            activateApplication()
+            return nil
+        }
+        // A kept note can outlive the source tab's selection. A live peek has no
+        // entry in the normal tab list and must not be assigned to activeTabID.
+        if browser.peek?.tab !== tab {
+            browser.dismissPeek()
+            browser.activeTabID = tab.id
+        }
+        tab.load(url)
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        activateApplication()
+        let target = browser.focusedPage
+        if target?.webView?.window === window {
+            target?.focusPage()
+            return nil
+        } else {
+            // A structurally different tab may join its native host on the next
+            // SwiftUI update. Never override a subsequent user focus request.
+            let focusResponder = window.firstResponder
+            let addressRequest = browser.addressFocusRequest
+            let findRequest = browser.findFocusRequest
+            let findVisible = target?.isFindBarVisible ?? false
+            return Task { @MainActor [weak browser, weak target, weak window, weak focusResponder] in
+                for _ in 0..<20 {
+                    guard !Task.isCancelled, let browser, let target, let window, !browser.isClosed,
+                          browser.focusedPage === target, browser.window === window,
+                          window.isKeyWindow, window.firstResponder === focusResponder,
+                          browser.addressFocusRequest == addressRequest,
+                          browser.findFocusRequest == findRequest,
+                          target.isFindBarVisible == findVisible else { return }
+                    if target.webView?.window === window { target.focusPage(); return }
+                    try? await Task.sleep(for: .milliseconds(25))
+                }
+            }
+        }
+    }
+
     static func copyText(_ state: LinkPreviewState, to pasteboard: NSPasteboard = .general) {
         pasteboard.clearContents()
         pasteboard.setString(state.contextText, forType: .string)

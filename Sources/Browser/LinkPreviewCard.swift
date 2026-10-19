@@ -129,13 +129,14 @@ final class PreviewDragView: NSView {
         let pressPoint = sourceWindow.convertPoint(toScreen: press.locationInWindow)
         let origin = preview.frame.origin
         preview.beginDrag()
-        guard let panel = preview.panel else { return }
+        guard preview.panel != nil else { return }
         NSCursor.closedHand.push()
         defer { NSCursor.pop(); preview.endDrag() }
         // The mouse-down belongs to the source window, even after the view is
         // reparented into a note. Track real local events in screen coordinates;
         // performDrag(with:) requires the original event in the same window.
         var next: NSEvent? = event
+        var wasActive = NSApp.isActive
         while !preview.isClosed {
             if let next {
                 if next.type == .keyDown {
@@ -148,10 +149,11 @@ final class PreviewDragView: NSView {
                     if next.type == .leftMouseUp { break }
                 }
             }
-            if !NSApp.isActive || NSEvent.pressedMouseButtons & 1 == 0 { break }
+            let active = NSApp.isActive
+            if (wasActive && !active) || NSEvent.pressedMouseButtons & 1 == 0 { break }
+            wasActive = active
             next = NSApp.nextEvent(matching: [.leftMouseDragged, .leftMouseUp, .keyDown],
                 until: Date(timeIntervalSinceNow: 0.1), inMode: .eventTracking, dequeue: true)
         }
-        if !preview.isClosed { panel.makeKeyAndOrderFront(nil) }
     }
 }

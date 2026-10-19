@@ -217,8 +217,10 @@ extension BrowserIntelligenceTests {
         window.isReleasedWhenClosed = false
         window.makeKeyAndOrderFront(nil)
         let anchor = window.convertToScreen(NSRect(x: 100, y: 460, width: 250, height: 20))
+        var dragFocusRequests: [LinkPreviewPanel] = []
         let preview = LinkPreviewPresentation(url: URL(string: "https://example.com/hover")!, sourceView: view,
-            anchor: anchor, open: {}, didKeep: { _ in }, didClose: { _ in })
+            anchor: anchor, open: {}, didKeep: { _ in }, didClose: { _ in },
+            focusNote: { dragFocusRequests.append($0) })
         defer { preview.close(); window.close() }
         preview.show()
         let glass = try XCTUnwrap(preview.glass)
@@ -241,8 +243,11 @@ extension BrowserIntelligenceTests {
         XCTAssertNil(drag.hitTest(NSPoint(x: 290, y: 25)), "Open Page remains clickable")
         let frame = preview.frame
         let sourceFrame = window.frame
+        let tint = glass.tintColor
         preview.beginDrag()
         let panel = try XCTUnwrap(preview.panel)
+        XCTAssertEqual(dragFocusRequests.count, 1, "The note is focused before the first drag event is tracked")
+        XCTAssertTrue(dragFocusRequests.first === panel)
         XCTAssertTrue(glass.window === panel)
         XCTAssertTrue(glass.contentView === host, "Detaching keeps the same contextual content host")
         let surface = try XCTUnwrap(panel.contentView)
@@ -255,11 +260,18 @@ extension BrowserIntelligenceTests {
         preview.resize(height: 480)
         XCTAssertEqual(panel.frame, frame, "Card does not jump while dragging")
         preview.moveDuringDrag(to: NSPoint(x: frame.minX + 35, y: frame.minY - 20))
+        XCTAssertEqual(glass.tintColor, tint)
+        XCTAssertEqual(glass.style, .regular)
         XCTAssertEqual(panel.frame.origin, NSPoint(x: frame.minX + 35, y: frame.minY - 20))
         XCTAssertEqual(window.frame, sourceFrame, "Tearing off a card must never move the browser window")
         preview.endDrag()
         XCTAssertTrue(preview.state.isKept)
         XCTAssertEqual(glass.frame, surface.bounds)
+        XCTAssertEqual(glass.tintColor, tint)
+        preview.beginDrag()
+        XCTAssertEqual(dragFocusRequests.count, 2, "An existing note also gains focus before tracking")
+        preview.endDrag()
+        XCTAssertEqual(dragFocusRequests.count, 2, "Dropping does not change focus or styling")
 
         let menu = preview.actions.actionsMenu()
         XCTAssertFalse(menu.allowsContextMenuPlugIns)
@@ -349,6 +361,94 @@ extension BrowserIntelligenceTests {
         PreviewNoteActions.copyLink(first, to: pasteboard)
         XCTAssertEqual(pasteboard.string(forType: .URL), first.url.absoluteString)
         XCTAssertNil(pasteboard.string(forType: .string)?.range(of: "destination overview"))
+    }
+
+    func testOpenPreviewSelectsSourceRestoresWindowAndActivatesApplication() throws {
+        let browser = BrowserModel()
+        let source = try XCTUnwrap(browser.activeTab)
+        source.restore()
+        browser.addTab(focusAddress: false)
+        let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = source.contentView
+        browser.window = window
+        defer { source.stopLoading(); window.close() }
+        let destination = URL(string: "data:text/html,<title>PreviewDestination</title>")!
+        var activations = 0
+        var fallbacks: [URL] = []
+        PreviewNoteActions.openPage(destination, from: source, activateApplication: { activations += 1 },
+                                    openElsewhere: { fallbacks.append($0) })
+        XCTAssertEqual(source.url, destination)
+        XCTAssertEqual(browser.activeTabID, source.id)
+        XCTAssertEqual(window.restoreRequests, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        XCTAssertTrue(window.requestedResponder === source.webView)
+        XCTAssertEqual(activations, 1)
+        XCTAssertTrue(fallbacks.isEmpty)
+    }
+
+    func testOpenPreviewPreservesLiveSourcePeek() throws {
+        let browser = BrowserModel()
+        let opener = try XCTUnwrap(browser.activeTab)
+        let source = browser.openPeek(from: opener)
+        let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                         styleMask: [.titled], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = source.contentView
+        browser.window = window
+        defer { browser.dismissPeek(); window.close() }
+        let destination = URL(string: "data:text/html,<title>PeekDestination</title>")!
+        var activations = 0
+        PreviewNoteActions.openPage(destination, from: source, activateApplication: { activations += 1 },
+                                    openElsewhere: { _ in XCTFail("A live peek remains a valid destination") })
+        XCTAssertTrue(browser.peek?.tab === source)
+        XCTAssertEqual(browser.activeTabID, opener.id)
+        XCTAssertEqual(source.url, destination)
+        XCTAssertTrue(window.requestedResponder === source.webView)
+        XCTAssertEqual(activations, 1)
+    }
+
+    func testOpenPreviewRoutesElsewhereAfterSourceTabCloses() throws {
+        let browser = BrowserModel()
+        let source = try XCTUnwrap(browser.activeTab)
+        browser.closeTab(source.id)
+        let destination = URL(string: "https://example.com/preview")!
+        var activations = 0
+        var routed: [URL] = []
+        PreviewNoteActions.openPage(destination, from: source, activateApplication: { activations += 1 },
+                                    openElsewhere: { routed.append($0) })
+        XCTAssertEqual(routed, [destination])
+        XCTAssertEqual(activations, 1)
+        XCTAssertNotEqual(browser.activeTabID, source.id)
+    }
+
+    func testDeferredPreviewFocusRespectsLaterResponderAddressAndFindRequests() async throws {
+        for change in ["none", "responder", "address", "find"] {
+            let browser = BrowserModel()
+            let source = try XCTUnwrap(browser.activeTab)
+            let window = PreviewActionWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 500),
+                                             styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            browser.window = window
+            defer { source.stopLoading(); window.close() }
+            let originalResponder = NSResponder()
+            let newResponder = NSResponder()
+            _ = window.makeFirstResponder(originalResponder)
+            let pending = PreviewNoteActions.openPage(URL(string: "data:text/html,<p>Focus</p>")!, from: source,
+                activateApplication: {}, openElsewhere: { _ in XCTFail("The source is live") })
+            XCTAssertNotNil(pending)
+            switch change {
+            case "responder": _ = window.makeFirstResponder(newResponder)
+            case "address": browser.requestAddressFocus()
+            case "find": source.findText = "fixture"; browser.showFindBar()
+            default: break
+            }
+            window.contentView = source.contentView
+            await pending?.value
+            let expected: NSResponder? = change == "none" ? source.webView : (change == "responder" ? newResponder : originalResponder)
+            XCTAssertTrue(window.requestedResponder === expected, change)
+        }
     }
 
     func testPreviewDestinationAddressesExcludePrivateAndLocalNetworks() {
@@ -458,6 +558,20 @@ extension BrowserIntelligenceTests {
 // without taking focus away from the user's running Release browser.
 @MainActor private final class PreviewFixtureWindow: NSWindow {
     override var isKeyWindow: Bool { true }
+}
+
+/// Record explicit activation requests without taking over the user's desktop.
+@MainActor private final class PreviewActionWindow: NSWindow {
+    private var minimized = true
+    var restoreRequests = 0
+    var frontRequests = 0
+    var requestedResponder: NSResponder?
+    override var isMiniaturized: Bool { minimized }
+    override var isKeyWindow: Bool { frontRequests > 0 }
+    override var firstResponder: NSResponder? { requestedResponder }
+    override func deminiaturize(_ sender: Any?) { minimized = false; restoreRequests += 1 }
+    override func makeKeyAndOrderFront(_ sender: Any?) { frontRequests += 1 }
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool { requestedResponder = responder; return true }
 }
 
 extension BrowserIntelligenceTests {

@@ -240,6 +240,7 @@ final class LinkPreviewPresentation {
     private let openPage: () -> Void
     private let didKeep: (LinkPreviewPresentation) -> Void
     private let didClose: (LinkPreviewPresentation) -> Void
+    private let focusNote: (LinkPreviewPanel) -> Void
     private var eventMonitor: Any?
     private var observers: [NSObjectProtocol] = []
     private var dismissTask: Task<Void, Never>?
@@ -251,7 +252,8 @@ final class LinkPreviewPresentation {
     var imageTask: Task<Void, Never>?
 
     init(url: URL, sourceView: WKWebView, anchor: NSRect, open: @escaping () -> Void,
-         didKeep: @escaping (LinkPreviewPresentation) -> Void, didClose: @escaping (LinkPreviewPresentation) -> Void) {
+         didKeep: @escaping (LinkPreviewPresentation) -> Void, didClose: @escaping (LinkPreviewPresentation) -> Void,
+         focusNote: @escaping (LinkPreviewPanel) -> Void = { $0.makeKeyAndOrderFront(nil) }) {
         state = LinkPreviewState(url: url)
         self.sourceView = sourceView
         sourceWindow = sourceView.window
@@ -259,6 +261,7 @@ final class LinkPreviewPresentation {
         openPage = open
         self.didKeep = didKeep
         self.didClose = didClose
+        self.focusNote = focusNote
     }
 
     func show() {
@@ -398,7 +401,17 @@ final class LinkPreviewPresentation {
         if !isDragging { resize(height: state.contentHeight) }
     }
 
-    func beginDrag() { isDragging = true; keep() }
+    func beginDrag() {
+        guard !isClosed else { return }
+        isDragging = true
+        keep()
+        guard let panel else { return }
+        // The new panel must be key before tracking starts; otherwise glass is
+        // rendered with its inactive treatment until the mouse is released.
+        focusNote(panel)
+        panel.contentView?.layoutSubtreeIfNeeded()
+        panel.displayIfNeeded()
+    }
 
     func moveDuringDrag(to origin: NSPoint) {
         guard isDragging, let panel else { return }
@@ -549,8 +562,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         let screenAnchor = window.convertToScreen(view.convert(anchor, to: nil))
         let tab = tabs.object(forKey: view)
         let preview = LinkPreviewPresentation(url: url, sourceView: view, anchor: screenAnchor, open: { [weak tab] in
-            if let tab, tab.browser?.isClosed != true { tab.load(url); tab.browser?.window?.makeKeyAndOrderFront(nil) }
-            else { ExternalURLRouter.shared.open([url]) }
+            PreviewNoteActions.openPage(url, from: tab)
         }, didKeep: { [weak self] note in
             self?.notes[note.state.id] = note
             if self?.current === note { self?.current = nil }
