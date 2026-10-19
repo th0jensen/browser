@@ -226,7 +226,7 @@ extension BrowserIntelligenceTests {
         XCTAssertTrue(glass.window === window, "Hover glass samples the webpage in the same window")
         XCTAssertNil(preview.panel)
         XCTAssertTrue(glass.contentView === host)
-        XCTAssertEqual(glass.style, .clear)
+        XCTAssertEqual(glass.style, .regular)
         XCTAssertEqual(anchor.minY - preview.frame.maxY, 24, accuracy: 0.5)
         XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: anchor.minY - 8)))
         XCTAssertTrue(preview.containsHoverPoint(NSPoint(x: anchor.midX, y: (anchor.minY + preview.frame.maxY) / 2)))

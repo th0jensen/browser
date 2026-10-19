@@ -267,8 +267,10 @@ final class LinkPreviewPresentation {
         content.focusRingType = .none
         self.content = content
         let glass = NSGlassEffectView()
-        glass.style = .clear
-        glass.tintColor = NSColor.black.withAlphaComponent(0.12)
+        // Regular glass adapts the hosted semantic text and background together.
+        // Clear glass has no adaptive legibility treatment over busy webpages.
+        glass.style = .regular
+        glass.tintColor = NSColor.black.withAlphaComponent(0.24)
         glass.cornerRadius = 16
         glass.contentView = content
         self.glass = glass
