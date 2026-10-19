@@ -15,6 +15,22 @@ python3 scripts/benchmark-report.py --start-run "$run" --label "$label" --derive
 python3 scripts/benchmark-report.py --verify-fixture
 xcodegen generate
 
+# Sample the benchmark host and every WebKit service registered in its PID domain
+# during the named quiet windows. The sampler follows the test's phase marker and
+# never launches, discovers, or stops an installed Browser application.
+cohort_pid=""
+cohort_status=0
+if [[ "$mode" != "reveal" ]]; then
+  workload="core"
+  [[ "$mode" == "google" ]] && workload="google"
+  python3 scripts/benchmark-cohort.py --log "$run/benchmark.log" --output "$run/cohort" --workload "$workload" &
+  cohort_pid=$!
+fi
+cleanup() {
+  if [[ -n "$cohort_pid" ]] && kill -0 "$cohort_pid" 2>/dev/null; then kill "$cohort_pid" 2>/dev/null || true; fi
+}
+trap cleanup EXIT INT TERM
+
 # TEST_RUNNER_ forwards variables through xcodebuild to the test host.
 # Benchmark inherits Release optimization, with a separate identity and no installation or deployment.
 set +e
@@ -29,7 +45,16 @@ xcodebuild -project Browser.xcodeproj -scheme Browser -configuration Benchmark \
   > >(tee "$run/benchmark.log" "$derived/benchmark.log") 2>&1
 status=$?
 set -e
-python3 scripts/benchmark-report.py --finish-run "$run" --exit-status "$status"
+if [[ -n "$cohort_pid" ]]; then
+  set +e
+  wait "$cohort_pid"
+  cohort_status=$?
+  set -e
+  cohort_pid=""
+fi
+overall_status=$status
+if [[ "$overall_status" -eq 0 && "$cohort_status" -ne 0 ]]; then overall_status=$cohort_status; fi
+python3 scripts/benchmark-report.py --finish-run "$run" --exit-status "$overall_status"
 if [[ -d "$results" ]]; then
   mkdir -p "$run/attachments"
   xcrun xcresulttool export attachments --path "$results" --output-path "$run/attachments" || true
@@ -37,4 +62,4 @@ fi
 echo "XCTest result bundle: $results"
 echo "Raw JSON, provenance, and screenshot recovery: $run"
 echo "The BROWSER_BENCHMARK_OUTPUT line in $run/benchmark.log names the host-writable temporary directory."
-exit "$status"
+exit "$overall_status"

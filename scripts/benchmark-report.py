@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 import platform
 import plistlib
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -65,6 +67,30 @@ def finish_run(path, exit_status):
         manifest["executable_identity_limit"] = "Build product observed after xcodebuild; a failed build may leave a previous product."
     except (OSError, ValueError, KeyError, plistlib.InvalidFileException) as error:
         manifest["executable_identity_error"] = str(error)
+    try:
+        sizes = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/browser-resources.py"), "sizes", str(app)],
+            check=True, text=True, capture_output=True,
+        )
+        manifest["bundle_sizes"] = json.loads(sizes.stdout)["bundles"][0]
+    except (OSError, KeyError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
+        manifest["bundle_sizes_error"] = str(error)
+    cohorts = {}
+    for cohort_file in sorted((Path(path) / "cohort").glob("*.json")):
+        try:
+            record = json.loads(cohort_file.read_text())
+            if record.get("schema") != "browser-resources-v1" or record.get("mode") != "sample":
+                continue
+            cohorts[cohort_file.stem] = {
+                "state": record.get("state"), "scope": record.get("scope"),
+                "selected_pids": record.get("selected_pids"), "summary": record.get("summary"),
+                "host_summary": record.get("host_summary"),
+                "webkit_summary": record.get("related_processes_summary"),
+            }
+        except (OSError, json.JSONDecodeError):
+            continue
+    if cohorts:
+        manifest["resource_cohorts"] = cohorts
     file.write_text(json.dumps(manifest, indent=2) + "\n")
 
 
@@ -83,6 +109,7 @@ def read_result(path):
     files = [source] if source.is_file() else sorted(source.rglob("*"))
     records = []
     manifests = []
+    manifest = None
     for file in files:
         if not file.is_file():
             continue
@@ -128,7 +155,7 @@ def read_result(path):
     print(f"{value['label']}: {file} ({value['status']})")
     if value.get("status") != "complete":
         raise SystemExit("Latest benchmark record is incomplete; refusing to report a completed comparison.")
-    if manifests:
+    if manifest is not None:
         value["run_provenance"] = manifest
     return value
 
@@ -160,11 +187,35 @@ def report(baseline, candidate):
         rss_a, rss_b = a.get("rss_after_bytes"), b.get("rss_after_bytes")
         row(f"Host idle RSS: {name}", rss_a / 2**20 if rss_a is not None else None,
             rss_b / 2**20 if rss_b is not None else None, "MiB")
+
+    left_run, right_run = baseline.get("run_provenance", {}), candidate.get("run_provenance", {})
+    left_bundle, right_bundle = left_run.get("bundle_sizes", {}), right_run.get("bundle_sizes", {})
+    for label, key in [("App logical size", "bundle_logical_bytes"),
+                       ("App allocated size", "bundle_allocated_bytes"),
+                       ("Executable logical size", "executable_logical_bytes")]:
+        a, b = left_bundle.get(key), right_bundle.get(key)
+        row(label, a / 2**20 if a is not None else None, b / 2**20 if b is not None else None, "MiB")
+
+    left_cohorts, right_cohorts = left_run.get("resource_cohorts", {}), right_run.get("resource_cohorts", {})
+    for name in dict.fromkeys([*left_cohorts, *right_cohorts]):
+        a, b = left_cohorts.get(name, {}), right_cohorts.get(name, {})
+        for scope, key in [("Host + WebKit", "summary"), ("WebKit", "webkit_summary")]:
+            left_summary, right_summary = a.get(key) or {}, b.get(key) or {}
+            row(f"{scope} CPU: {name}", left_summary.get("cpu_percent_one_core"),
+                right_summary.get("cpu_percent_one_core"), "% of one core")
+            left_rss, right_rss = left_summary.get("sum_rss_sampled_peak_bytes"), right_summary.get("sum_rss_sampled_peak_bytes")
+            row(f"{scope} peak RSS: {name}", left_rss / 2**20 if left_rss is not None else None,
+                right_rss / 2**20 if right_rss is not None else None, "MiB")
+            left_footprint = left_summary.get("sum_physical_footprint_sampled_peak_bytes")
+            right_footprint = right_summary.get("sum_physical_footprint_sampled_peak_bytes")
+            row(f"{scope} peak footprint: {name}", left_footprint / 2**20 if left_footprint is not None else None,
+                right_footprint / 2**20 if right_footprint is not None else None, "MiB")
     print("\nLatency rows show medians; inspect raw JSON for counts, warmups, p90 and individual samples. "
-          "Twenty-tab batches are single observations. CPU/RSS include the application XCTest host, "
-          "exclude WebKit subprocesses and use one 30-second resource window per state. RSS endpoints are not peaks. "
-          "Live Google navigation includes network/cache/server variability. Native frame, attachment and DOM/rAF "
-          "acknowledgements have different completion definitions; none proves final display presentation.")
+          "Twenty-tab batches are single observations. Host idle rows use the XCTest process only. Cohort rows use "
+          "the host PID domain's registered WebKit services and report sampled peaks; see raw attribution evidence. "
+          "Bundle rows measure the Benchmark product, not compressed distribution size. Live Google navigation includes "
+          "network/cache/server variability. Native frame, attachment and DOM/rAF acknowledgements have different "
+          "completion definitions; none proves final display presentation.")
 
 
 def main():
