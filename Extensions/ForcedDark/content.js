@@ -1,5 +1,6 @@
 (() => {
   "use strict";
+  if (document.contentType.startsWith("image/")) return;
   const C = globalThis.ForcedDarkColors;
   const api = globalThis.browser ?? globalThis.chrome;
   const attribute = "data-browser-forced-dark";

@@ -41,3 +41,15 @@ test('computed sRGB syntax preserves alpha', () => {
   near(C.parse('color(srgb 0.1 0.2 0.3 / 0.4)'),[0.1,0.2,0.3,0.4]);
   assert.equal(C.parse('color(display-p3 1 0 0)'),null);
 });
+
+test('low-contrast chromatic text reaches AA without changing alpha', () => {
+  for (const background of ['#121212','#181c20','#17211c','#211c19','#000000']) {
+    for (const foreground of ['#0000ff','#555555','#777777','#993344','#008877']) {
+      const bg = C.parse(background);
+      const result = C.foreground(C.parse(foreground),bg);
+      const rounded = C.parse(C.css(result));
+      assert.ok(C.contrast(rounded,bg) >= 4.5, `${foreground} on ${background}: ${C.contrast(rounded,bg)}`);
+      assert.equal(result[3],1);
+    }
+  }
+});

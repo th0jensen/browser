@@ -77,7 +77,22 @@
     // must be classified against what is actually behind them.
     const originalContrast = contrast(composite(color,backdrop),backdrop);
     const invertedContrast = contrast(composite(transformed,backdrop),backdrop);
-    return originalContrast >= 4.5 || originalContrast >= invertedContrast ? color : transformed;
+    const best = originalContrast >= 4.5 || originalContrast >= invertedContrast ? color : transformed;
+    if (contrast(composite(best,backdrop),backdrop) >= 4.6) return best;
+    // Preserve chroma and alpha, moving only lightness when inversion alone
+    // leaves text below WCAG AA. A small margin survives 8-bit CSS rounding.
+    const lab = toLab(best);
+    const target = luminance(backdrop) > 0.179 ? 0 : 100;
+    let low = 0, high = 1;
+    let readable = fromLab([target,lab[1],lab[2]],best[3]);
+    if (contrast(composite(readable,backdrop),backdrop) < 4.6) return best;
+    for (let i = 0; i < 14; i++) {
+      const amount = (low+high)/2;
+      const candidate = fromLab([lab[0]+(target-lab[0])*amount,lab[1],lab[2]],best[3]);
+      if (contrast(composite(candidate,backdrop),backdrop) >= 4.6) { readable = candidate; high = amount; }
+      else low = amount;
+    }
+    return readable;
   }
   const defaults = Object.freeze({enabled:true, background:"#121212"});
   function settings(value = {}) {
