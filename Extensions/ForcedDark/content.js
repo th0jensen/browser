@@ -110,11 +110,14 @@
     // the same task; the browser cannot paint the authored white page between.
     reveal();
     if (!preferences.enabled) { observe(); return; }
-    if (!roots.has(document)) createSheet(document);
     const surface = C.parse(preferences.background);
     const rootStyle = getComputedStyle(document.documentElement);
     const bodyStyle = document.body && getComputedStyle(document.body);
     const base = [bodyStyle?.backgroundColor,rootStyle.backgroundColor].map(C.parse).find(color => color && color[3] >= 0.95);
+    // A dark page already provides its own coordinated palette. Do not scan or
+    // override it; disabling old sheets also handles a live light-to-dark switch.
+    if (C.isDark(base)) { observe(); return; }
+    if (!roots.has(document)) createSheet(document);
     const canvas = base ? C.background(base,surface) : surface;
     const scrollbar = `*{scrollbar-color:#747474 ${preferences.background}!important}*::-webkit-scrollbar-track{background-color:${preferences.background}!important}*::-webkit-scrollbar-thumb{background-color:#747474!important;border-color:${preferences.background}!important}`;
     const output = new Map([[document,[`html{background-color:${C.css(canvas)}!important;color-scheme:dark!important}`,scrollbar]]]);
