@@ -62,11 +62,15 @@ final class NativeToolbarCommandButton: NSButton {
         (cell as? CenteredToolbarButtonCell)?.horizontalOffset = command.identifier == "back" ? 2 : command.identifier == "forward" ? -2 : 0
         let commandID = NSUserInterfaceItemIdentifier(command.identifier)
         if identifier != commandID { identifier = commandID }
-        if title != command.title {
-            cell?.title = command.title
-            needsDisplay = true
-            setAccessibilityLabel(command.title)
+        // An invisible icon-only cell title still makes AppKit reallocate the
+        // whole toolbar. Keep spoken semantics current without touching layout.
+        if displayMode == .labelOnly || displayMode == .iconAndLabel {
+            if title != command.title {
+                cell?.title = command.title
+                needsDisplay = true
+            }
         }
+        setAccessibilityLabel(command.title)
         if toolTip != command.help { toolTip = command.help }
         if isEnabled != command.isEnabled { isEnabled = command.isEnabled }
         if symbol != command.symbol {

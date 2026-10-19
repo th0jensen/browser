@@ -26,7 +26,7 @@ final class NativeToolbarCommandTests: XCTestCase {
         menu.addItem(withTitle: "Previous Page", action: nil, keyEquivalent: "")
         adapter.update(.init(identifier: "reload", title: "Stop Loading", symbol: "xmark", isEnabled: false,
                              action: { actions += 10 }, menu: { menu }))
-        XCTAssertEqual(adapter.button.title, "Stop Loading")
+        XCTAssertEqual(adapter.button.accessibilityLabel(), "Stop Loading")
         XCTAssertEqual(adapter.button.imagePosition, .imageOnly)
         XCTAssertNotNil(adapter.button.image)
         XCTAssertEqual(adapter.button.symbol, "xmark")
