@@ -197,7 +197,7 @@ final class CompactToolbarTests: XCTestCase {
         defer { fixture.close() }
         let toolbar = try XCTUnwrap(fixture.window.toolbar)
         let identifiers: [NSToolbarItem.Identifier] = [
-            .init("reload"), .space, .init("back"), .init("divider0"), .init("address"),
+            .init("reload"), .space, .init("back"), .space, .init("address"),
             .flexibleSpace, .init("forward"), .space, .init("newTab")
         ]
         toolbar.itemIdentifiers = identifiers
@@ -206,7 +206,7 @@ final class CompactToolbarTests: XCTestCase {
         }
         let parts = FullscreenToolbarPart.parts(for: toolbar.items.map { $0.itemIdentifier.rawValue })
         XCTAssertEqual(parts.map(\.content), [
-            .controls(["reload"]), .space, .controls(["back"]), .divider, .address,
+            .controls(["reload"]), .space, .controls(["back"]), .space, .address,
             .flexibleSpace, .controls(["forward"]), .space, .controls(["newTab"])
         ])
         XCTAssertEqual(parts.map(\.id), Array(identifiers.indices),
@@ -592,6 +592,7 @@ private final class CompactToolbarFixture {
         self.browser = browser
         self.tab = tab
         tab.isNewTab = false
+        tab.restore()
         // The model creates its initial tab with a focus request. A loaded-page fixture starts unfocused.
         browser.consumedAddressFocusRequest = browser.addressFocusRequest
         webView = try XCTUnwrap(tab.webView)

@@ -2,14 +2,13 @@ import AppKit
 import SwiftUI
 
 /// The attached NSToolbar remains the persisted source of truth in fullscreen.
-/// Separators and spaces end a glass group exactly where native customization put them.
+/// Native spaces end a glass group exactly where customization put them.
 struct FullscreenToolbarPart: Equatable, Identifiable {
     enum Content: Equatable {
         case controls([String])
         case address
         case space
         case flexibleSpace
-        case divider
     }
 
     let id: Int
@@ -20,7 +19,6 @@ struct FullscreenToolbarPart: Equatable, Identifiable {
         case .controls(let identifiers): CGFloat(identifiers.count) * 28 + 8
         case .address: 160
         case .space, .flexibleSpace: 20
-        case .divider: 1
         }
     }
 
@@ -39,7 +37,7 @@ struct FullscreenToolbarPart: Equatable, Identifiable {
             case "address": separator = .address
             case NSToolbarItem.Identifier.space.rawValue: separator = .space
             case NSToolbarItem.Identifier.flexibleSpace.rawValue: separator = .flexibleSpace
-            default: separator = identifier.hasPrefix("divider") ? .divider : nil
+            default: separator = identifier.hasPrefix("divider") ? .space : nil
             }
             if let separator {
                 flushControls()
@@ -95,17 +93,13 @@ struct FullscreenToolbarRow<Control: View, Address: View>: View {
                                         .id("address")
                                         .layoutValue(key: ToolbarRowRoleKey.self, value: .address)
                                 case .space:
-                                    Color.clear.frame(width: 20, height: 1)
+                                    HStack(spacing: 0) { Divider().frame(height: 20) }
+                                        .frame(width: 20, height: 20)
                                         .layoutValue(key: ToolbarRowRoleKey.self, value: .space)
                                         .allowsHitTesting(false)
                                 case .flexibleSpace:
                                     Color.clear.frame(minWidth: 20, minHeight: 1)
                                         .layoutValue(key: ToolbarRowRoleKey.self, value: .flexibleSpace)
-                                case .divider:
-                                    Rectangle().fill(.separator)
-                                        .frame(width: 1, height: 20)
-                                        .layoutValue(key: ToolbarRowRoleKey.self, value: .divider)
-                                        .allowsHitTesting(false)
                                 }
                             }
                         }
@@ -296,11 +290,11 @@ final class FullscreenWindowControlsView: NSView {
     }
 }
 
-private enum ToolbarRowRole { case control, address, space, flexibleSpace, divider }
+private enum ToolbarRowRole { case control, address, space, flexibleSpace }
 private struct ToolbarRowRoleKey: LayoutValueKey { static let defaultValue = ToolbarRowRole.control }
 
 /// Explicit allocation prevents an expanding address view swallowing flexible
-/// spacing. Dividers have no extra padding; fixed spaces keep their exact width.
+/// spacing. Fixed spaces keep their exact width and separate glass groups.
 private struct ToolbarRowLayout: Layout {
     var availableWidth: CGFloat
     private func gap(before index: Int, subviews: Subviews) -> CGFloat {
@@ -314,7 +308,6 @@ private struct ToolbarRowLayout: Layout {
             switch subview[ToolbarRowRoleKey.self] {
             case .address: CGFloat(160)
             case .flexibleSpace, .space: CGFloat(20)
-            case .divider: CGFloat(1)
             case .control: subview.sizeThatFits(.unspecified).width
             }
         }

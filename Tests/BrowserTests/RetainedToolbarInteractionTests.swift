@@ -20,13 +20,13 @@ final class RetainedToolbarInteractionTests: XCTestCase {
         XCTAssertNotNil(reload.commandMenu())
         XCTAssertTrue(initialAllowed.contains(.space))
         XCTAssertTrue(initialAllowed.contains(.flexibleSpace))
-        let divider = try XCTUnwrap(initialAllowed.first { $0.rawValue.hasPrefix("divider") })
+        XCTAssertFalse(initialAllowed.contains { $0.rawValue.hasPrefix("divider") })
         let palettePin = try XCTUnwrap(delegate.toolbar?(toolbar, itemForItemIdentifier: .init("pinSidebar"), willBeInsertedIntoToolbar: false))
         XCTAssertEqual(palettePin.label, "Pin Sidebar")
         XCTAssertEqual(palettePin.paletteLabel, "Pin Sidebar")
         toolbar.insertItem(withItemIdentifier: .init("pinSidebar"), at: 0)
         toolbar.insertItem(withItemIdentifier: .space, at: toolbar.items.count)
-        toolbar.insertItem(withItemIdentifier: divider, at: toolbar.items.count)
+        toolbar.insertItem(withItemIdentifier: .space, at: toolbar.items.count)
         try await waitFor("customized pin command to acquire its native view") {
             toolbar.items.first { $0.itemIdentifier.rawValue == "pinSidebar" }?.view is NativeToolbarCommandButton
         }
@@ -315,6 +315,7 @@ private enum ToolbarInteractionFailure: Error { case timeout }
         self.browser = browser
         self.tab = tab
         tab.isNewTab = false
+        tab.restore()
         browser.consumedAddressFocusRequest = browser.addressFocusRequest
         webView = try XCTUnwrap(tab.webView)
         let window = ToolbarInteractionWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),

@@ -50,7 +50,7 @@ final class BrowserModel: NSObject {
                 previousTab.captureThumbnail(afterScreenUpdates: false, minimumAge: .seconds(2))
                 previousTab.lastActive = .now
             }
-            activeTab?.restore()
+            if activeTab?.isNewTab != true { activeTab?.restore() }
             restoreVisibleSplit()
             activeTab?.didBecomeSelected()
             let representedTab = tab(withID: activeSplit?.anchorID) ?? activeTab
@@ -99,7 +99,7 @@ final class BrowserModel: NSObject {
             ? TabFolderStore(directory: BrowserProfile.directory, enabled: false) : .shared)
         super.init()
         tabDrag.canSplit = { [weak self] source, target in self?.canSplitDrag(source, with: target) == true }
-        if createsInitialTab { addTab(configuration: configuration ?? makeConfiguration()) }
+        if createsInitialTab { addTab(configuration: configuration) }
         suspender = TabSuspender(browser: self)
     }
 
@@ -556,7 +556,8 @@ final class BrowserModel: NSObject {
     }
 
     private func makeTab(configuration: WKWebViewConfiguration? = nil) -> BrowserTab {
-        adopt(BrowserTab(configuration: configuration ?? makeConfiguration(), browser: self))
+        if let configuration { return adopt(BrowserTab(configuration: configuration, browser: self)) }
+        return adopt(BrowserTab(newTabIn: self))
     }
 
     private func adopt(_ tab: BrowserTab) -> BrowserTab {
@@ -685,7 +686,7 @@ final class BrowserModel: NSObject {
     @discardableResult
     func openChildTab(of opener: BrowserTab, configuration: WKWebViewConfiguration? = nil,
                       loading request: URLRequest? = nil, select: Bool) -> BrowserTab {
-        let tab = makeTab(configuration: configuration)
+        let tab = makeTab(configuration: configuration ?? makeConfiguration())
         tab.isNewTab = false
         tab.openerID = opener.id
         tab.isPopUp = configuration != nil

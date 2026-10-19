@@ -587,6 +587,7 @@ struct BrowserWindow: View {
                 .defaultCustomization(.hidden)
                 .sharedBackgroundVisibility(.automatic)
         }
+        ToolbarSpacer(.fixed, placement: .automatic)
         Group {
             ToolbarItem(id: "back", placement: .automatic) { navigationButton(.back) }
             ToolbarItem(id: "forward", placement: .automatic) { navigationButton(.forward) }
@@ -603,6 +604,7 @@ struct BrowserWindow: View {
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(id: "downloads", placement: .automatic) { toolbarComponent(.downloads) }
             .sharedBackgroundVisibility(.automatic)
+        ToolbarSpacer(.fixed, placement: .automatic)
         ForEach(browser.isPrivate ? [] : BrowserExtensions.shared.toolbarExtensions) { item in
             ToolbarItem(id: "extension.\(item.id.uuidString)", placement: .automatic) { ExtensionButton(item: item, browser: browser) }
                 .defaultCustomization(.hidden)
@@ -620,14 +622,6 @@ struct BrowserWindow: View {
             ToolbarItem(id: "newTab", placement: .automatic) { toolbarComponent(.newTab) }
                 .defaultCustomization(tabLayout == .horizontal ? .visible : .hidden)
                 .sharedBackgroundVisibility(.automatic)
-        }
-        Group {
-            ToolbarItem(id: "divider0", placement: .automatic) {
-                Rectangle().fill(.separator).frame(width: 1, height: 20)
-                    .accessibilityLabel("Divider")
-            }
-            .defaultCustomization(.hidden)
-            .sharedBackgroundVisibility(.hidden)
         }
     }
 

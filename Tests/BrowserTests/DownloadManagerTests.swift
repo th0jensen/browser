@@ -40,6 +40,7 @@ final class DownloadManagerTests: XCTestCase {
         let downloads = DownloadManager(directory: directory)
         let browser = BrowserModel(downloads: downloads)
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let webView = try XCTUnwrap(tab.webView)
         webView.loadHTMLString("<title>Files</title><a id=file download=note.txt href='data:text/plain,hello'>Get</a>",
                                baseURL: URL(string: "https://example.com")!)
@@ -109,6 +110,7 @@ extension DownloadManagerTests {
     private func startDownload(in browser: BrowserModel) async throws {
         browser.sitePermissions.setDecision(true, for: .downloads, on: "example.com")
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let view = try XCTUnwrap(tab.webView)
         view.loadHTMLString("<title>Private source</title><a id=file download=original.txt href='data:text/plain,hello'>Get</a>",
                             baseURL: URL(string: "https://example.com")!)

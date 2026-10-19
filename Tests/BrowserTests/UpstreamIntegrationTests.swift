@@ -10,6 +10,7 @@ final class UpstreamIntegrationTests: XCTestCase {
 
     private func assertPrivateConfiguration(_ tab: BrowserTab, in browser: BrowserModel,
                                             file: StaticString = #filePath, line: UInt = #line) throws {
+        tab.restore()
         let configuration = try XCTUnwrap(tab.webView?.configuration, file: file, line: line)
         XCTAssertTrue(configuration.websiteDataStore === browser.websiteDataStore, file: file, line: line)
         XCTAssertFalse(configuration.websiteDataStore.isPersistent, file: file, line: line)
@@ -25,6 +26,7 @@ final class UpstreamIntegrationTests: XCTestCase {
         XCTAssertFalse(normal.isPrivate)
         XCTAssertFalse(normal.websiteDataStore.isPersistent)
         XCTAssertTrue(normal.history === history)
+        normal.activeTab?.restore()
         XCTAssertNotNil(normal.activeTab?.webView?.configuration.webExtensionController)
         XCTAssertTrue(privateWindow.isPrivate)
         XCTAssertNil(privateWindow.history)

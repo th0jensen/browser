@@ -105,7 +105,9 @@ extension BrowserModel {
         if let index = splits.firstIndex(where: { $0.id == group.id }), let activeTabID {
             splits[index].focusedID = activeTabID
         }
-        for id in group.tabIDs { tab(withID: id)?.restore() }
+        for id in group.tabIDs {
+            if let tab = tab(withID: id), !tab.isNewTab { tab.restore() }
+        }
     }
 
     func separateSplit(_ id: UUID) {

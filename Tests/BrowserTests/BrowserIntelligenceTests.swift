@@ -186,6 +186,7 @@ extension BrowserIntelligenceTests {
         })
         let browser = BrowserModel(downloads: downloads)
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let view = try XCTUnwrap(tab.webView)
         view.loadHTMLString("<title>Ownership Tutorial</title><a id='file' download='a848.txt' href='data:text/plain,hello'>Download</a>", baseURL: URL(string: "https://example.com"))
         try await waitUntil { !tab.isLoading && tab.pageTitle == "Ownership Tutorial" }
@@ -217,6 +218,7 @@ extension BrowserIntelligenceTests {
         controller.setEnabled(true)
         let browser = BrowserModel()
         let tab = try XCTUnwrap(browser.activeTab)
+        tab.restore()
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
         controller.install(in: view, tab: tab)
         let window = PreviewFixtureWindow(contentRect: view.bounds, styleMask: [.titled, .closable], backing: .buffered, defer: false)

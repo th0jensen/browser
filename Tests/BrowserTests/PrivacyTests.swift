@@ -20,6 +20,7 @@ final class PrivacyTests: XCTestCase {
         let second = BrowserModel.makePrivate(downloads: DownloadManager())
         first.addTab()
 
+        first.tabs.forEach { $0.restore() }
         let stores = first.tabs.compactMap { $0.webView?.configuration.websiteDataStore }
         XCTAssertEqual(stores.count, 2)
         XCTAssertTrue(stores.allSatisfy { $0 === first.websiteDataStore })
@@ -30,14 +31,15 @@ final class PrivacyTests: XCTestCase {
     func testPrivatePopUpsAndRestoredTabsStayPrivate() throws {
         let browser = BrowserModel.makePrivate(downloads: DownloadManager())
         let opener = try XCTUnwrap(browser.activeTab)
+        opener.restore()
         let configuration = try XCTUnwrap(opener.webView?.configuration)
 
         let popUp = browser.openChildTab(of: opener, configuration: configuration, select: false)
         XCTAssertTrue(popUp.webView?.configuration.websiteDataStore === browser.websiteDataStore)
 
         browser.restoreSession(WindowSession(tabs: [
-            TabSession(url: URL(string: "data:text/html,<title>A</title>")!, title: "A", interactionState: nil),
-            TabSession(url: URL(string: "data:text/html,<title>B</title>")!, title: "B", interactionState: nil),
+            TabSession(url: URL(string: "http://127.0.0.1:9/private-a")!, title: "A", interactionState: nil),
+            TabSession(url: URL(string: "http://127.0.0.1:9/private-b")!, title: "B", interactionState: nil),
         ], selectedIndex: 0))
         browser.selectTab(at: 1)
 

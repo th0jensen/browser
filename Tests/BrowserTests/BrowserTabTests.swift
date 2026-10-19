@@ -90,6 +90,7 @@ final class BrowserTabTests: XCTestCase {
         weak var closedWebView: WKWebView?
         autoreleasepool {
             browser.addTab()
+            browser.activeTab?.restore()
             closedTab = browser.activeTab
             closedWebView = browser.activeTab?.webView
             browser.closeActiveTab()

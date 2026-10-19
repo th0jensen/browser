@@ -197,6 +197,7 @@ final class NativeToolbarCommandTests: XCTestCase {
             XCTAssertEqual(reloadButton.imagePosition, mode == .labelOnly ? .noImage : (mode == .iconAndLabel ? .imageAbove : .imageOnly))
         }
         browser.activeTab?.isNewTab = false
+        browser.activeTab?.restore()
         browser.activeTab?.webView?.loadHTMLString("<title>Toolbar State</title><p>Loaded</p>", baseURL: URL(string: "https://example.invalid"))
         try await waitUntil { reloadButton.isEnabled }
         XCTAssertTrue(reloadItem.view === reloadButton)

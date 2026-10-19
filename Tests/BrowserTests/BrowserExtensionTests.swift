@@ -270,6 +270,7 @@ final class BrowserExtensionTests: XCTestCase {
         let item = try XCTUnwrap(store.installed.first)
         let browser = BrowserModel()
         store.register(browser)
+        browser.activeTab?.restore()
         let existing = try XCTUnwrap(browser.activeTab?.webView)
         await store.setEnabled(item, true)
         XCTAssertNil(store.errors[item.id])
@@ -334,6 +335,7 @@ final class BrowserExtensionTests: XCTestCase {
 
         // Also covers registering an already-created page after rule restoration.
         let browser = BrowserModel()
+        browser.activeTab?.restore()
         restored.register(browser)
         defer { restored.unregister(browser) }
         try await assertDisplay("none", in: XCTUnwrap(browser.activeTab?.webView))
@@ -402,6 +404,7 @@ final class BrowserExtensionTests: XCTestCase {
         browser.addTab()
         let verifier = try XCTUnwrap(browser.activeTab)
         verifier.isNewTab = false
+        verifier.restore()
         let webView = try XCTUnwrap(verifier.webView)
         webView.loadHTMLString("<html><body>Verification fixture</body></html>", baseURL: URL(string: "https://example.com/")!)
         var reply: String?

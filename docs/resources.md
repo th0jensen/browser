@@ -32,7 +32,12 @@ evidence. Keep these external results separate from the host-only 30-second
 table: their process scopes and observation windows differ. Run external
 sampling outside the latency phases.
 
-Latency metrics use 30 measured operations after three discarded warmups:
+The `twenty_blank_tabs_allocation` metric times one synchronous batch of 20 extra
+empty tabs, with no warmups; it excludes rendering and focus. Its adjacent idle
+record reports the number of retained web views. Treat that batch as a single
+observation, rather than a latency distribution.
+
+The remaining latency metrics use 30 measured operations after three discarded warmups:
 
 | Metric | Completion measured |
 |---|---|

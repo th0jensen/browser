@@ -223,6 +223,7 @@ final class PasswordTests: XCTestCase {
         let browser = BrowserModel(websiteDataStore: .default(), passwords: passwords)
         let tab = try XCTUnwrap(browser.activeTab)
         tab.isNewTab = false
+        tab.restore()
         tab.suspend()
         tab.restore()
         XCTAssertTrue(try XCTUnwrap(tab.webView).configuration.userContentController.userScripts.contains {
