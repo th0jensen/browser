@@ -101,7 +101,14 @@ final class ContentBlockingTests: XCTestCase {
         await blocker.prepare()
 
         XCTAssertTrue(blocker.isReady, blocker.lastError ?? "Rules never became ready")
+        XCTAssertTrue(blocker.isPreparedForNavigation)
         XCTAssertEqual(controller.identifiers, ["ExtensionRules", "Trackers"])
+        let additions = controller.additions
+        blocker.attach(controller)
+        blocker.setEnabled(true)
+        await blocker.prepare()
+        XCTAssertEqual(controller.additions, additions, "Repeated attachment must not reinstall the current list")
+        XCTAssertTrue(controller.removals.isEmpty)
         blocker.setEnabled(false)
         XCTAssertEqual(controller.identifiers, ["ExtensionRules"])
         blocker.setEnabled(true)
@@ -138,6 +145,7 @@ final class ContentBlockingTests: XCTestCase {
         })
         blocker.attach(controller)
         try await gate.waitUntil { gate.requests == 1 }
+        XCTAssertFalse(blocker.isPreparedForNavigation)
         var prepared = false
         let preparation = Task {
             await blocker.prepare()
@@ -150,6 +158,7 @@ final class ContentBlockingTests: XCTestCase {
         try await gate.waitUntil { gate.requests == 2 }
         XCTAssertTrue(controller.additions.isEmpty, "The initial rules were superseded while compiling")
         XCTAssertFalse(prepared, "Navigation must wait for the current exceptions")
+        XCTAssertFalse(blocker.isPreparedForNavigation)
 
         let secondChange = Task { await blocker.setBlocking(false, on: "second.example") }
         try await gate.waitUntil { blocker.exceptions.contains("second.example") }
@@ -164,6 +173,7 @@ final class ContentBlockingTests: XCTestCase {
 
         XCTAssertTrue(prepared)
         XCTAssertTrue(blocker.isReady)
+        XCTAssertTrue(blocker.isPreparedForNavigation)
         XCTAssertFalse(blocker.isUpdating)
         XCTAssertNil(blocker.lastError)
         XCTAssertEqual(controller.additions, ["Trackers"])
@@ -185,6 +195,7 @@ final class ContentBlockingTests: XCTestCase {
         await blocker.prepare()
         XCTAssertEqual(attempts, 1)
         XCTAssertFalse(blocker.isReady)
+        XCTAssertFalse(blocker.isPreparedForNavigation)
         XCTAssertFalse(blocker.isUpdating)
         XCTAssertTrue(blocker.lastError?.contains("Controlled compilation failure") == true)
         await blocker.prepare()
@@ -202,6 +213,7 @@ private final class RecordingRuleController: WKUserContentController {
     private(set) var identifiers: Set<String> = []
     private(set) var removeAllCalls = 0
     private(set) var additions: [String] = []
+    private(set) var removals: [String] = []
 
     override func add(_ contentRuleList: WKContentRuleList) {
         additions.append(contentRuleList.identifier)
@@ -210,6 +222,7 @@ private final class RecordingRuleController: WKUserContentController {
     }
 
     override func remove(_ contentRuleList: WKContentRuleList) {
+        removals.append(contentRuleList.identifier)
         identifiers.remove(contentRuleList.identifier)
         super.remove(contentRuleList)
     }

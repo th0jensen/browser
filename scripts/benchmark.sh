@@ -3,11 +3,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Run baseline and candidate serially with this exact harness and the same display.
-# Use just benchmark baseline [core|full|reveal]. Results stay in ignored DerivedData.
+# Use just benchmark baseline [core|full|reveal|google]. Results stay in ignored DerivedData.
 label="${1:-candidate}"
 derived="$PWD/DerivedData"
 mode="${2:-core}"
-case "$mode" in core|full|reveal) ;; *) echo "Expected mode core, full, or reveal" >&2; exit 1 ;; esac
+case "$mode" in core|full|reveal|google) ;; *) echo "Expected mode core, full, reveal, or google" >&2; exit 1 ;; esac
 run="$derived/Benchmarks/Benchmark-$(date -u +%Y%m%d-%H%M%S)-$(uuidgen)"
 results="$run/Results.xcresult"
 mkdir -p "$run"

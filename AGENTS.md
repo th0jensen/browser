@@ -19,7 +19,7 @@ Launch ongoing QA with `--qa-profile` only. Avoid `-compactToolbar`, `-tabLayout
 
 Include this trailer on commits made with this assistant, recording the model name:
 
-Co-authored-by: Codex (GPT-6) <noreply@openai.com>
+Co-authored-by: Codex (GPT-6.1 Sol) <noreply@openai.com>
 
 Keep benchmark measurements and before/after results in the task thread, not PR descriptions or committed reports.
 

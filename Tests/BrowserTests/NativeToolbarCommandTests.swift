@@ -100,6 +100,44 @@ final class NativeToolbarCommandTests: XCTestCase {
         XCTAssertTrue(item.view === canonical, "Teardown must release commands and restore the canonical view")
     }
 
+    func testStagedCommandsKeepLatestActionsAndRepairRecreatedHosts() throws {
+        let delegate = CommandTestToolbarDelegate()
+        let toolbar = NSToolbar(identifier: "StagedCommandsTest")
+        toolbar.delegate = delegate
+        toolbar.insertItem(withItemIdentifier: .init("newTab"), at: 0)
+        let window = NSWindow(contentRect: .init(x: 0, y: 0, width: 700, height: 400),
+                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.toolbar = toolbar
+        let chrome = WindowChromeView()
+        window.contentView = chrome
+        defer { window.close() }
+        let item = try XCTUnwrap(toolbar.items.first)
+        let canonical = item.view
+        var action = 0
+        chrome.setNativeCommands([.init(identifier: "newTab", title: "New Tab", symbol: "plus", action: { action = 1 })],
+                                 applyImmediately: false)
+        XCTAssertTrue(item.view === canonical)
+        chrome.update(layout: .horizontal, tabs: AnyView(EmptyView()))
+        let button = try XCTUnwrap(item.view as? NativeToolbarCommandButton)
+        button.performClick(nil)
+        XCTAssertEqual(action, 1)
+
+        chrome.setNativeCommands([.init(identifier: "newTab", title: "New Tab", symbol: "plus", action: { action = 2 })],
+                                 applyImmediately: false)
+        chrome.update(layout: .horizontal, tabs: AnyView(EmptyView()))
+        XCTAssertTrue(item.view === button)
+        button.performClick(nil)
+        XCTAssertEqual(action, 2, "A new action must replace the old one even when visible metadata is unchanged")
+
+        let replacement = NSView(frame: .init(x: 0, y: 0, width: 24, height: 24))
+        item.view = replacement
+        chrome.refresh()
+        XCTAssertTrue(item.view === button, "An unchanged command must still repair a recreated SwiftUI host")
+        chrome.detachNativeCommands()
+        XCTAssertTrue(item.view === replacement, "Teardown must restore the newest canonical host")
+    }
+
     func testToolbarContextMenuRoutingPreservesPageHistoryAndTextEditing() async throws {
         let suite = "ToolbarContextMenu-\(UUID())"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))

@@ -72,6 +72,40 @@ a substitute. Manifest-backed comparisons also reject differing harness hashes.
 For legacy exports without manifests, selection uses the newest run's JSON
 timestamps; ambiguous ties require a single run directory or JSON file.
 
+## Live Google workload
+
+`just benchmark LABEL google` uses live `https://www.google.com` pages instead of
+blank tabs and the local color fixture. First it loads one Google tab and measures
+30 seconds of resources. It then opens **20 additional Google tabs sequentially**,
+waiting for each main-frame load plus two animation frames while selected and
+visible, and measures a second 30-second resource window with all **21 live pages**.
+The one batch load duration is a single observation, not a latency distribution.
+Extra tabs close after the resource window. Layout, warm tab attachment and native/DOM
+resize timings then run on actual loaded Google pages using the same native probes.
+
+`warm_google_navigation` measures ten same-URL Google navigations after three
+warmups. `new_google_tab_ready` replaces the blank-tab address-focus metric with ten
+new Google tabs reaching load plus two animation frames after three warmups. Tab
+creation, native attachment, page hooks and network activity are included; closing
+each sample tab is outside its timed interval. Other latency counts stay at 30
+measured operations after three warmups.
+
+A test-only main-frame user script in an isolated content world supplies load and
+resize acknowledgements without replacing production delegates or scripts. A
+navigation error, timeout, challenge/error page, missing live WebKit view or unready
+page fails the run; no local content is substituted. Raw JSON records each
+navigation's final URL, title, document status and HTTP response status when WebKit
+exposes Navigation Timing `responseStatus` (`null` means unavailable). Resource
+records include the final page inventory. Consent and regional Google variants
+remain visible in this evidence; inspect them before comparing runs.
+
+Use this exact harness and mode for both revisions. Network, DNS/TLS, server load,
+redirects, Google content/consent, bot challenges and shared ephemeral session/cache
+warmth affect the results. Runs use the isolated nonpersistent store, not the
+user's Google login/profile. Resource windows include Google's ongoing work; they
+are not static-page idle measurements. The built-in-display, fully visible native
+window guards and process-scope limitations remain the same as the local workload.
+
 ## Bundle size
 
 After both Release builds finish:

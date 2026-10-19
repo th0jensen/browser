@@ -53,6 +53,20 @@ final class BrowserModel: NSObject {
             if activeTab?.isNewTab != true { activeTab?.restore() }
             restoreVisibleSplit()
             activeTab?.didBecomeSelected()
+            // A plain loaded page already has a native host. Attach its replacement
+            // now so toolbar and tab-strip updates cannot delay showing the page.
+            // Structural changes and overlays stay with SwiftUI's normal update.
+            if let previous = tab(withID: oldValue), let selected = activeTab,
+               previous.webView != nil, selected.webView != nil,
+               !previous.isNewTab, !selected.isNewTab,
+               previous.loadError == nil, selected.loadError == nil,
+               !previous.isFindBarVisible, !selected.isFindBarVisible,
+               split(containing: previous.id) == nil, activeSplit == nil,
+               let host = previous.contentView.superview as? PageHostView,
+               let window, host.window === window,
+               selected.contentView.window == nil || selected.contentView.window === window {
+                host.show(selected.contentView)
+            }
             let representedTab = tab(withID: activeSplit?.anchorID) ?? activeTab
             if let pageID = representedTab?.folderPageID { changeFolders { try folders.reveal(pageID) } }
             if let section = representedTab?.temporarySection, !section.isExpanded { setTemporarySectionExpanded(section.id, expanded: true) }

@@ -13,6 +13,8 @@ final class ToolbarLayoutPersistence {
     private var applying = false
     private var pendingWrite: Data?
     private var lastReadData: Data?
+    private var encodedIdentifiers: [String]?
+    private var encodedData: Data?
 
     func update(toolbar: NSToolbar, binding: Binding<Data>?) {
         guard let binding, !applying else { return }
@@ -77,7 +79,11 @@ final class ToolbarLayoutPersistence {
     }
 
     private func write(_ layout: Layout) {
-        guard let data = try? JSONEncoder().encode(layout), binding?.wrappedValue != data, pendingWrite != data else { return }
+        if encodedIdentifiers != layout.identifiers {
+            encodedData = try? JSONEncoder().encode(layout)
+            encodedIdentifiers = encodedData == nil ? nil : layout.identifiers
+        }
+        guard let data = encodedData, binding?.wrappedValue != data, pendingWrite != data else { return }
         pendingWrite = data
         let expectedToolbar = toolbar
         DispatchQueue.main.async { [weak self] in

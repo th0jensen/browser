@@ -14,9 +14,10 @@ parser.add_argument("--log", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--duration", type=float, default=10)
 parser.add_argument("--timeout", type=float, default=400)
+parser.add_argument("--workload", choices=["core", "google"], default="core")
 args = parser.parse_args()
 args.output.mkdir(parents=True, exist_ok=True)
-expected = {"new_tab", "static_color_page", "twenty_blank_tabs"}
+expected = {"one_google_tab", "twenty_one_google_tabs"} if args.workload == "google" else {"new_tab", "static_color_page", "twenty_blank_tabs"}
 captured = {}
 directory = None
 offset = 0

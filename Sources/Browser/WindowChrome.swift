@@ -91,7 +91,7 @@ struct WindowChromeConfigurator: NSViewRepresentable {
         view.toolbarContextMenu = toolbarContextMenu
         view.savedToolbarConfiguration = savedToolbarConfiguration
         view.insetRevealedToolbar = insetRevealedToolbar
-        view.setNativeCommands(nativeCommands, displayMode: toolbarDisplayMode)
+        view.setNativeCommands(nativeCommands, displayMode: toolbarDisplayMode, applyImmediately: false)
         hoverController?.nativeToolbarPresenter = view
         view.update(layout: tabLayout, tabs: horizontalTabs, compactToolbar: compactToolbar,
                     toolbarIsRevealed: hoverController?.toolbarIsRevealed ?? toolbarIsRevealed)
@@ -136,6 +136,8 @@ final class WindowChromeView: NSView {
     private var controlObservers: [NSObjectProtocol] = []
     private var observedControlViews: [ObjectIdentifier] = []
     private var nativeCommands: [String: NativeToolbarCommand] = [:]
+    private var nativeCommandsRevision: UInt64 = 0
+    private var appliedNativeCommandsRevision: UInt64?
     private var toolbarDisplayMode: NSToolbar.DisplayMode?
     private var nativeAdapters: [ObjectIdentifier: NativeToolbarCommandAdapter] = [:]
     var toolbarContextMenu: (@MainActor () -> NSMenu)?
@@ -152,10 +154,14 @@ final class WindowChromeView: NSView {
 
     func refresh() { updateWindowState() }
 
-    func setNativeCommands(_ commands: [NativeToolbarCommand], displayMode: NSToolbar.DisplayMode? = nil) {
+    func setNativeCommands(_ commands: [NativeToolbarCommand], displayMode: NSToolbar.DisplayMode? = nil,
+                           applyImmediately: Bool = true) {
         toolbarDisplayMode = displayMode
         nativeCommands = Dictionary(commands.map { ($0.identifier, $0) }, uniquingKeysWith: { _, new in new })
-        applyNativeCommands()
+        nativeCommandsRevision &+= 1
+        // The representable configures the window next; apply there after any native
+        // toolbar changes. Direct callers still receive an immediate command update.
+        if applyImmediately { applyNativeCommands() }
     }
 
     func detachNativeCommands() {
@@ -182,6 +188,7 @@ final class WindowChromeView: NSView {
 
     private func applyNativeCommands() {
         let items = window?.toolbar?.items ?? []
+        let commandsChanged = appliedNativeCommandsRevision != nativeCommandsRevision
         let current = Set(items.filter { nativeCommands[$0.itemIdentifier.rawValue] != nil }.map(ObjectIdentifier.init))
         for key in Array(nativeAdapters.keys) where !current.contains(key) {
             nativeAdapters.removeValue(forKey: key)?.restore()
@@ -190,10 +197,18 @@ final class WindowChromeView: NSView {
             guard let command = nativeCommands[item.itemIdentifier.rawValue] else { continue }
             let key = ObjectIdentifier(item)
             let mode = toolbarDisplayMode ?? window?.toolbar?.displayMode ?? .iconOnly
-            if let adapter = nativeAdapters[key] { adapter.update(command, displayMode: mode) }
+            if let adapter = nativeAdapters[key] {
+                // AppKit update/resize notifications may follow the synchronous
+                // configuration pass. Repair a replacement SwiftUI host, but avoid
+                // reapplying every command when its native button is already current.
+                if commandsChanged || item.view !== adapter.button || adapter.button.displayMode != mode {
+                    adapter.update(command, displayMode: mode)
+                }
+            }
             else { nativeAdapters[key] = NativeToolbarCommandAdapter(item: item, command: command, displayMode: mode) }
             nativeAdapters[key]?.button.visibilityToolbar = window?.toolbar
         }
+        appliedNativeCommandsRevision = nativeCommandsRevision
     }
 
     /// The native pointer callback can reveal existing toolbar views immediately,

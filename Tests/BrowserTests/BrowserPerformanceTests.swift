@@ -14,6 +14,12 @@ final class BrowserPerformanceTests: XCTestCase {
     private let warmups = 3
     private let repetitions = 30
     private var metrics: [[String: Any]] = []
+    private var navigationRecords: [[String: Any]] = []
+    private var googleTokens: [UUID: String] = [:]
+    private var finalPages: [[String: Any]] = []
+    private var usesGoogle: Bool { ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "google" }
+    private static let googleURL = URL(string: "https://www.google.com")!
+    private static let googleWorld = WKContentWorld.world(name: "BrowserPerformanceGoogle")
     private var resourceWindows: [[String: Any]] = []
     private var windowInventoryBeforeClosure: [[String: Any]] = []
     private var closedHostWindowCount = 0
@@ -85,52 +91,89 @@ final class BrowserPerformanceTests: XCTestCase {
             print("BENCHMARK_WINDOW_PROTOCOL=floating/allSpaces/fullScreenAuxiliary level=\(window.level.rawValue) occlusion=\(window.occlusionState.rawValue) visible=\(window.occlusionState.contains(.visible)) key=\(window.isKeyWindow) appActive=\(NSApp.isActive) activationPolicy=\(NSApp.activationPolicy().rawValue) appRunning=\(NSApp.isRunning) onActiveSpace=\(window.isOnActiveSpace) windowNumber=\(window.windowNumber)")
             window.toolbar?.autosavesConfiguration = false
             window.makeFirstResponder(nil) // Stop the editor caret during idle windows.
+            let bridge = PerformanceScriptBridge()
             if ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "reveal" {
                 let tab = try XCTUnwrap(browser.activeTab)
-                let bridge = PerformanceScriptBridge()
                 try await prepare(tab, bridge: bridge, window: window, browser: browser)
                 try await loadFixture(tab, bridge: bridge, token: UUID().uuidString)
                 try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
                 try writeResults(status: "complete")
                 return
             }
-            resourceWindows.append(try await idleResources(name: "new_tab", seconds: 30))
-            try writeResults(status: "running")
+            if usesGoogle {
+                let baseline = try XCTUnwrap(browser.activeTab)
+                try await prepare(baseline, bridge: bridge, window: window, browser: browser)
+                try await loadGoogle(baseline, bridge: bridge, phase: "one_google_tab")
+                window.makeFirstResponder(nil)
+                var baselineResources = try await idleResources(name: "one_google_tab", seconds: 30)
+                baselineResources["pages"] = try await googlePages(browser.tabs)
+                baselineResources["tab_count"] = browser.tabs.count
+                baselineResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
+                resourceWindows.append(baselineResources)
+                try writeResults(status: "running")
 
-            let blankIDsBefore = Set(browser.tabs.map(\.id))
-            let allocationStart = Self.now()
-            for _ in 0..<20 { browser.addTab(focusAddress: false) }
-            appendMetric("twenty_blank_tabs_allocation", definition:
-                "Synchronous model allocation and selection of twenty blank tabs; native focus and rendering excluded.",
-                samples: [(Self.now() - allocationStart) * 1000])
-            metrics[metrics.count - 1]["warmups_discarded"] = 0
-            var blankResources = try await idleResources(name: "twenty_blank_tabs", seconds: 30)
-            blankResources["tab_count"] = browser.tabs.count
-            blankResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
-            resourceWindows.append(blankResources)
-            try writeResults(status: "running")
-            for id in browser.tabs.map(\.id) where !blankIDsBefore.contains(id) { browser.closeTab(id) }
+                let idsBefore = Set(browser.tabs.map(\.id))
+                let start = Self.now()
+                for index in 1...20 {
+                    browser.addTab(focusAddress: false)
+                    let tab = try XCTUnwrap(browser.activeTab)
+                    try await prepare(tab, bridge: bridge, window: window, browser: browser)
+                    try await loadGoogle(tab, bridge: bridge, phase: "additional_google_tab_\(index)")
+                }
+                appendMetric("twenty_google_tabs_loaded", definition:
+                    "Sequential creation, native attachment and https://www.google.com navigation of twenty additional tabs, each reaching main-frame load plus two animation frames before the next starts. Includes network, redirects and production page hooks; one batch observation.",
+                    samples: [(Self.now() - start) * 1000], warmupsDiscarded: 0)
+                // Every tab was loaded while selected and visible; retain all 21 during this resource window.
+                _ = try await googlePages(browser.tabs)
+                window.makeFirstResponder(nil)
+                var loadedResources = try await idleResources(name: "twenty_one_google_tabs", seconds: 30)
+                loadedResources["pages"] = try await googlePages(browser.tabs)
+                loadedResources["tab_count"] = browser.tabs.count
+                loadedResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
+                resourceWindows.append(loadedResources)
+                try writeResults(status: "running")
+                for id in browser.tabs.map(\.id) where !idsBefore.contains(id) { browser.closeTab(id) }
+            } else {
+                resourceWindows.append(try await idleResources(name: "new_tab", seconds: 30))
+                try writeResults(status: "running")
+
+                let blankIDsBefore = Set(browser.tabs.map(\.id))
+                let allocationStart = Self.now()
+                for _ in 0..<20 { browser.addTab(focusAddress: false) }
+                appendMetric("twenty_blank_tabs_allocation", definition:
+                    "Synchronous model allocation and selection of twenty blank tabs; native focus and rendering excluded.",
+                    samples: [(Self.now() - allocationStart) * 1000])
+                metrics[metrics.count - 1]["warmups_discarded"] = 0
+                var blankResources = try await idleResources(name: "twenty_blank_tabs", seconds: 30)
+                blankResources["tab_count"] = browser.tabs.count
+                blankResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
+                resourceWindows.append(blankResources)
+                try writeResults(status: "running")
+                for id in browser.tabs.map(\.id) where !blankIDsBefore.contains(id) { browser.closeTab(id) }
+            }
 
             print("BENCHMARK_PHASE=prepare_first")
             let first = try XCTUnwrap(browser.activeTab)
-            let bridge = PerformanceScriptBridge()
             try await prepare(first, bridge: bridge, window: window, browser: browser)
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
             window.setContentSize(NSSize(width: 1100, height: 760))
             print("BENCHMARK_PHASE=load_first windowVisible=\(window.isVisible) occlusion=\(window.occlusionState.rawValue) appHidden=\(NSApp.isHidden) appActive=\(NSApp.isActive) frame=\(window.frame) webHidden=\(first.webView?.isHiddenOrHasHiddenAncestor == true)")
-            try await loadFixture(first, bridge: bridge, token: UUID().uuidString)
+            try await loadPage(first, bridge: bridge, phase: "first_page")
             print("BENCHMARK_PHASE=static_idle")
             try await settle(window: window, browser: browser)
             window.makeFirstResponder(nil)
-            resourceWindows.append(try await idleResources(name: "static_color_page", seconds: 30))
-            try writeResults(status: "running")
-            try await saveScreenshot(webView: XCTUnwrap(first.webView), name: "colorful-horizontal-page")
+            if !usesGoogle {
+                resourceWindows.append(try await idleResources(name: "static_color_page", seconds: 30))
+                try writeResults(status: "running")
+            }
+            try await saveScreenshot(webView: XCTUnwrap(first.webView), name: usesGoogle ? "google-horizontal-page" : "colorful-horizontal-page")
 
-            try await sample("local_html_load", definition:
-                "Host monotonic time from WKWebView.loadHTMLString to script-message delivery after window load and two requestAnimationFrame callbacks; warm WebKit process; local embedded HTML; no network.") {
+            try await sample(usesGoogle ? "warm_google_navigation" : "local_html_load", definition: usesGoogle
+                ? "Host monotonic time from BrowserTab.load(https://www.google.com) to test-only isolated-world main-frame window load plus two requestAnimationFrame callbacks. Warm WebKit process and shared ephemeral session/cache; includes DNS/TLS/network/redirect/server variability. No local fallback."
+                : "Host monotonic time from WKWebView.loadHTMLString to script-message delivery after window load and two requestAnimationFrame callbacks; warm WebKit process; local embedded HTML; no network.", measuredCount: usesGoogle ? 10 : repetitions) {
                 let start = Self.now()
-                let end = try await self.loadFixture(first, bridge: bridge, token: UUID().uuidString)
+                let end = try await self.loadPage(first, bridge: bridge, phase: "warm_navigation")
                 return end - start
             }
 
@@ -147,14 +190,14 @@ final class BrowserPerformanceTests: XCTestCase {
             }
             browser.chromePreferences.tabLayout = .vertical
             try await settle(window: window, browser: browser) { Self.layoutInstalled(.vertical, in: window) }
-            try await saveScreenshot(webView: XCTUnwrap(first.webView), name: "colorful-vertical-page")
+            try await saveScreenshot(webView: XCTUnwrap(first.webView), name: usesGoogle ? "google-vertical-page" : "colorful-vertical-page")
             browser.chromePreferences.tabLayout = .horizontal
             try await settle(window: window, browser: browser) { Self.layoutInstalled(.horizontal, in: window) }
 
             browser.addTab(focusAddress: false)
             let second = try XCTUnwrap(browser.activeTab)
             try await prepare(second, bridge: bridge, window: window, browser: browser)
-            try await loadFixture(second, bridge: bridge, token: UUID().uuidString)
+            try await loadPage(second, bridge: bridge, phase: "second_page")
             try await settle(window: window, browser: browser)
             let probes = [first.id: PerformanceAttachmentProbe(), second.id: PerformanceAttachmentProbe()]
             for tab in [first, second] {
@@ -179,31 +222,45 @@ final class BrowserPerformanceTests: XCTestCase {
                 return end - start
             }
 
-            try await sample("new_tab_address_focus", definition:
-                "BrowserModel.addTab to the first CFRunLoopObserver.beforeWaiting event observing the new tab selected, a newer address-focus request, and native AddressField.currentEditor identical to window.firstResponder. Previous editing ended before the operation. No simulated input or timed polling; closes each new tab outside the measured interval.") {
-                window.makeFirstResponder(nil)
-                let previousField = try XCTUnwrap(Self.addressField(in: window))
-                guard previousField.currentEditor() == nil else {
-                    throw PerformanceFailure.system("Previous address editing did not end before the new-tab sample")
+            if usesGoogle {
+                try await sample("new_google_tab_ready", definition:
+                    "BrowserModel.addTab(focusAddress: false) through native attachment, Google navigation and main-frame load plus two animation frames. Includes WebKit allocation, network and production hooks; three warmups and ten measured opens, each closed outside the timed interval. No blank-tab focus sample in Google mode.", measuredCount: 10) {
+                    window.makeFirstResponder(nil)
+                    let start = Self.now()
+                    browser.addTab(focusAddress: false)
+                    let tab = try XCTUnwrap(browser.activeTab)
+                    defer { browser.closeTab(tab.id) }
+                    try await self.prepare(tab, bridge: bridge, window: window, browser: browser)
+                    let end = try await self.loadGoogle(tab, bridge: bridge, phase: "new_google_tab_ready")
+                    return end - start
                 }
-                let previousID = browser.activeTabID
-                let previousRequest = browser.addressFocusRequest
-                var created: UUID?
-                let monitor = PerformanceRunLoopMonitor {
-                    guard let created, created != previousID, browser.activeTabID == created,
-                          browser.activeTab?.isNewTab == true, browser.addressFocusRequest > previousRequest,
-                          let field = Self.addressField(in: window), field.window === window,
-                          let editor = field.currentEditor() else { return false }
-                    return window.firstResponder === editor
+            } else {
+                try await sample("new_tab_address_focus", definition:
+                    "BrowserModel.addTab to the first CFRunLoopObserver.beforeWaiting event observing the new tab selected, a newer address-focus request, and native AddressField.currentEditor identical to window.firstResponder. Previous editing ended before the operation. No simulated input or timed polling; closes each new tab outside the measured interval.") {
+                    window.makeFirstResponder(nil)
+                    let previousField = try XCTUnwrap(Self.addressField(in: window))
+                    guard previousField.currentEditor() == nil else {
+                        throw PerformanceFailure.system("Previous address editing did not end before the new-tab sample")
+                    }
+                    let previousID = browser.activeTabID
+                    let previousRequest = browser.addressFocusRequest
+                    var created: UUID?
+                    let monitor = PerformanceRunLoopMonitor {
+                        guard let created, created != previousID, browser.activeTabID == created,
+                              browser.activeTab?.isNewTab == true, browser.addressFocusRequest > previousRequest,
+                              let field = Self.addressField(in: window), field.window === window,
+                              let editor = field.currentEditor() else { return false }
+                        return window.firstResponder === editor
+                    }
+                    defer { monitor.stop() }
+                    let start = Self.now()
+                    browser.addTab()
+                    created = try XCTUnwrap(browser.activeTabID)
+                    let end = try await monitor.event.wait()
+                    browser.closeTab(try XCTUnwrap(created))
+                    try await self.settle(window: window, browser: browser)
+                    return end - start
                 }
-                defer { monitor.stop() }
-                let start = Self.now()
-                browser.addTab()
-                created = try XCTUnwrap(browser.activeTabID)
-                let end = try await monitor.event.wait()
-                browser.closeTab(try XCTUnwrap(created))
-                try await self.settle(window: window, browser: browser)
-                return end - start
             }
 
             browser.activeTabID = first.id
@@ -215,7 +272,11 @@ final class BrowserPerformanceTests: XCTestCase {
             try await sample("resize_dom_ack", definition:
                 "NSWindow.setContentSize to script-message delivery after DOM resize plus two requestAnimationFrame callbacks, with CSS viewport matching current native WKWebView bounds to within 1 pt. Alternates 1000x700 and 1180x780 content sizes; includes IPC and frame quantization.") {
                 let token = UUID().uuidString
-                _ = try await webView.evaluateJavaScript("window.__resizeToken = '\(token)'")
+                if self.usesGoogle {
+                    _ = try await webView.evaluateJavaScript("window.__resizeToken = '\(token)'", contentWorld: Self.googleWorld)
+                } else {
+                    _ = try await webView.evaluateJavaScript("window.__resizeToken = '\(token)'")
+                }
                 let nativeEvent = PerformanceEvent()
                 let domEvent = PerformanceEvent()
                 bridge.callbacks[token] = { body in
@@ -245,6 +306,7 @@ final class BrowserPerformanceTests: XCTestCase {
             if ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "full" {
                 try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
             }
+            if usesGoogle { finalPages = try await googlePages(browser.tabs) }
             try writeResults(status: "complete")
         } catch {
             try? writeResults(status: "failed: \(error)")
@@ -257,7 +319,16 @@ final class BrowserPerformanceTests: XCTestCase {
         tab.restore()
         let webView = try XCTUnwrap(tab.webView)
         XCTAssertFalse(webView.configuration.websiteDataStore.isPersistent)
-        webView.configuration.userContentController.add(bridge, name: "browserBenchmark")
+        if usesGoogle, googleTokens[tab.id] == nil {
+            let token = UUID().uuidString
+            googleTokens[tab.id] = token
+            webView.configuration.userContentController.add(bridge, contentWorld: Self.googleWorld, name: "browserBenchmark")
+            webView.configuration.userContentController.addUserScript(WKUserScript(
+                source: Self.googleScript.replacingOccurrences(of: "__BENCHMARK_TOKEN__", with: token),
+                injectionTime: .atDocumentStart, forMainFrameOnly: true, in: Self.googleWorld))
+        } else if !usesGoogle {
+            webView.configuration.userContentController.add(bridge, name: "browserBenchmark")
+        }
         try await settle(window: window, browser: browser) { tab.contentView.window === window && webView.bounds.width > 0 }
     }
 
@@ -286,8 +357,117 @@ final class BrowserPerformanceTests: XCTestCase {
         return end
     }
 
+    @discardableResult
+    private func loadPage(_ tab: BrowserTab, bridge: PerformanceScriptBridge, phase: String) async throws -> Double {
+        if usesGoogle { return try await loadGoogle(tab, bridge: bridge, phase: phase) }
+        return try await loadFixture(tab, bridge: bridge, token: UUID().uuidString)
+    }
+
+    @discardableResult
+    private func loadGoogle(_ tab: BrowserTab, bridge: PerformanceScriptBridge, phase: String) async throws -> Double {
+        try requireVisiblePlacement()
+        let webView = try XCTUnwrap(tab.webView)
+        let token = try XCTUnwrap(googleTokens[tab.id])
+        guard let window = webView.window, window.occlusionState.contains(.visible),
+              !webView.isHiddenOrHasHiddenAncestor, webView.bounds.width > 0, webView.bounds.height > 0 else {
+            throw PerformanceFailure.system("Google navigation requires a visible attached WebKit page; no hidden-page or local fallback")
+        }
+        let event = PerformanceEvent()
+        bridge.callbacks[token] = { body in
+            if body["kind"] as? String == "ready" { event.finish() }
+        }
+        // Observe production error state without replacing the production navigation delegate.
+        let errors = PerformanceRunLoopMonitor {
+            guard let error = tab.loadError else { return false }
+            event.fail(PerformanceFailure.system("Google navigation failed: \(error)"))
+            return true
+        }
+        defer { bridge.callbacks[token] = nil; errors.stop() }
+        let start = Self.now()
+        tab.load(Self.googleURL)
+        do {
+            let end = try await event.wait(timeout: 45)
+            let completed = PerformanceRunLoopMonitor { !webView.isLoading || tab.loadError != nil }
+            defer { completed.stop() }
+            _ = try await completed.event.wait()
+            var page = try await googlePage(tab)
+            page["phase"] = phase
+            page["requested_url"] = Self.googleURL.absoluteString
+            page["load_to_ready_ms"] = (end - start) * 1000
+            navigationRecords.append(page)
+            return end
+        } catch {
+            navigationRecords.append(["phase": phase, "requested_url": Self.googleURL.absoluteString,
+                                      "final_url": webView.url?.absoluteString ?? "none", "title": webView.title ?? "",
+                                      "status": "failed", "error": String(describing: error),
+                                      "production_load_error": String(describing: tab.loadError), "is_loading": webView.isLoading])
+            throw error
+        }
+    }
+
+    private func googlePages(_ tabs: [BrowserTab]) async throws -> [[String: Any]] {
+        var pages: [[String: Any]] = []
+        for tab in tabs { pages.append(try await googlePage(tab)) }
+        return pages
+    }
+
+    private func googlePage(_ tab: BrowserTab) async throws -> [String: Any] {
+        let webView = try XCTUnwrap(tab.webView, "Loaded Google resource workload must retain every live WebKit page")
+        let result = try await webView.evaluateJavaScript(Self.googlePageEvidence, contentWorld: Self.googleWorld)
+        var page = try XCTUnwrap(result as? [String: Any])
+        page["tab_id"] = tab.id.uuidString
+        page["native_url"] = webView.url?.absoluteString ?? "none"
+        page["native_title"] = webView.title ?? ""
+        page["is_loading"] = webView.isLoading
+        guard tab.loadError == nil, !webView.isLoading,
+              let urlString = page["final_url"] as? String, let url = URL(string: urlString),
+              url.scheme == "https", let host = url.host?.lowercased(),
+              host == "google.com" || host.hasSuffix(".google.com"),
+              page["ready"] as? Bool == true, page["document_state"] as? String == "complete",
+              let title = page["title"] as? String, !title.isEmpty,
+              let bodyLength = page["body_text_length"] as? Int, bodyLength > 0,
+              !url.path.hasPrefix("/sorry"), !title.lowercased().contains("unusual traffic"),
+              (page["http_status"] as? Int ?? 200) < 400 else {
+            throw PerformanceFailure.system("Google page not ready or challenge/error response: \(page); production error: \(String(describing: tab.loadError))")
+        }
+        page["status"] = "loaded_main_frame_plus_two_animation_frames"
+        return page
+    }
+
+    // Isolated test world avoids page globals and leaves all production scripts/delegates intact.
+    private static let googleScript = #"""
+(() => {
+  const token = "__BENCHMARK_TOKEN__";
+  const acknowledge = kind => requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (kind === "ready") window.__benchmarkReady = true;
+    window.webkit.messageHandlers.browserBenchmark.postMessage({
+      kind, token: kind === "resize" ? window.__resizeToken : token,
+      width: innerWidth, height: innerHeight
+    });
+  }));
+  addEventListener("load", () => acknowledge("ready"), { once: true });
+  addEventListener("resize", () => acknowledge("resize"));
+})();
+"""#
+
+    private static let googlePageEvidence = #"""
+(() => {
+  const navigation = performance.getEntriesByType("navigation")[0];
+  const status = navigation?.responseStatus;
+  return {
+    final_url: location.href, title: document.title, document_state: document.readyState,
+    ready: window.__benchmarkReady === true, visibility: document.visibilityState,
+    body_text_length: document.body?.innerText?.length || 0,
+    http_status: typeof status === "number" && status > 0 ? status : null,
+    http_status_note: "Navigation Timing responseStatus when exposed by WebKit; null means unavailable, not success.",
+    navigation_type: navigation?.type || "unknown", redirect_count: navigation?.redirectCount ?? null
+  };
+})();
+"""#
+
     private func requireVisiblePlacement() throws {
-        guard let window = benchmarkWindow, let screen = window.screen,
+        guard let window = benchmarkWindow, window.isVisible, !window.isMiniaturized,
+              window.occlusionState.contains(.visible), let screen = window.screen,
               let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
               CGDisplayIsBuiltin(number.uint32Value) != 0,
               screen.visibleFrame.insetBy(dx: -1, dy: -1).contains(window.frame) else {
@@ -295,10 +475,10 @@ final class BrowserPerformanceTests: XCTestCase {
         }
     }
 
-    private func sample(_ name: String, definition: String, operation: () async throws -> Double) async throws {
+    private func sample(_ name: String, definition: String, measuredCount: Int? = nil, operation: () async throws -> Double) async throws {
         print("BENCHMARK_PHASE=\(name)")
         var values: [Double] = []
-        for index in 0..<(warmups + repetitions) {
+        for index in 0..<(warmups + (measuredCount ?? repetitions)) {
             try requireVisiblePlacement()
             let seconds = try await operation()
             try requireVisiblePlacement()
@@ -308,10 +488,10 @@ final class BrowserPerformanceTests: XCTestCase {
         try writeResults(status: "running")
     }
 
-    private func appendMetric(_ name: String, definition: String, samples: [Double]) {
+    private func appendMetric(_ name: String, definition: String, samples: [Double], warmupsDiscarded: Int? = nil) {
         let sorted = samples.sorted()
         metrics.append(["name": name, "definition": definition, "unit": "ms", "samples": samples,
-                        "count": samples.count, "warmups_discarded": warmups,
+                        "count": samples.count, "warmups_discarded": warmupsDiscarded ?? warmups,
                         "median": (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2,
                         "p90": sorted[Int(ceil(Double(sorted.count) * 0.9)) - 1]])
     }
@@ -570,6 +750,8 @@ final class BrowserPerformanceTests: XCTestCase {
             "application_active": NSApp.isActive,
             "quantiles": "Median averages two middle values for even N; p90 uses nearest rank ceil(0.90*N).",
             "metrics": metrics, "resource_windows": resourceWindows,
+            "page_navigations": navigationRecords, "final_pages": finalPages,
+            "workload": usesGoogle ? "Live https://www.google.com; one loaded baseline then twenty additional sequentially loaded tabs. Ten measured network navigations and ten new Google tabs after three discarded warmups each; all other latency counts unchanged. Ephemeral shared store, no persistent user profile, no local fallback. Network/cache/consent/regional content/bot challenges may differ between runs; inspect actual URLs/titles/statuses before comparison." : "Deterministic embedded local fixture and blank tabs",
             "output_directory": outputDirectory.path,
             "limitations": ["Window created inside the application XCTest host, not full app startup.",
                             "App-only CPU/RSS include XCTest; other normal application host windows were closed. WebKit content/network/GPU processes are excluded.",
@@ -641,19 +823,27 @@ final class BrowserPerformanceTests: XCTestCase {
 @MainActor private final class PerformanceEvent {
     private var timestamp: Double?
     private var continuation: CheckedContinuation<Double, Error>?
+    private var failure: Error?
+    func fail(_ error: Error) {
+        guard timestamp == nil, failure == nil else { return }
+        failure = error
+        continuation?.resume(throwing: error)
+        continuation = nil
+    }
     func finish() {
-        guard timestamp == nil else { return }
+        guard timestamp == nil, failure == nil else { return }
         let time = ProcessInfo.processInfo.systemUptime
         timestamp = time
         continuation?.resume(returning: time)
         continuation = nil
     }
-    func wait() async throws -> Double {
+    func wait(timeout: Double = 15) async throws -> Double {
+        if let failure { throw failure }
         if let timestamp { return timestamp }
         return try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(15))
+                try? await Task.sleep(for: .seconds(timeout))
                 guard let self, let pending = self.continuation else { return }
                 self.continuation = nil
                 pending.resume(throwing: PerformanceFailure.timeout)
@@ -665,7 +855,7 @@ final class BrowserPerformanceTests: XCTestCase {
 @MainActor private final class PerformanceScriptBridge: NSObject, WKScriptMessageHandler {
     var callbacks: [String: ([String: Any]) -> Void] = [:]
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any], let token = body["token"] as? String else { return }
+        guard message.frameInfo.isMainFrame, let body = message.body as? [String: Any], let token = body["token"] as? String else { return }
         callbacks[token]?(body)
     }
 }

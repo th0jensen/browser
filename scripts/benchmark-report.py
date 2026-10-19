@@ -143,22 +143,28 @@ def report(baseline, candidate):
         raise SystemExit("Baseline and candidate harness hashes differ; comparison requires an identical harness.")
     left = {m["name"]: m for m in baseline.get("metrics", [])}
     right = {m["name"]: m for m in candidate.get("metrics", [])}
-    print("\n| Latency (ms) | Baseline median | Candidate median | Baseline p90 | Candidate p90 | Median change |")
-    print("|---|---:|---:|---:|---:|---:|")
+    print("\n| Metric | Baseline | Final | Change (%) |")
+    print("|---|---:|---:|---:|")
+    def row(name, a, b, unit):
+        delta = ((b / a) - 1) * 100 if a and b is not None else None
+        change = "—" if delta is None else f"{delta:+.1f}%"
+        print(f"| {name} | {number(a)} {unit} | {number(b)} {unit} | {change} |")
     for name in dict.fromkeys([*left, *right]):
         a, b = left.get(name, {}), right.get(name, {})
-        delta = ((b["median"] / a["median"]) - 1) * 100 if a.get("median") and b.get("median") is not None else None
-        change = "—" if delta is None else f"{delta:+.1f}%"
-        print(f"| {name} | {number(a.get('median'))} | {number(b.get('median'))} | {number(a.get('p90'))} | {number(b.get('p90'))} | {change} |")
-    print("\n| Host-only idle state | Baseline CPU % (one core) | Candidate CPU % (one core) | Baseline RSS after (MiB) | Candidate RSS after (MiB) |")
-    print("|---|---:|---:|---:|---:|")
+        row(name, a.get("median"), b.get("median"), "ms")
     left = {m["name"]: m for m in baseline.get("resource_windows", [])}
     right = {m["name"]: m for m in candidate.get("resource_windows", [])}
     for name in dict.fromkeys([*left, *right]):
         a, b = left.get(name, {}), right.get(name, {})
+        row(f"Host idle CPU: {name}", a.get("cpu_percent_one_core"), b.get("cpu_percent_one_core"), "% of one core")
         rss_a, rss_b = a.get("rss_after_bytes"), b.get("rss_after_bytes")
-        print(f"| {name} | {number(a.get('cpu_percent_one_core'))} | {number(b.get('cpu_percent_one_core'))} | {number(rss_a / 2**20 if rss_a is not None else None)} | {number(rss_b / 2**20 if rss_b is not None else None)} |")
-    print("\nCPU/RSS above include the application XCTest host; other normal host windows were closed before measurement. WebKit subprocesses are excluded. Host idle results use one 30-second window per state after 1 second quiet; RSS values are endpoints, not peaks. External host-plus-registered-WebKit-service cohort samples, when collected, use a separate 10-second window within each idle phase and are not included in this table. Latency distributions use 30 samples after 3 discarded warmups; twenty_blank_tabs_allocation is one synchronous batch with no warmups. Native frame, view attachment, run-loop focus, and DOM/rAF acknowledgements have distinct completion definitions; none proves final display presentation. See raw JSON for actual durations, window/screen inventories, precise definitions, and limitations.")
+        row(f"Host idle RSS: {name}", rss_a / 2**20 if rss_a is not None else None,
+            rss_b / 2**20 if rss_b is not None else None, "MiB")
+    print("\nLatency rows show medians; inspect raw JSON for counts, warmups, p90 and individual samples. "
+          "Twenty-tab batches are single observations. CPU/RSS include the application XCTest host, "
+          "exclude WebKit subprocesses and use one 30-second resource window per state. RSS endpoints are not peaks. "
+          "Live Google navigation includes network/cache/server variability. Native frame, attachment and DOM/rAF "
+          "acknowledgements have different completion definitions; none proves final display presentation.")
 
 
 def main():
