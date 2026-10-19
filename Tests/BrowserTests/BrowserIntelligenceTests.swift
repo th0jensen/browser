@@ -378,11 +378,11 @@ extension BrowserIntelligenceTests {
         var activations = 0
         var fallbacks: [URL] = []
         let pending = PreviewNoteActions.openPage(destination, from: source, activateApplication: {
-            XCTAssertFalse(source.isLoading)
+            XCTAssertEqual(source.url, destination)
             activations += 1
         }, openElsewhere: { fallbacks.append($0) })
-        XCTAssertEqual(activations, 0)
-        XCTAssertEqual(window.frontRequests, 0)
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(window.frontRequests, 1)
         await pending?.value
         XCTAssertEqual(source.url, destination)
         XCTAssertEqual(browser.activeTabID, source.id)
@@ -406,10 +406,10 @@ extension BrowserIntelligenceTests {
         let destination = URL(string: "data:text/html,<title>PeekDestination</title>")!
         var activations = 0
         let pending = PreviewNoteActions.openPage(destination, from: source, activateApplication: {
-            XCTAssertFalse(source.isLoading)
+            XCTAssertEqual(source.url, destination)
             activations += 1
         }, openElsewhere: { _ in XCTFail("A live peek remains a valid destination") })
-        XCTAssertEqual(activations, 0)
+        XCTAssertEqual(activations, 1)
         await pending?.value
         XCTAssertTrue(browser.peek?.tab === source)
         XCTAssertEqual(browser.activeTabID, opener.id)
@@ -432,7 +432,7 @@ extension BrowserIntelligenceTests {
         XCTAssertNotEqual(browser.activeTabID, source.id)
     }
 
-    func testOpenPreviewWaitsForDestinationLoadBeforeActivatingBrowser() async throws {
+    func testOpenPreviewStartsNavigationAndActivatesBeforeDestinationFinishes() async throws {
         let handler = PreviewDelayedSchemeHandler()
         let configuration = BrowserTab.makeConfiguration(includingExtensions: false)
         configuration.setURLSchemeHandler(handler, forURLScheme: "preview-load")
@@ -445,19 +445,22 @@ extension BrowserIntelligenceTests {
         browser.window = window
         defer { source.stopLoading(); window.close() }
         var activations = 0
-        let pending = PreviewNoteActions.openPage(URL(string: "preview-load://fixture/destination")!, from: source,
+        let destination = URL(string: "preview-load://fixture/destination")!
+        let pending = PreviewNoteActions.openPage(destination, from: source,
             activateApplication: {
-                XCTAssertFalse(source.isLoading)
+                XCTAssertEqual(source.url, destination)
+                XCTAssertTrue(source.webView?.isLoading == true)
                 activations += 1
             }, openElsewhere: { _ in XCTFail("The source is live") })
         try await waitUntil { handler.pending != nil }
         XCTAssertTrue(source.isLoading)
-        XCTAssertEqual(activations, 0)
-        XCTAssertEqual(window.frontRequests, 0)
-        XCTAssertEqual(window.restoreRequests, 0)
-        handler.finish()
         await pending?.value
-        XCTAssertFalse(source.isLoading)
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(window.frontRequests, 1)
+        XCTAssertEqual(window.restoreRequests, 1)
+        XCTAssertTrue(window.requestedResponder === source.webView)
+        handler.finish()
+        try await waitUntil { !source.isLoading }
         XCTAssertEqual(activations, 1)
         XCTAssertEqual(window.frontRequests, 1)
         XCTAssertEqual(window.restoreRequests, 1)
