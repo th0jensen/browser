@@ -2,12 +2,23 @@ import Darwin
 import Foundation
 import Synchronization
 
-/// A store's file, encoded and written on a serial background queue. Publication checks
-/// the write generation, so a newer snapshot cannot be replaced by an older queued write.
+/// A store's file, encoded and written on a serial background queue. Pending writes are
+/// coalesced so obsolete snapshots do not wait in memory or replace newer state.
 final class StoreFile: Sendable {
+    private struct WriteRequest: Sendable {
+        let generation: Int
+        let encode: @Sendable () -> Data?
+    }
+
+    private struct WriteState: Sendable {
+        var generation = 0
+        var workerScheduled = false
+        var pending: WriteRequest?
+    }
+
     let url: URL
     private let queue = DispatchQueue(label: "dev.athas.browser.store-file", qos: .utility)
-    private let latestWrite = Mutex(0)
+    private let writes = Mutex(WriteState())
     private let persistedData = Mutex<Data?>(nil)
 
     init(url: URL) {
@@ -31,30 +42,49 @@ final class StoreFile: Sendable {
     }
 
     func write(_ encode: @escaping @Sendable () -> Data?) {
-        let generation = nextWrite()
-        queue.async { [self] in
-            guard latestWrite.withLock({ $0 == generation }), let data = encode() else { return }
-            save(data, generation: generation)
+        let shouldSchedule = writes.withLock { state in
+            state.generation += 1
+            state.pending = WriteRequest(generation: state.generation, encode: encode)
+            guard !state.workerScheduled else { return false }
+            state.workerScheduled = true
+            return true
         }
+        guard shouldSchedule else { return }
+        queue.async { [self] in drainWrites() }
     }
 
     /// Drains the writer before returning, including when the app is quitting.
     func writeNow(_ data: Data?) {
-        let generation = nextWrite()
+        let generation = writes.withLock { state in
+            state.generation += 1
+            state.pending = nil
+            return state.generation
+        }
         queue.sync {
             if let data { save(data, generation: generation) }
         }
     }
 
-    private func nextWrite() -> Int {
-        latestWrite.withLock { latest in
-            latest += 1
-            return latest
+    private func drainWrites() {
+        while let request = takePendingWrite() {
+            guard let data = request.encode() else { continue }
+            save(data, generation: request.generation)
+        }
+    }
+
+    private func takePendingWrite() -> WriteRequest? {
+        writes.withLock { state in
+            guard let pending = state.pending else {
+                state.workerScheduled = false
+                return nil
+            }
+            state.pending = nil
+            return pending
         }
     }
 
     private func save(_ data: Data, generation: Int) {
-        guard latestWrite.withLock({ $0 == generation }), persistedData.withLock({ $0 != data }) else { return }
+        guard writes.withLock({ $0.generation == generation }), persistedData.withLock({ $0 != data }) else { return }
         do {
             let directory = url.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -72,8 +102,8 @@ final class StoreFile: Sendable {
             try handle.close()
             // Encoding and fsync stay outside the lock; only the atomic publication
             // must be indivisible with a newer write request.
-            let published = try latestWrite.withLock { current in
-                guard current == generation else { return false }
+            let published = try writes.withLock { state in
+                guard state.generation == generation else { return false }
                 guard Darwin.rename(temporary.path, url.path) == 0 else { throw posixError() }
                 return true
             }
