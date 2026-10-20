@@ -29,7 +29,8 @@ struct FaviconCandidate: Equatable, Sendable {
         let href = href.trimmingCharacters(in: .whitespacesAndNewlines)
         guard rels.contains("icon") || isTouchIcon, !href.isEmpty,
               let url = URL(string: href, relativeTo: baseURL)?.absoluteURL,
-              ["http", "https", "data"].contains(url.scheme?.lowercased() ?? ""),
+              let scheme = url.scheme?.lowercased(), ["http", "https", "data"].contains(scheme),
+              url.absoluteString.utf8.count <= (scheme == "data" ? FaviconData.maxDataURLCharacters : FaviconData.maxURLCharacters),
               type.lowercased() != "image/svg+xml", url.pathExtension.lowercased() != "svg",
               !url.absoluteString.lowercased().hasPrefix("data:image/svg") else { return nil }
         let sizeTokens = sizes.lowercased().split(whereSeparator: \.isWhitespace)
@@ -183,11 +184,23 @@ enum FaviconStore {
     static var cache = FaviconCache(directory: BrowserProfile.isTesting || BrowserProfile.qaDirectory != nil
         ? BrowserProfile.directory.appending(path: "Favicons")
         : URL.cachesDirectory.appending(path: BrowserProfile.bundleIdentifier).appending(path: "Favicons"))
+    static let maximumPageCandidates = 32
+    static let maximumPageCandidateElements = 256
+    static let maximumPageLinkElements = 512
+    static let maximumMemoryIcons = 120
+    static let maximumMemoryIconCost = 8 * 1024 * 1024
+    static let maximumMissingHosts = 256
+    static let maximumFailedSources = 512
+
     private static var icons: [String: Icon] = [:]
+    private static var iconCosts: [String: Int] = [:]
+    private static var iconRecency: [String: Int] = [:]
+    private static var totalIconCost = 0
+    private static var recency = 0
     private static var requests: [String: Task<Icon?, Never>] = [:]
     /// When a host's icon couldn't be found, so a slow network doesn't leave it without one for long.
     private static var missingHosts: [String: ContinuousClock.Instant] = [:]
-    private static var failedSources: Set<URL> = []
+    private static var failedSourceKeys: Set<UInt64> = []
     private static var generation = 0
     private static var clearTask: Task<Void, Never>?
 
@@ -205,8 +218,12 @@ enum FaviconStore {
         requests = [:]
         cache.invalidatePendingWrites()
         icons = [:]
+        iconCosts = [:]
+        iconRecency = [:]
+        totalIconCost = 0
+        recency = 0
         missingHosts = [:]
-        failedSources = []
+        failedSourceKeys = []
         let currentGeneration = generation
         let previousClear = clearTask
         let requestCache = cache
@@ -225,7 +242,21 @@ enum FaviconStore {
     }
 
     static func cachedIcon(for url: URL?) -> Image? {
-        url?.host().flatMap { icons[$0]?.image }
+        guard let host = url?.host(), let icon = icons[host] else { return nil }
+        touch(host)
+        return icon.image
+    }
+
+    struct MemoryUsage: Equatable {
+        let icons: Int
+        let iconCost: Int
+        let missingHosts: Int
+        let failedSources: Int
+    }
+
+    static var memoryUsage: MemoryUsage {
+        MemoryUsage(icons: icons.count, iconCost: totalIconCost,
+                    missingHosts: missingHosts.count, failedSources: failedSourceKeys.count)
     }
 
     /// An icon for a site that isn't open: the cached one or its conventional `/favicon.ico`.
@@ -237,7 +268,10 @@ enum FaviconStore {
         }
         await clearTask?.value
         guard !Task.isCancelled else { return nil }
-        if let icon = icons[host] { return icon.image }
+        if let icon = icons[host] {
+            touch(host)
+            return icon.image
+        }
         if let missing = missingHosts[host], ContinuousClock.now - missing < .seconds(300) { return nil }
 
         let currentGeneration = generation
@@ -246,7 +280,7 @@ enum FaviconStore {
             await loadSiteIcon(for: url, host: host, in: requestCache)
         }
         guard currentGeneration == generation, !Task.isCancelled else { return nil }
-        missingHosts[host] = icon == nil ? .now : nil
+        rememberMissingHost(host, at: icon == nil ? .now : nil)
         return icon?.image
     }
 
@@ -262,8 +296,7 @@ enum FaviconStore {
     /// A private window's icons aren't kept, in memory or on disk.
     static func icon(forPage url: URL, candidates: [FaviconCandidate], remember: Bool = true) async -> Image? {
         guard let host = url.host() else { return nil }
-        let sources = FaviconCandidate.ranked(candidates, pageURL: url)
-            .filter { !remember || !failedSources.contains($0) }.prefix(4)
+        let sources = rankedSources(candidates, pageURL: url, remember: remember)
         guard let best = sources.first else { return nil }
         guard remember else {
             for source in sources {
@@ -274,7 +307,10 @@ enum FaviconStore {
 
         await clearTask?.value
         guard !Task.isCancelled else { return nil }
-        if let icon = icons[host], icon.source == best { return icon.image }
+        if let icon = icons[host], icon.source == best {
+            touch(host)
+            return icon.image
+        }
         let currentGeneration = generation
         let requestCache = cache
         let icon = await deduplicated(best.absoluteString, host: host) {
@@ -283,21 +319,59 @@ enum FaviconStore {
                 guard !Task.isCancelled, currentGeneration == generation else { return nil }
                 if let icon = await download(source, forHost: host, into: requestCache) { return icon }
                 guard !Task.isCancelled, currentGeneration == generation else { return nil }
-                failedSources.insert(source)
+                rememberFailedSource(source)
             }
             return nil
         }
         guard currentGeneration == generation, !Task.isCancelled else { return nil }
-        if icon != nil { missingHosts[host] = nil }
+        if icon != nil { rememberMissingHost(host, at: nil) }
         return icon?.image
+    }
+
+    private static func rankedSources(_ candidates: [FaviconCandidate], pageURL: URL,
+                                      remember: Bool) -> ArraySlice<URL> {
+        FaviconCandidate.ranked(candidates, pageURL: pageURL)
+            .filter { !remember || !failedSourceKeys.contains(failureKey(for: $0)) }
+            .prefix(4)
     }
 
     /// Reads the icon links of the page a web view shows, in a content world the page's scripts can't reach.
     static func candidates(in webView: WKWebView) async -> [FaviconCandidate] {
         let script = """
-            Array.from(document.querySelectorAll('link[rel][href]'), link => ({
-                rel: link.rel, href: link.href, sizes: link.getAttribute('sizes') || '', type: link.type
-            }))
+            (() => {
+              const candidates = [];
+              let scanned = 0, examined = 0, order = 0;
+              for (const link of document.getElementsByTagName('link')) {
+                if (++scanned > \(maximumPageLinkElements)) break;
+                if (!link.hasAttribute('href')) continue;
+                const rel = new Set(link.rel.toLowerCase().split(/\\s+/));
+                const touch = rel.has('apple-touch-icon') || rel.has('apple-touch-icon-precomposed');
+                if (!rel.has('icon') && !touch) continue;
+                if (++examined > \(maximumPageCandidateElements)) break;
+                const href = link.href;
+                if (href.length > (href.startsWith('data:')
+                    ? \(FaviconData.maxDataURLCharacters) : \(FaviconData.maxURLCharacters))) continue;
+                const type = link.type.slice(0, 128).toLowerCase();
+                if (type === 'image/svg+xml' || href.toLowerCase().startsWith('data:image/svg')) continue;
+                const sizeText = (link.getAttribute('sizes') || '').slice(0, 256).toLowerCase();
+                const sizes = sizeText.split(/\\s+/).map(value => parseInt(value, 10)).filter(Number.isFinite);
+                const usable = sizes.filter(value => value >= 32).sort((a, b) => Math.abs(a - 64) - Math.abs(b - 64));
+                let tier, distance;
+                if (touch) [tier, distance] = [4, Math.abs((sizes.length ? Math.max(...sizes) : 180) - 64)];
+                else if (usable.length) [tier, distance] = [0, Math.abs(usable[0] - 64)];
+                else if (sizeText.split(/\\s+/).includes('any')) [tier, distance] = [1, 0];
+                else if (!sizes.length) [tier, distance] = [2, 0];
+                else [tier, distance] = [3, -Math.max(...sizes)];
+                candidates.push({
+                  rel: link.rel.slice(0, 128), href, sizes: sizeText, type,
+                  __tier: tier, __distance: distance, __order: order++
+                });
+              }
+              candidates.sort((a, b) => a.__tier - b.__tier
+                || a.__distance - b.__distance || a.__order - b.__order);
+              return candidates.slice(0, \(maximumPageCandidates))
+                .map(({__tier, __distance, __order, ...value}) => value);
+            })()
             """
         guard let pageURL = webView.url,
               let links = try? await webView.evaluateJavaScript(script, contentWorld: .defaultClient) as? [[String: String]]
@@ -318,8 +392,50 @@ enum FaviconStore {
         let icon = await request.value
         guard generation == currentGeneration, !request.isCancelled else { return nil }
         requests[key] = nil
-        if let icon { icons[host] = icon }
+        if let icon { store(icon, forHost: host) }
         return icon
+    }
+
+    private static func touch(_ host: String) {
+        recency += 1
+        iconRecency[host] = recency
+    }
+
+    private static func store(_ icon: Icon, forHost host: String) {
+        if let previous = iconCosts[host] { totalIconCost -= previous }
+        let cost = FaviconData.maxPixelSize * FaviconData.maxPixelSize * 4
+            + icon.source.absoluteString.utf8.count
+        icons[host] = icon
+        iconCosts[host] = cost
+        totalIconCost += cost
+        touch(host)
+        while icons.count > maximumMemoryIcons || totalIconCost > maximumMemoryIconCost {
+            guard let victim = iconRecency.min(by: { $0.value < $1.value })?.key else { break }
+            icons[victim] = nil
+            totalIconCost -= iconCosts.removeValue(forKey: victim) ?? 0
+            iconRecency[victim] = nil
+        }
+    }
+
+    private static func rememberMissingHost(_ host: String, at instant: ContinuousClock.Instant?) {
+        missingHosts[host] = instant
+        while missingHosts.count > maximumMissingHosts,
+              let oldest = missingHosts.min(by: { $0.value < $1.value })?.key {
+            missingHosts[oldest] = nil
+        }
+    }
+
+    private static func rememberFailedSource(_ source: URL) {
+        failedSourceKeys.insert(failureKey(for: source))
+        while failedSourceKeys.count > maximumFailedSources, let victim = failedSourceKeys.first {
+            failedSourceKeys.remove(victim)
+        }
+    }
+
+    private static func failureKey(for source: URL) -> UInt64 {
+        source.absoluteString.utf8.reduce(14_695_981_039_346_656_037) { hash, byte in
+            (hash ^ UInt64(byte)) &* 1_099_511_628_211
+        }
     }
 
     @concurrent
@@ -364,6 +480,8 @@ enum FaviconStore {
 /// outside WebKit's sandbox, so only small files in a few raster formats are accepted.
 enum FaviconData {
     static let maxIconBytes = 512 * 1024
+    static let maxDataURLCharacters = 128 * 1024
+    static let maxURLCharacters = 2 * 1024
     /// Icons show at 14–32 pt, so larger images are scaled down as they're decoded.
     static let maxPixelSize = 128
 
