@@ -1,3 +1,5 @@
+// Benchmark definitions are intentionally verbose and kept together for identical cross-cohort provenance.
+// swiftlint:disable file_length type_body_length function_body_length cyclomatic_complexity line_length
 import AppKit
 import CoreFoundation
 import Darwin
@@ -11,14 +13,15 @@ import XCTest
 /// Keep this entire file and colorful.html identical in the baseline and candidate.
 @MainActor
 final class BrowserPerformanceTests: XCTestCase {
-    private let warmups = 3
-    private let repetitions = 30
+    private let warmups = 2
+    private let repetitions = 20
     private var metrics: [[String: Any]] = []
     private var navigationRecords: [[String: Any]] = []
     private var googleTokens: [UUID: String] = [:]
     private var finalPages: [[String: Any]] = []
+    private var forcedDarkEvidence: [String: Any] = [:]
     private var usesGoogle: Bool { ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "google" }
-    private static let googleURL = URL(string: "https://www.google.com")!
+    private static let googleURL = URL(string: "https://www.google.com/search?q=webkit+browser+performance&hl=en&num=10&pws=0")!
     private static let googleWorld = WKContentWorld.world(name: "BrowserPerformanceGoogle")
     private var resourceWindows: [[String: Any]] = []
     private var windowInventoryBeforeClosure: [[String: Any]] = []
@@ -43,6 +46,7 @@ final class BrowserPerformanceTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.set(TabLayout.horizontal.rawValue, forKey: TabLayout.storageKey)
         defaults.set(false, forKey: SidebarVisibility.autoHideKey)
+        forcedDarkEvidence = try await enableForcedDark()
         let browser = BrowserModel(sitePermissions: SitePermissions(), chromePreferences: WindowChromePreferences(defaults: defaults))
         let screen = try XCTUnwrap(NSScreen.screens.first { screen in
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return false }
@@ -103,9 +107,9 @@ final class BrowserPerformanceTests: XCTestCase {
             if usesGoogle {
                 let baseline = try XCTUnwrap(browser.activeTab)
                 try await prepare(baseline, bridge: bridge, window: window, browser: browser)
-                try await loadGoogle(baseline, bridge: bridge, phase: "one_google_tab")
+                try await loadGoogle(baseline, bridge: bridge, phase: "one_google_search_results")
                 window.makeFirstResponder(nil)
-                var baselineResources = try await idleResources(name: "one_google_tab", seconds: 30)
+                var baselineResources = try await idleResources(name: "one_google_search_results", seconds: 30)
                 baselineResources["pages"] = try await googlePages(browser.tabs)
                 baselineResources["tab_count"] = browser.tabs.count
                 baselineResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
@@ -114,19 +118,19 @@ final class BrowserPerformanceTests: XCTestCase {
 
                 let idsBefore = Set(browser.tabs.map(\.id))
                 let start = Self.now()
-                for index in 1...20 {
+                for index in 1...5 {
                     browser.addTab(focusAddress: false)
                     let tab = try XCTUnwrap(browser.activeTab)
                     try await prepare(tab, bridge: bridge, window: window, browser: browser)
                     try await loadGoogle(tab, bridge: bridge, phase: "additional_google_tab_\(index)")
                 }
-                appendMetric("twenty_google_tabs_loaded", definition:
-                    "Sequential creation, native attachment and https://www.google.com navigation of twenty additional tabs, each reaching main-frame load plus two animation frames before the next starts. Includes network, redirects and production page hooks; one batch observation.",
+                appendMetric("five_google_search_tabs_loaded", definition:
+                    "Sequential creation, native attachment and live Google search-results navigation of five additional tabs, each reaching main-frame load, Forced Dark completion and two animation frames before the next starts. Includes network, redirects and production page hooks; one batch observation.",
                     samples: [(Self.now() - start) * 1000], warmupsDiscarded: 0)
                 // Every tab was loaded while selected and visible; retain all 21 during this resource window.
                 _ = try await googlePages(browser.tabs)
                 window.makeFirstResponder(nil)
-                var loadedResources = try await idleResources(name: "twenty_one_google_tabs", seconds: 30)
+                var loadedResources = try await idleResources(name: "six_google_search_result_tabs", seconds: 30)
                 loadedResources["pages"] = try await googlePages(browser.tabs)
                 loadedResources["tab_count"] = browser.tabs.count
                 loadedResources["live_webview_count"] = browser.tabs.filter { $0.webView != nil }.count
@@ -170,8 +174,8 @@ final class BrowserPerformanceTests: XCTestCase {
             try await saveScreenshot(webView: XCTUnwrap(first.webView), name: usesGoogle ? "google-horizontal-page" : "colorful-horizontal-page")
 
             try await sample(usesGoogle ? "warm_google_navigation" : "local_html_load", definition: usesGoogle
-                ? "Host monotonic time from BrowserTab.load(https://www.google.com) to test-only isolated-world main-frame window load plus two requestAnimationFrame callbacks. Warm WebKit process and shared ephemeral session/cache; includes DNS/TLS/network/redirect/server variability. No local fallback."
-                : "Host monotonic time from WKWebView.loadHTMLString to script-message delivery after window load and two requestAnimationFrame callbacks; warm WebKit process; local embedded HTML; no network.", measuredCount: usesGoogle ? 10 : repetitions) {
+                ? "Host monotonic time from BrowserTab.load(live Google search results) to main-frame window load, Forced Dark completion and two requestAnimationFrame callbacks. Warm WebKit process and shared ephemeral session/cache; includes DNS/TLS/network/redirect/server variability. No local fallback."
+                : "Host monotonic time from WKWebView.loadHTMLString to script-message delivery after window load and two requestAnimationFrame callbacks; warm WebKit process; local embedded HTML; no network.", measuredCount: usesGoogle ? 5 : repetitions) {
                 let start = Self.now()
                 let end = try await self.loadPage(first, bridge: bridge, phase: "warm_navigation")
                 return end - start
@@ -224,7 +228,7 @@ final class BrowserPerformanceTests: XCTestCase {
 
             if usesGoogle {
                 try await sample("new_google_tab_ready", definition:
-                    "BrowserModel.addTab(focusAddress: false) through native attachment, Google navigation and main-frame load plus two animation frames. Includes WebKit allocation, network and production hooks; three warmups and ten measured opens, each closed outside the timed interval. No blank-tab focus sample in Google mode.", measuredCount: 10) {
+                    "BrowserModel.addTab(focusAddress: false) through native attachment, live Google search-results navigation, Forced Dark completion and two animation frames. Includes WebKit allocation, network and production hooks; two warmups and five measured opens, each closed outside the timed interval. No blank-tab focus sample in Google mode.", measuredCount: 5) {
                     window.makeFirstResponder(nil)
                     let start = Self.now()
                     browser.addTab(focusAddress: false)
@@ -306,12 +310,47 @@ final class BrowserPerformanceTests: XCTestCase {
             if ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "full" {
                 try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
             }
-            if usesGoogle { finalPages = try await googlePages(browser.tabs) }
+            if usesGoogle {
+                finalPages = try await googlePages(browser.tabs)
+                let postLoadSample: ([String: Any]) -> Double? = {
+                    ($0["ready_timing_ms"] as? [String: Any])?["after_load"] as? Double
+                }
+                let postLoadSamples = navigationRecords.compactMap(postLoadSample)
+                appendMetric("google_post_load_ready", definition:
+                    "In-page Navigation Timing from loadEventEnd to Forced Dark readiness plus two animation frames. Excludes DNS, TLS, response transfer, server latency and native navigation dispatch; includes page/extension completion work and frame scheduling.",
+                    samples: postLoadSamples, warmupsDiscarded: 0)
+                let batchPostLoad = navigationRecords.filter {
+                    ($0["phase"] as? String)?.hasPrefix("additional_google_tab_") == true
+                }.compactMap(postLoadSample)
+                appendMetric("five_google_tabs_post_load_total", definition:
+                    "Sum of loadEventEnd-to-ready completion for five retained Google tabs in five_google_search_tabs_loaded. Network/server/transfer time and native tab setup excluded.",
+                    samples: [batchPostLoad.reduce(0, +)], warmupsDiscarded: 0)
+            }
             try writeResults(status: "complete")
         } catch {
             try? writeResults(status: "failed: \(error)")
             throw error
         }
+    }
+
+    private func enableForcedDark() async throws -> [String: Any] {
+        let resourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: "Extensions/ForcedDark", directoryHint: .isDirectory)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: resourceURL.appending(path: "manifest.json").path))
+        let extensions = BrowserExtensions.shared
+        if !extensions.installed.contains(where: { $0.name == "Forced Dark" }) {
+            try await extensions.importResources(from: resourceURL)
+        }
+        let item = try XCTUnwrap(extensions.installed.first(where: { $0.name == "Forced Dark" }))
+        try await extensions.load(item, askPermission: false)
+        let context = try XCTUnwrap(extensions.context(for: item))
+        XCTAssertTrue(context.isLoaded)
+        return ["name": item.name, "context_loaded": context.isLoaded,
+                "requested_permissions": context.webExtension.requestedPermissions.map(\.rawValue).sorted(),
+                "requested_match_patterns": context.webExtension.allRequestedMatchPatterns.map(\.string).sorted()]
     }
 
     private func prepare(_ tab: BrowserTab, bridge: PerformanceScriptBridge, window: NSWindow, browser: BrowserModel) async throws {
@@ -425,7 +464,9 @@ final class BrowserPerformanceTests: XCTestCase {
               host == "google.com" || host.hasSuffix(".google.com"),
               page["ready"] as? Bool == true, page["document_state"] as? String == "complete",
               let title = page["title"] as? String, !title.isEmpty,
-              let bodyLength = page["body_text_length"] as? Int, bodyLength > 0,
+              let bodyLength = page["body_text_length"] as? Int, bodyLength > 500,
+              let resultLinks = page["result_link_count"] as? Int, resultLinks >= 10,
+              page["forced_dark_ready"] as? Bool == true, url.path == "/search",
               !url.path.hasPrefix("/sorry"), !title.lowercased().contains("unusual traffic"),
               (page["http_status"] as? Int ?? 200) < 400 else {
             throw PerformanceFailure.system("Google page not ready or challenge/error response: \(page); production error: \(String(describing: tab.loadError))")
@@ -439,13 +480,28 @@ final class BrowserPerformanceTests: XCTestCase {
 (() => {
   const token = "__BENCHMARK_TOKEN__";
   const acknowledge = kind => requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (kind === "ready") window.__benchmarkReady = true;
+    if (kind === "ready") {
+      window.__benchmarkReady = true;
+      const navigation = performance.getEntriesByType("navigation")[0];
+      const pageReady = performance.now();
+      window.__benchmarkReadyTiming = {
+        page_ready: pageReady,
+        after_load: navigation?.loadEventEnd > 0 ? pageReady - navigation.loadEventEnd : null
+      };
+    }
     window.webkit.messageHandlers.browserBenchmark.postMessage({
       kind, token: kind === "resize" ? window.__resizeToken : token,
       width: innerWidth, height: innerHeight
     });
   }));
-  addEventListener("load", () => acknowledge("ready"), { once: true });
+  const acknowledgeReady = () => {
+    if (!document.documentElement.hasAttribute("data-browser-forced-dark-ready")) {
+      requestAnimationFrame(acknowledgeReady);
+      return;
+    }
+    acknowledge("ready");
+  };
+  addEventListener("load", acknowledgeReady, { once: true });
   addEventListener("resize", () => acknowledge("resize"));
 })();
 """#
@@ -458,6 +514,20 @@ final class BrowserPerformanceTests: XCTestCase {
     final_url: location.href, title: document.title, document_state: document.readyState,
     ready: window.__benchmarkReady === true, visibility: document.visibilityState,
     body_text_length: document.body?.innerText?.length || 0,
+    result_link_count: document.querySelectorAll("a[href]").length,
+    forced_dark_ready: document.documentElement.hasAttribute("data-browser-forced-dark-ready"),
+    forced_dark_transformed_nodes: document.querySelectorAll("[data-browser-forced-dark]").length,
+    ready_timing_ms: window.__benchmarkReadyTiming || null,
+    navigation_timing_ms: navigation ? {
+      dns: navigation.domainLookupEnd - navigation.domainLookupStart,
+      connect: navigation.connectEnd - navigation.connectStart,
+      tls: navigation.secureConnectionStart > 0 ? navigation.connectEnd - navigation.secureConnectionStart : null,
+      ttfb: navigation.responseStart - navigation.requestStart,
+      response: navigation.responseEnd - navigation.responseStart,
+      dom_interactive: navigation.domInteractive,
+      dom_content_loaded: navigation.domContentLoadedEventEnd,
+      load_event_end: navigation.loadEventEnd
+    } : null,
     http_status: typeof status === "number" && status > 0 ? status : null,
     http_status_note: "Navigation Timing responseStatus when exposed by WebKit; null means unavailable, not success.",
     navigation_type: navigation?.type || "unknown", redirect_count: navigation?.redirectCount ?? null
@@ -750,8 +820,9 @@ final class BrowserPerformanceTests: XCTestCase {
             "application_active": NSApp.isActive,
             "quantiles": "Median averages two middle values for even N; p90 uses nearest rank ceil(0.90*N).",
             "metrics": metrics, "resource_windows": resourceWindows,
+            "forced_dark": forcedDarkEvidence,
             "page_navigations": navigationRecords, "final_pages": finalPages,
-            "workload": usesGoogle ? "Live https://www.google.com; one loaded baseline then twenty additional sequentially loaded tabs. Ten measured network navigations and ten new Google tabs after three discarded warmups each; all other latency counts unchanged. Ephemeral shared store, no persistent user profile, no local fallback. Network/cache/consent/regional content/bot challenges may differ between runs; inspect actual URLs/titles/statuses before comparison." : "Deterministic embedded local fixture and blank tabs",
+            "workload": usesGoogle ? "Live Google search results for webkit browser performance; one loaded baseline then five additional sequentially loaded tabs. Five measured warm navigations and five new Google tabs after two discarded warmups each. Forced Dark must load before any page and every recorded page must publish its completion attribute. Ephemeral shared store, no persistent user profile, no local fallback. Network/cache/consent/regional content/bot challenges may differ between runs; inspect actual URLs/titles/statuses before comparison." : "Deterministic embedded local fixture and blank tabs",
             "output_directory": outputDirectory.path,
             "limitations": ["Window created inside the application XCTest host, not full app startup.",
                             "App-only CPU/RSS include XCTest; other normal application host windows were closed. WebKit content/network/GPU processes are excluded.",
