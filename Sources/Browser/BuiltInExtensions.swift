@@ -10,10 +10,9 @@ enum BuiltInExtensions {
     }
 
     static func forcedDarkURL(in bundle: Bundle = .main) -> URL? {
-        guard let bundleURL = bundle.url(forResource: "ForcedDarkResources", withExtension: "bundle") else {
-            return nil
-        }
-        return Bundle(url: bundleURL)?.resourceURL
+        guard let resourceURL = bundle.resourceURL?.appending(path: "ForcedDark", directoryHint: .isDirectory),
+              isForcedDarkResource(resourceURL) else { return nil }
+        return resourceURL
     }
 
     static func synchronizeForcedDark(from source: URL, in directory: URL,

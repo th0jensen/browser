@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const extension = path.join(__dirname,'..');
+const extension = path.join(__dirname,'..','ForcedDark');
 
 test('background publishes initial and changed appearance to Browser', async () => {
   const messages = [];

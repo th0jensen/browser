@@ -60,6 +60,8 @@ final class BrowserExtensionTests: XCTestCase {
 
     func testForcedDarkResourcesAreBundledWithBrowser() throws {
         let resource = try XCTUnwrap(BuiltInExtensions.forcedDarkURL())
+        XCTAssertEqual(resource.lastPathComponent, "ForcedDark")
+        XCTAssertNil(Bundle.main.url(forResource: "ForcedDarkResources", withExtension: "bundle"))
         XCTAssertTrue(BuiltInExtensions.isForcedDarkResource(resource))
         for filename in ["background.js", "colors.js", "content.js", "loading.css", "popup.html", "popup.js"] {
             XCTAssertTrue(FileManager.default.fileExists(atPath: resource.appending(path: filename).path), filename)
