@@ -34,6 +34,15 @@ final class DownloadManagerTests: XCTestCase {
                        "Download")
     }
 
+    func testDownloadFailuresUseFriendlyDescriptions() {
+        XCTAssertEqual(DownloadManager.failureDescription(for: URLError(.notConnectedToInternet)),
+                       "No internet connection.")
+        XCTAssertEqual(DownloadManager.failureDescription(for: URLError(.timedOut)),
+                       "The download timed out.")
+        XCTAssertEqual(DownloadManager.failureDescription(for: URLError(.serverCertificateUntrusted)),
+                       "The secure connection failed.")
+    }
+
     func testDownloadLinkSavesBesideExistingFile() async throws {
         let directory = try makeDirectory()
         try "old".write(to: directory.appending(path: "note.txt"), atomically: true, encoding: .utf8)
@@ -55,6 +64,7 @@ final class DownloadManagerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: XCTUnwrap(item.destinationURL), encoding: .utf8), "hello")
         XCTAssertEqual(try String(contentsOf: directory.appending(path: "note.txt"), encoding: .utf8), "old")
         XCTAssertFalse(downloads.isDownloading)
+        XCTAssertFalse(item.hasActiveTransferResources)
 
         downloads.clearFinished()
         XCTAssertTrue(downloads.items.isEmpty)
@@ -134,6 +144,22 @@ extension DownloadManagerTests {
         XCTAssertEqual(item.name, "original.txt")
         XCTAssertNil(item.originalName)
         XCTAssertFalse(item.isNaming)
+    }
+
+    func testNamingFailureKeepsOriginalWithoutShowingAnOperationalError() async throws {
+        let directory = try makeDirectory()
+        let downloads = DownloadManager(directory: directory, shouldTidyDownloads: { true },
+                                        suggestName: { _, _, _ in
+            throw IntelligenceError.message("Model refused the filename request")
+        })
+        let browser = BrowserModel(downloads: downloads)
+        try await startDownload(in: browser)
+        try await waitUntil { downloads.items.first?.isNaming == false }
+        let item = try XCTUnwrap(downloads.items.first)
+        XCTAssertEqual(item.name, "original.txt")
+        XCTAssertNil(item.originalName)
+        XCTAssertNil(item.failureDescription)
+        XCTAssertFalse(item.hasActiveTransferResources)
     }
 
     func testChosenFilenameIsNotChangedByAutomaticNaming() async throws {
