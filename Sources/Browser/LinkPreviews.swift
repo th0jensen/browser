@@ -503,6 +503,9 @@ final class LinkPreviewPresentation {
 /// only the current transient preview follows source-page hover/navigation events.
 @MainActor
 final class LinkPreviewController: NSObject, WKScriptMessageHandler {
+    typealias SummaryUpdate = @Sendable (LinkSummary) async -> Void
+    typealias StreamingSummaryProvider = @Sendable (URL, SummaryUpdate) async throws -> LinkSummary
+
     static let shared = LinkPreviewController()
     private static let messageName = "browserLinkPreview"
     private static let world = WKContentWorld.world(name: "BrowserLinkPreviews")
@@ -512,6 +515,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     private var enabled = UserDefaults.standard.bool(forKey: BrowserIntelligence.fiveSecondPreviewsKey)
     private let modifierFlags: () -> NSEvent.ModifierFlags
     private let summaryProvider: (@Sendable (URL) async throws -> LinkSummary)?
+    private let streamingSummaryProvider: StreamingSummaryProvider?
     private let waitForPreparationDeadline: @Sendable () async throws -> Void
     private var settingsObserver: NSObjectProtocol?
     private(set) var current: LinkPreviewPresentation?
@@ -520,13 +524,16 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     var presentedPreview: LinkPreviewState? { current?.isPresented == true ? current?.state : nil }
     var keptNotes: [LinkPreviewState] { notes.values.map(\.state) }
 
-    init(observesSettings: Bool = true, modifierFlags: @escaping () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags },
+    init(observesSettings: Bool = true,
+         modifierFlags: @escaping () -> NSEvent.ModifierFlags = { NSEvent.modifierFlags },
          summaryProvider: (@Sendable (URL) async throws -> LinkSummary)? = nil,
+         streamingSummaryProvider: StreamingSummaryProvider? = nil,
          waitForPreparationDeadline: @escaping @Sendable () async throws -> Void = {
              try await Task.sleep(for: .seconds(5))
          }) {
         self.modifierFlags = modifierFlags
         self.summaryProvider = summaryProvider
+        self.streamingSummaryProvider = streamingSummaryProvider
         self.waitForPreparationDeadline = waitForPreparationDeadline
         super.init()
         guard observesSettings else { return }
@@ -578,7 +585,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         }
         guard modifierFlags().contains(.shift), view.window?.isKeyWindow == true,
               !view.isHiddenOrHasHiddenAncestor,
-              summaryProvider != nil || BrowserIntelligence.unavailableReason == nil,
+              summaryProvider != nil || streamingSummaryProvider != nil || BrowserIntelligence.unavailableReason == nil,
               let request = previewRequest(from: body, in: view) else { return }
         present(request, from: view)
     }
@@ -631,10 +638,11 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
 
     private func startLoading(_ preview: LinkPreviewPresentation, from url: URL) {
         let summarize = summaryProvider
+        let streamSummary = streamingSummaryProvider
         let waitForDeadline = waitForPreparationDeadline
         preview.task = Task { [weak self, weak preview] in
             guard let self, let preview, !Task.isCancelled, !preview.isClosed else { return }
-            await self.load(preview, from: url, summarize: summarize)
+            await self.load(preview, from: url, summarize: summarize, streamSummary: streamSummary)
         }
         preview.preparationTimeoutTask = Task { [weak preview] in
             do { try await waitForDeadline() }
@@ -645,16 +653,26 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     }
 
     private func load(_ preview: LinkPreviewPresentation, from url: URL,
-                      summarize: (@Sendable (URL) async throws -> LinkSummary)?) async {
+                      summarize: (@Sendable (URL) async throws -> LinkSummary)?,
+                      streamSummary: StreamingSummaryProvider?) async {
         defer { preview.task = nil }
         let state = preview.state
         do {
-            let result = try await summary(for: preview, url: url, summarize: summarize)
-            guard !Task.isCancelled, !preview.isClosed, isUsable(result) else {
-                preview.close()
+            let result = try await summary(for: preview, url: url, summarize: summarize,
+                                           streamSummary: streamSummary) { [weak self, weak preview] partial in
+                guard let self, let preview else { return }
+                await self.publish(partial, to: preview)
+            }
+            guard !Task.isCancelled, !preview.isClosed else { return }
+            guard isUsable(result) else {
+                if !preview.isPresented { preview.close() }
                 return
             }
             cacheResult(result, image: state.image, for: url)
+            if preview.isPresented {
+                state.result = result
+                return
+            }
             guard await canReveal(preview) else {
                 preview.close()
                 return
@@ -662,19 +680,36 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             state.result = result
             preview.show()
         } catch {
-            guard !preview.isClosed else { return }
+            guard !preview.isClosed, !preview.isPresented else { return }
             preview.close()
         }
     }
 
     private func summary(for preview: LinkPreviewPresentation, url: URL,
-                         summarize: (@Sendable (URL) async throws -> LinkSummary)?) async throws -> LinkSummary {
+                         summarize: (@Sendable (URL) async throws -> LinkSummary)?,
+                         streamSummary: StreamingSummaryProvider?,
+                         onUpdate: @escaping SummaryUpdate) async throws -> LinkSummary {
+        if let streamSummary { return try await streamSummary(url, onUpdate) }
         if let summarize { return try await summarize(url) }
         await LocalIntelligence.shared.prepare(.preview)
         let document = try await LinkPreviewFetcher.shared.document(at: url)
         guard !Task.isCancelled, !preview.isClosed else { throw CancellationError() }
         if let imageURL = document.imageURL { loadImage(imageURL, for: preview, url: url) }
-        return try await LocalIntelligence.shared.summarize(text: document.text, url: url)
+        return try await LocalIntelligence.shared.summarize(text: document.text, url: url, onUpdate: onUpdate)
+    }
+
+    private func publish(_ partial: LinkSummary, to preview: LinkPreviewPresentation) async {
+        guard !Task.isCancelled, !preview.isClosed, isUsable(partial) else { return }
+        if preview.isPresented {
+            preview.state.result = partial
+            return
+        }
+        guard await canReveal(preview), !Task.isCancelled, !preview.isClosed else {
+            preview.close()
+            return
+        }
+        preview.state.result = partial
+        preview.show()
     }
 
     private func canReveal(_ preview: LinkPreviewPresentation) async -> Bool {
@@ -683,7 +718,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
               !view.isHiddenOrHasHiddenAncestor else { return false }
         // Injected providers are test seams. Production asks the isolated hover
         // tracker again so a queued leave cannot race a completed summary onto screen.
-        guard summaryProvider == nil else { return true }
+        guard summaryProvider == nil, streamingSummaryProvider == nil else { return true }
         let url = preview.state.url.absoluteString
         guard let encoded = try? JSONSerialization.data(withJSONObject: url, options: .fragmentsAllowed),
               let literal = String(data: encoded, encoding: .utf8) else { return false }
@@ -698,7 +733,12 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     }
 
     private func isUsable(_ result: LinkSummary) -> Bool {
-        !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let summary = result.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard summary.count >= 20 else { return false }
+        let lowercased = summary.lowercased()
+        return !["i can't", "i can’t", "i cannot", "i'm unable", "i’m unable",
+                  "unable to summarize", "cannot summarize", "not enough information"]
+            .contains { lowercased.contains($0) }
     }
 
     private func loadImage(_ imageURL: URL, for preview: LinkPreviewPresentation, url: URL) {
@@ -717,7 +757,10 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         cache[url] = (Date(), result, image)
     }
 
-    private static let script = """
+}
+
+private extension LinkPreviewController {
+    static let script = """
     (() => {
       if (window.browserSetLinkPreviews) return;
       let enabled = false, link = null, timer = null, sent = false;

@@ -5,16 +5,21 @@ import WebKit
 
 @MainActor
 final class LinkPreviewPresentationTests: XCTestCase {
-    func testPreviewPreparesOffscreenAndRevealsCompletedContentAtomically() async throws {
-        let resultGate = PreviewTestGate()
+    func testPreviewStaysHiddenUntilUsablePartialThenCascadesInPlace() async throws {
+        let partialGate = PreviewTestGate()
+        let finalGate = PreviewTestGate()
+        let partial = LinkSummary(title: "Loading", summary: "Useful partial preview content is ready.")
+        let final = LinkSummary(
+            title: "Ready", summary: "Complete useful preview content is ready.", keyPoints: ["One fact."])
         let controller = LinkPreviewController(
-            observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
-                await resultGate.wait()
-                return LinkSummary(
-                    title: "Ready", summary: "Complete useful preview content.", keyPoints: ["One fact."])
+            observesSettings: false, modifierFlags: { .shift }, streamingSummaryProvider: { _, update in
+                await partialGate.wait()
+                await update(partial)
+                await finalGate.wait()
+                return final
             })
         controller.setEnabled(true)
-        let fixture = makeFixture(controller: controller, title: "Atomic preview fixture")
+        let fixture = makeFixture(controller: controller, title: "Streaming preview fixture")
         defer { controller.setEnabled(false); fixture.window.close() }
         try await waitUntil { !fixture.view.isLoading && fixture.view.title != nil }
 
@@ -23,14 +28,17 @@ final class LinkPreviewPresentationTests: XCTestCase {
         let preparation = try XCTUnwrap(controller.current)
         XCTAssertNil(controller.presentedPreview)
         XCTAssertNil(preparation.glass)
-        XCTAssertNil(preparation.content)
         XCTAssertNil(preparation.state.result)
 
-        await resultGate.open()
-        try await waitUntil { controller.presentedPreview?.result?.title == "Ready" }
+        await partialGate.open()
+        try await waitUntil { controller.presentedPreview?.result?.title == "Loading" }
+        let glass = try XCTUnwrap(preparation.glass)
         XCTAssertTrue(controller.current === preparation)
-        XCTAssertNotNil(preparation.glass)
-        XCTAssertEqual(controller.presentedPreview?.result?.summary, "Complete useful preview content.")
+
+        await finalGate.open()
+        try await waitUntil { controller.presentedPreview?.result?.title == "Ready" }
+        XCTAssertTrue(preparation.glass === glass)
+        XCTAssertEqual(controller.presentedPreview?.result?.summary, final.summary)
     }
 
     func testLeavingLinkCancelsHiddenPreparationBeforeResultCompletes() async throws {
@@ -57,11 +65,12 @@ final class LinkPreviewPresentationTests: XCTestCase {
         XCTAssertNil(preparation.glass)
     }
 
-    func testFailedPreviewNeverMountsCard() async throws {
+    func testEarlyRefusalNeverMountsCard() async throws {
         let failureGate = PreviewTestGate()
         let controller = LinkPreviewController(
-            observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
+            observesSettings: false, modifierFlags: { .shift }, streamingSummaryProvider: { _, update in
                 await failureGate.wait()
+                await update(LinkSummary(title: "", summary: "I cannot summarize this page safely."))
                 throw IntelligenceError.message("No preview")
             })
         controller.setEnabled(true)
@@ -79,6 +88,32 @@ final class LinkPreviewPresentationTests: XCTestCase {
         XCTAssertNil(preparation.glass)
         XCTAssertNil(preparation.content)
         XCTAssertNil(preparation.panel)
+    }
+
+    func testErrorAfterUsablePartialKeepsCascadedContentOnScreen() async throws {
+        let partialGate = PreviewTestGate()
+        let partial = LinkSummary(title: "Partial", summary: "Useful partial preview content is available.")
+        let controller = LinkPreviewController(
+            observesSettings: false, modifierFlags: { .shift }, streamingSummaryProvider: { _, update in
+                await partialGate.wait()
+                await update(partial)
+                throw IntelligenceError.message("Late generation failure")
+            })
+        controller.setEnabled(true)
+        let fixture = makeFixture(controller: controller, title: "Late failure fixture")
+        defer { controller.setEnabled(false); fixture.window.close() }
+        try await waitUntil { !fixture.view.isLoading && fixture.view.title != nil }
+
+        await postPreviewMessage(path: "late-failure", to: fixture.view)
+        try await waitUntil { controller.current != nil }
+        let preparation = try XCTUnwrap(controller.current)
+        XCTAssertNil(controller.presentedPreview)
+        await partialGate.open()
+        try await waitUntil { preparation.task == nil }
+        XCTAssertTrue(controller.current === preparation)
+        XCTAssertFalse(preparation.isClosed)
+        XCTAssertEqual(controller.presentedPreview?.result?.summary, partial.summary)
+        XCTAssertNotNil(preparation.glass)
     }
 
     func testTimedOutPreviewCancelsBeforeMountingCard() async throws {
