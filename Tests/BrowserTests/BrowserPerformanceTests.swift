@@ -1,3 +1,5 @@
+// Benchmark definitions are intentionally verbose and kept together for identical cross-cohort provenance.
+// swiftlint:disable file_length type_body_length function_body_length cyclomatic_complexity line_length
 import AppKit
 import CoreFoundation
 import Darwin
@@ -308,7 +310,22 @@ final class BrowserPerformanceTests: XCTestCase {
             if ProcessInfo.processInfo.environment["BROWSER_BENCHMARK_MODE"] == "full" {
                 try await benchmarkChromeReveal(window: window, browser: browser, defaults: defaults)
             }
-            if usesGoogle { finalPages = try await googlePages(browser.tabs) }
+            if usesGoogle {
+                finalPages = try await googlePages(browser.tabs)
+                let postLoadSample: ([String: Any]) -> Double? = {
+                    ($0["ready_timing_ms"] as? [String: Any])?["after_load"] as? Double
+                }
+                let postLoadSamples = navigationRecords.compactMap(postLoadSample)
+                appendMetric("google_post_load_ready", definition:
+                    "In-page Navigation Timing from loadEventEnd to Forced Dark readiness plus two animation frames. Excludes DNS, TLS, response transfer, server latency and native navigation dispatch; includes page/extension completion work and frame scheduling.",
+                    samples: postLoadSamples, warmupsDiscarded: 0)
+                let batchPostLoad = navigationRecords.filter {
+                    ($0["phase"] as? String)?.hasPrefix("additional_google_tab_") == true
+                }.compactMap(postLoadSample)
+                appendMetric("five_google_tabs_post_load_total", definition:
+                    "Sum of loadEventEnd-to-ready completion for five retained Google tabs in five_google_search_tabs_loaded. Network/server/transfer time and native tab setup excluded.",
+                    samples: [batchPostLoad.reduce(0, +)], warmupsDiscarded: 0)
+            }
             try writeResults(status: "complete")
         } catch {
             try? writeResults(status: "failed: \(error)")
@@ -463,7 +480,15 @@ final class BrowserPerformanceTests: XCTestCase {
 (() => {
   const token = "__BENCHMARK_TOKEN__";
   const acknowledge = kind => requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (kind === "ready") window.__benchmarkReady = true;
+    if (kind === "ready") {
+      window.__benchmarkReady = true;
+      const navigation = performance.getEntriesByType("navigation")[0];
+      const pageReady = performance.now();
+      window.__benchmarkReadyTiming = {
+        page_ready: pageReady,
+        after_load: navigation?.loadEventEnd > 0 ? pageReady - navigation.loadEventEnd : null
+      };
+    }
     window.webkit.messageHandlers.browserBenchmark.postMessage({
       kind, token: kind === "resize" ? window.__resizeToken : token,
       width: innerWidth, height: innerHeight
@@ -492,6 +517,7 @@ final class BrowserPerformanceTests: XCTestCase {
     result_link_count: document.querySelectorAll("a[href]").length,
     forced_dark_ready: document.documentElement.hasAttribute("data-browser-forced-dark-ready"),
     forced_dark_transformed_nodes: document.querySelectorAll("[data-browser-forced-dark]").length,
+    ready_timing_ms: window.__benchmarkReadyTiming || null,
     navigation_timing_ms: navigation ? {
       dns: navigation.domainLookupEnd - navigation.domainLookupStart,
       connect: navigation.connectEnd - navigation.connectStart,
