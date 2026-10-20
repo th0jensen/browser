@@ -1,0 +1,5 @@
+# GitHub-hosted public-preview image.
+# Remove once actionlint recognizes this label.
+self-hosted-runner:
+  labels:
+    - xcode-27
