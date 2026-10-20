@@ -193,10 +193,12 @@ final class LinkPreviewState {
     let url: URL
     var result: LinkSummary?
     var image: NSImage?
+    var isLoading = true
     var isKept = false
     var cardWidth: CGFloat = 300
     var contentHeight: CGFloat = 150
     var maximumHeight: CGFloat = 420
+    var error: String?
     init(url: URL) { self.url = url }
 
     var contextText: String {
@@ -286,9 +288,10 @@ final class LinkPreviewPresentation {
     }
 
     func show() {
-        guard !isClosed, !isPresented else { return }
+        guard !isClosed else { return }
         preparationTimeoutTask?.cancel()
         preparationTimeoutTask = nil
+        guard !isPresented else { return }
         guard let window = sourceWindow, let root = window.contentView else { close(); return }
         beginPreparing()
         let content = NSHostingView(rootView: LinkPreviewCard(preview: self))
@@ -627,10 +630,11 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         })
         current = preview
         preview.beginPreparing()
+        preview.show()
         if let (date, result, image) = cache[request.url], Date().timeIntervalSince(date) < 300 {
             preview.state.result = result
             preview.state.image = image
-            preview.show()
+            preview.state.isLoading = false
         } else {
             startLoading(preview, from: request.url)
         }
@@ -647,8 +651,11 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
         preview.preparationTimeoutTask = Task { [weak preview] in
             do { try await waitForDeadline() }
             catch { return }
-            guard !Task.isCancelled, let preview, !preview.isClosed, !preview.isPresented else { return }
-            preview.close()
+            guard !Task.isCancelled, let preview, !preview.isClosed, preview.state.isLoading else { return }
+            preview.task?.cancel()
+            preview.task = nil
+            preview.state.error = "Preview unavailable. Open the page to read it."
+            preview.state.isLoading = false
         }
     }
 
@@ -665,23 +672,20 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             }
             guard !Task.isCancelled, !preview.isClosed else { return }
             guard isUsable(result) else {
-                if !preview.isPresented { preview.close() }
+                if state.result == nil { state.error = "Preview unavailable. Open the page to read it." }
+                state.isLoading = false
                 return
             }
             cacheResult(result, image: state.image, for: url)
-            if preview.isPresented {
-                state.result = result
-                return
-            }
-            guard await canReveal(preview) else {
-                preview.close()
-                return
-            }
             state.result = result
+            state.error = nil
+            state.isLoading = false
             preview.show()
-        } catch {
-            guard !preview.isClosed, !preview.isPresented else { return }
-            preview.close()
+        } catch is CancellationError { }
+        catch {
+            guard !Task.isCancelled, !preview.isClosed else { return }
+            if state.result == nil { state.error = "Preview unavailable. Open the page to read it." }
+            state.isLoading = false
         }
     }
 
@@ -747,7 +751,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             defer { preview.imageTask = nil }
             guard let data = try? await LinkPreviewFetcher.shared.imageData(at: imageURL),
                   !Task.isCancelled, !preview.isClosed, let image = NSImage(data: data) else { return }
-            if !preview.isPresented { preview.state.image = image }
+            preview.state.image = image
             if let cached = self?.cache[url] { self?.cache[url] = (cached.0, cached.1, image) }
         }
     }
@@ -781,7 +785,7 @@ private extension LinkPreviewController {
           if (link !== candidate || document.hidden) return;
           const r = candidate.getBoundingClientRect();
           post({url: candidate.href, x: r.x, y: r.y, width: r.width, height: r.height}); sent = true;
-        }, 450);
+        }, 150);
       }
       function over(e) {
         if (!e.isTrusted) return;
