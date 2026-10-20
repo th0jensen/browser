@@ -38,6 +38,9 @@ targetTemplates:
       - path: Sources/Browser
       - path: assets
         buildPhase: resources
+    dependencies:
+      - target: ForcedDarkResources
+        embed: true
     settings:
       base:
         PRODUCT_NAME: Browser
@@ -146,6 +149,19 @@ targets:
         # PLACEHOLDER, not a real key: replace it with the public key Sparkle's generate_keys prints (see
         # RELEASING.md). Updates stay off until it's set; the release workflow can also pass it in.
         SPARKLE_PUBLIC_ED_KEY: REPLACE_WITH_SPARKLE_PUBLIC_ED_KEY
+  ForcedDarkResources:
+    type: bundle
+    platform: macOS
+    sources:
+      - path: Extensions/ForcedDark
+        buildPhase: resources
+        excludes:
+          - tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.athas.browser.forced-dark-resources
+        PRODUCT_NAME: ForcedDarkResources
+        GENERATE_INFOPLIST_FILE: YES
   BrowserTests:
     type: bundle.unit-test
     platform: macOS

@@ -8,7 +8,7 @@ struct InstalledExtension: Codable, Identifiable {
     let id: UUID
     let name: String
     let kind: Kind
-    let filename: String
+    var filename: String
     let needsNativeMessaging: Bool
     var isEnabled = false
     var sourceIdentifier: String?
@@ -18,6 +18,9 @@ struct InstalledExtension: Codable, Identifiable {
     var hasToolbarAction: Bool?
     var toolbarActionLabel: String?
     var toolbarIconIsTemplate: Bool?
+    var managedIdentifier: String?
+
+    var isManaged: Bool { managedIdentifier != nil }
 }
 
 /// Owns extension resources and one controller shared by every window, tab and restored web view.
@@ -26,8 +29,8 @@ struct InstalledExtension: Codable, Identifiable {
 final class BrowserExtensions: NSObject {
     typealias ExtensionReader = @MainActor (URL) async throws -> WKWebExtension
     typealias RuleListCompiler = @MainActor (String, String) async throws -> WKContentRuleList?
-    static let forcedDarkApplicationIdentifier = "dev.athas.browser.forced-dark"
-    static let forcedDarkDescription = "Dark surfaces and readable text using Chromium’s CIELAB lightness inversion, while preserving images."
+    nonisolated static let forcedDarkApplicationIdentifier = "dev.athas.browser.forced-dark"
+    nonisolated static let forcedDarkDescription = "Dark surfaces and readable text using Chromium’s CIELAB lightness inversion, while preserving images."
     private static let forcedDarkBackgroundKey = "ForcedDarkUnderPageBackground"
 
     private final class AppliedRules {
@@ -77,7 +80,7 @@ final class BrowserExtensions: NSObject {
 
     init(directory: URL? = nil, persistent: Bool = true, applicationDirectories: [URL]? = nil,
          extensionReader: ExtensionReader? = nil, ruleListCompiler: RuleListCompiler? = nil,
-         appearanceDefaults: UserDefaults? = nil) {
+         appearanceDefaults: UserDefaults? = nil, builtInForcedDarkURL: URL? = nil) {
         self.directory = directory ?? BrowserProfile.directory.appending(path: "Extensions", directoryHint: .isDirectory)
         self.applicationDirectories = applicationDirectories ?? (persistent && !BrowserProfile.isTesting ? DiscoveredExtension.applicationDirectories : [])
         self.extensionReader = extensionReader
@@ -104,6 +107,16 @@ final class BrowserExtensions: NSObject {
                     let icon = NSImage(contentsOf: self.directory.appending(path: item.id.uuidString).appending(path: "toolbar-icon.png"))
                     icon?.isTemplate = item.toolbarIconIsTemplate ?? false
                     toolbarIcons[item.id] = icon
+                }
+            }
+            let forcedDarkURL = builtInForcedDarkURL
+                ?? (persistent && !BrowserProfile.isTesting ? BuiltInExtensions.forcedDarkURL() : nil)
+            if let forcedDarkURL {
+                let synchronized = try BuiltInExtensions.synchronizeForcedDark(
+                    from: forcedDarkURL, in: self.directory, installed: installed)
+                installed = synchronized.installed
+                if synchronized.changed {
+                    try JSONEncoder().encode(installed).write(to: index, options: .atomic)
                 }
             }
         } catch { lastError = error.localizedDescription }
@@ -478,6 +491,9 @@ extension BrowserExtensions {
     private func importWebExtension(from url: URL, discovery: DiscoveredExtension? = nil) async throws {
         let webExtension = try await readWebExtension(at: url)
         guard webExtension.errors.isEmpty else { throw webExtension.errors[0] }
+        if Self.isForcedDark(webExtension), installed.contains(where: \.isManaged) {
+            throw ExtensionFailure("Forced Dark is built into Browser and updates automatically.")
+        }
         let id = UUID()
         let filename = url.pathExtension == "appex" ? "extension.appex" : url.pathExtension == "zip" ? "extension.zip" : "resources"
         let item = InstalledExtension(id: id, name: webExtension.displayName ?? url.lastPathComponent,
@@ -634,6 +650,7 @@ extension BrowserExtensions {
     }
 
     func remove(_ item: InstalledExtension) {
+        guard !item.isManaged else { return }
         do {
             try unload(item)
             try FileManager.default.removeItem(at: directory.appending(path: item.id.uuidString))
