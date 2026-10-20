@@ -24,6 +24,35 @@ final class StoreFileTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["History.plist"])
     }
 
+    func testPendingWritesReleaseObsoleteCapturedSnapshots() async throws {
+        let directory = URL.temporaryDirectory.appending(path: "StoreFileTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = StoreFile(url: directory.appending(path: "Session.plist"))
+        let started = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        file.write {
+            started.signal()
+            resume.wait()
+            return Data("active".utf8)
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+
+        var captured: [WeakStorePayload] = []
+        for value in 0..<64 {
+            var payload: StorePayload? = StorePayload(Data("snapshot-\(value)".utf8))
+            captured.append(WeakStorePayload(payload))
+            file.write { [payload] in payload?.data }
+            payload = nil
+        }
+
+        XCTAssertTrue(captured.dropLast().allSatisfy { $0.value == nil })
+        XCTAssertNotNil(captured.last?.value)
+        resume.signal()
+        let saved = await file.read()
+        XCTAssertEqual(saved, Data("snapshot-63".utf8))
+        XCTAssertTrue(captured.allSatisfy { $0.value == nil })
+    }
+
     func testIdenticalSnapshotDoesNotRewriteFile() throws {
         let directory = URL.temporaryDirectory.appending(path: "StoreFileTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -35,5 +64,21 @@ final class StoreFileTests: XCTestCase {
         file.writeNow(data)
         let modified = try FileManager.default.attributesOfItem(atPath: file.url.path)[.modificationDate] as? Date
         XCTAssertEqual(modified, oldDate)
+    }
+}
+
+private final class StorePayload: @unchecked Sendable {
+    let data: Data
+
+    init(_ data: Data) {
+        self.data = data
+    }
+}
+
+private final class WeakStorePayload {
+    private(set) weak var value: StorePayload?
+
+    init(_ value: StorePayload?) {
+        self.value = value
     }
 }
