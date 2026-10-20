@@ -109,8 +109,8 @@ private struct DownloadRow: View {
                 if item.originalName != nil {
                     Text("Renamed · click name to undo").font(.system(size: 10)).foregroundStyle(.secondary)
                 }
-                if let error = item.namingError {
-                    Text(error).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if let error = item.failureDescription {
+                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(2)
                 }
                 Text(status)
                     .font(.system(size: 11))

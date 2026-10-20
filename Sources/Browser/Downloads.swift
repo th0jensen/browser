@@ -22,7 +22,7 @@ final class DownloadItem: Identifiable {
     fileprivate(set) var totalBytes: Int64 = -1
     fileprivate(set) var destinationURL: URL?
     fileprivate(set) var originalName: String?
-    fileprivate(set) var namingError: String?
+    fileprivate(set) var failureDescription: String?
     fileprivate(set) var isNaming = false
     fileprivate(set) var hasRecoverableFile = false
     @ObservationIgnored fileprivate var allowsIntelligence = true
@@ -31,8 +31,11 @@ final class DownloadItem: Identifiable {
     @ObservationIgnored fileprivate var namingTask: Task<Void, Never>?
     /// A chosen destination is published only after the complete file is available.
     @ObservationIgnored fileprivate var chosenDestination: DownloadDestination?
-    @ObservationIgnored fileprivate let download: WKDownload
+    @ObservationIgnored fileprivate var download: WKDownload?
     @ObservationIgnored fileprivate var progressObservation: NSKeyValueObservation?
+    @ObservationIgnored private var pendingProgress: (fraction: Double, completed: Int64, total: Int64)?
+    @ObservationIgnored private var progressTask: Task<Void, Never>?
+    @ObservationIgnored private var lastProgressPublication = 0.0
     /// Asks whether a download the page started on its own may go ahead, or `nil` when the user started it.
     @ObservationIgnored fileprivate var confirmation: (@MainActor () async -> Bool)?
     /// The window the save panel opens on, when Settings ▸ Downloads asks where to save each file.
@@ -42,12 +45,67 @@ final class DownloadItem: Identifiable {
         self.download = download
         name = download.originalRequest?.url?.lastPathComponent ?? "Download"
     }
+
+    fileprivate func receiveProgress(fraction: Double, completed: Int64, total: Int64) {
+        pendingProgress = (fraction, completed, total)
+        let elapsed = Date.timeIntervalSinceReferenceDate - lastProgressPublication
+        guard elapsed < 0.1 else {
+            publishPendingProgress()
+            return
+        }
+        guard progressTask == nil else { return }
+        progressTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(0.1 - elapsed))
+            guard !Task.isCancelled else { return }
+            self?.publishPendingProgress()
+        }
+    }
+
+    fileprivate func completeProgress() {
+        if let pendingProgress {
+            completedBytes = pendingProgress.completed
+            totalBytes = pendingProgress.total
+        }
+        pendingProgress = nil
+        progressTask?.cancel()
+        progressTask = nil
+        progress = 1
+    }
+
+    var hasActiveTransferResources: Bool {
+        download != nil || progressObservation != nil || progressTask != nil || confirmation != nil || window != nil
+    }
+
+    fileprivate func releaseTransfer() {
+        progressObservation = nil
+        progressTask?.cancel()
+        progressTask = nil
+        pendingProgress = nil
+        download = nil
+        confirmation = nil
+        window = nil
+        if !hasRecoverableFile { chosenDestination = nil }
+        sourceTitle = ""
+        sourceURL = nil
+    }
+
+    private func publishPendingProgress() {
+        progressTask = nil
+        guard let pendingProgress else { return }
+        self.pendingProgress = nil
+        progress = pendingProgress.fraction
+        completedBytes = pendingProgress.completed
+        totalBytes = pendingProgress.total
+        lastProgressPublication = Date.timeIntervalSinceReferenceDate
+    }
 }
 
 /// Downloads from every window, saved to the Downloads folder or where the user chooses.
 @MainActor
 @Observable
 final class DownloadManager: NSObject, WKDownloadDelegate {
+    private static let terminalItemLimit = 100
+
     private(set) var items: [DownloadItem] = []
     @ObservationIgnored let directory: URL
     @ObservationIgnored private let asksWhereToSave: @MainActor () -> Bool
@@ -102,20 +160,20 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
             let (fraction, completed, total) = (progress.fractionCompleted, progress.completedUnitCount,
                                                 progress.totalUnitCount)
             Task { @MainActor [item] in
-                item?.progress = fraction
-                item?.completedBytes = completed
-                item?.totalBytes = total
+                item?.receiveProgress(fraction: fraction, completed: completed, total: total)
             }
         }
         items.insert(item, at: 0)
     }
 
     func cancel(_ item: DownloadItem) {
-        guard item.state == .downloading else { return }
+        guard item.state == .downloading, let download = item.download else { return }
         item.state = .cancelled
         let partialFile = item.destinationURL
         let chosenDestination = item.chosenDestination
-        item.download.cancel { _ in
+        item.releaseTransfer()
+        trimHistory()
+        download.cancel { _ in
             if let chosenDestination { chosenDestination.discardTransfer() }
             else { partialFile.map { try? FileManager.default.removeItem(at: $0) } }
         }
@@ -135,6 +193,7 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         items.filter { $0.state != .downloading }.forEach {
             $0.namingTask?.cancel()
             $0.chosenDestination?.discardTransfer()
+            $0.releaseTransfer()
         }
         items.removeAll { $0.state != .downloading }
     }
@@ -162,12 +221,26 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         items.first { $0.download === download }
     }
 
+    private func trimHistory() {
+        var retainedTerminalItems = 0
+        items.removeAll { item in
+            guard item.state != .downloading else { return false }
+            retainedTerminalItems += 1
+            guard retainedTerminalItems > Self.terminalItemLimit else { return false }
+            item.namingTask?.cancel()
+            item.chosenDestination?.discardTransfer()
+            item.releaseTransfer()
+            return true
+        }
+    }
+
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                   suggestedFilename: String) async -> URL? {
         guard let item = item(for: download), item.state == .downloading else { return nil }
         if let confirmation = item.confirmation {
             item.confirmation = nil
             guard await confirmation() else {
+                item.releaseTransfer()
                 items.removeAll { $0 === item }
                 return nil
             }
@@ -208,6 +281,7 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
             chosenURL = response == .OK ? panel.url : nil
         }
         guard let url = chosenURL, item.state == .downloading else {
+            item.releaseTransfer()
             items.removeAll { $0 === item }
             return nil
         }
@@ -217,7 +291,9 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
                 && (other.chosenDestination?.selectedURL ?? other.destinationURL)?.standardizedFileURL == url.standardizedFileURL
         }) else {
             item.state = .failed
-            item.namingError = "Another download is saving to this file."
+            item.failureDescription = "Another download is already saving to this file."
+            item.releaseTransfer()
+            trimHistory()
             return nil
         }
         do {
@@ -228,13 +304,19 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
             return destination.transferURL
         } catch {
             item.state = .failed
-            item.namingError = "Could not prepare the chosen destination. " + error.localizedDescription
+            item.failureDescription = "Couldn’t prepare the chosen destination. " + error.localizedDescription
+            item.releaseTransfer()
+            trimHistory()
             return nil
         }
     }
 
     func downloadDidFinish(_ download: WKDownload) {
         guard let item = item(for: download) else { return }
+        defer {
+            item.releaseTransfer()
+            trimHistory()
+        }
         if let destination = item.chosenDestination {
             do {
                 // Quarantine the staged file before publishing it at the chosen address.
@@ -244,13 +326,13 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
             } catch {
                 item.state = .failed
                 item.hasRecoverableFile = true
-                item.namingError = "Could not save the file. The complete download is available using Show in Finder. "
+                item.failureDescription = "Couldn’t save the file. The complete download is available in Finder. "
                     + error.localizedDescription
                 return
             }
         }
         item.state = .finished
-        item.progress = 1
+        item.completeProgress()
         if let url = item.destinationURL {
             quarantine(url, from: download.originalRequest?.url)
             tidyDownload(item)
@@ -260,20 +342,25 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
         guard let item = item(for: download), item.state == .downloading else { return }
         item.state = .failed
+        item.failureDescription = Self.failureDescription(for: error)
         // Without resume support, a partial file is of no use.
         if let destination = item.chosenDestination { destination.discardTransfer() }
         else if let url = item.destinationURL { try? FileManager.default.removeItem(at: url) }
+        item.releaseTransfer()
+        trimHistory()
     }
 
     private func tidyDownload(_ item: DownloadItem) {
         guard item.allowsIntelligence, item.chosenDestination == nil, shouldTidyDownloads(), let originalURL = item.destinationURL else { return }
         let originalName = item.name
+        let sourceTitle = item.sourceTitle
+        let sourceURL = item.sourceURL
         let suggest = suggestName
         item.isNaming = true
         item.namingTask = Task { [weak self, weak item] in
             defer { item?.namingTask = nil; item?.isNaming = false }
             do {
-                let stem = try await suggest(originalName, item?.sourceTitle ?? "", item?.sourceURL)
+                let stem = try await suggest(originalName, sourceTitle, sourceURL)
                 guard let self, let item, !Task.isCancelled, item.state == .finished,
                       item.destinationURL == originalURL, self.items.contains(where: { $0 === item }),
                       self.shouldTidyDownloads() else { return }
@@ -281,8 +368,7 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
                 guard name.caseInsensitiveCompare(originalName) != .orderedSame else { return }
                 try self.renameDownloadedFile(item, to: name)
                 item.originalName = originalName
-            } catch is CancellationError { }
-            catch { item?.namingError = "Kept the original filename. " + error.localizedDescription }
+            } catch { }
         }
     }
 
@@ -291,8 +377,8 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         do {
             try renameDownloadedFile(item, to: original)
             item.originalName = nil
-            item.namingError = nil
-        } catch { item.namingError = error.localizedDescription }
+            item.failureDescription = nil
+        } catch { item.failureDescription = "Couldn’t restore the original filename. " + error.localizedDescription }
     }
 
     private func renameDownloadedFile(_ item: DownloadItem, to name: String) throws {
@@ -303,6 +389,21 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
         try FileManager.default.moveItem(at: source, to: destination)
         item.destinationURL = destination
         item.name = destination.lastPathComponent
+    }
+
+    nonisolated static func failureDescription(for error: Error) -> String {
+        guard let error = error as? URLError else { return "Download failed. " + error.localizedDescription }
+        switch error.code {
+        case .notConnectedToInternet: return "No internet connection."
+        case .timedOut: return "The download timed out."
+        case .cannotFindHost: return "Couldn’t find the server."
+        case .cannotConnectToHost: return "Couldn’t connect to the server."
+        case .networkConnectionLost: return "The network connection was lost."
+        case .secureConnectionFailed, .serverCertificateHasBadDate, .serverCertificateUntrusted,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid:
+            return "The secure connection failed."
+        default: return "Download failed. " + error.localizedDescription
+        }
     }
 
     nonisolated static func tidyFilename(stem: String, original: String) -> String {
