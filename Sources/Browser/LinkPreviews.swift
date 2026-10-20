@@ -766,7 +766,7 @@ private extension LinkPreviewController {
       let enabled = false, link = null, timer = null, sent = false;
       const post = data => window.webkit.messageHandlers.browserLinkPreview.postMessage(data);
       window.browserLinkPreviewIsActive = href => enabled && sent && !document.hidden && link?.href === href;
-      function clear() { clearTimeout(timer); if (sent) post({leave: true}); sent = false; }
+      function clear() { clearTimeout(timer); timer = null; if (sent) post({leave: true}); sent = false; }
       function contentLink(target) {
         const candidate = target.closest?.('a[href]');
         if (!candidate || !candidate.innerText?.trim() || target.closest?.('img,picture,video,canvas,svg')) return null;
@@ -777,6 +777,7 @@ private extension LinkPreviewController {
         clear(); if (!link) return;
         const candidate = link;
         timer = setTimeout(() => {
+          timer = null;
           if (link !== candidate || document.hidden) return;
           const r = candidate.getBoundingClientRect();
           post({url: candidate.href, x: r.x, y: r.y, width: r.width, height: r.height}); sent = true;
@@ -793,6 +794,9 @@ private extension LinkPreviewController {
         if (!e.isTrusted || !link) return;
         if (!e.relatedTarget || !link.contains(e.relatedTarget)) { clear(); link = null; }
       }
+      function move(e) {
+        if (e.isTrusted && e.shiftKey && link && !timer && !sent && link.contains(e.target)) start();
+      }
       function key(e) {
         if (e.isTrusted && e.key === 'Escape') { stop(); return; }
         if (e.isTrusted && e.key === 'Shift') {
@@ -805,6 +809,7 @@ private extension LinkPreviewController {
         enabled = value;
         const action = value ? 'addEventListener' : 'removeEventListener';
         document[action]('mouseover', over, true); document[action]('mouseout', out, true);
+        document[action]('mousemove', move, true);
         document[action]('keydown', key, true); document[action]('keyup', key, true);
         document[action]('scroll', stop, true); document[action]('mousedown', stop, true);
         window[action]('blur', stop, true); document[action]('visibilitychange', stop, true);

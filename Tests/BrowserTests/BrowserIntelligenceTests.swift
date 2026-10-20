@@ -641,11 +641,11 @@ extension BrowserIntelligenceTests {
         """, baseURL: URL(string: "https://www.google.com/search?q=preview"))
         try await waitUntil { !view.isLoading && view.title == "Google results fixture" }
 
-        func hover(_ selector: String, shift: Bool) async -> String? {
+        func dispatch(_ event: String, to selector: String, shift: Bool) async -> String? {
             let source = """
             (() => {
-              const handler = window.__previewListeners?.mouseover;
-              if (typeof handler !== 'function') return 'missing mouseover listener';
+              const handler = window.__previewListeners?.['\(event)'];
+              if (typeof handler !== 'function') return 'missing \(event) listener';
               try {
                 handler({isTrusted:true,target:document.querySelector('\(selector)'),shiftKey:\(shift)});
                 return null;
@@ -662,20 +662,26 @@ extension BrowserIntelligenceTests {
             }
         }
 
-        var unmodifiedError = await hover("#textTarget", shift: false)
+        var unmodifiedError = await dispatch("mouseover", to: "#textTarget", shift: false)
         for _ in 0..<50 where unmodifiedError == "missing mouseover listener" {
             try await Task.sleep(for: .milliseconds(20))
-            unmodifiedError = await hover("#textTarget", shift: false)
+            unmodifiedError = await dispatch("mouseover", to: "#textTarget", shift: false)
         }
         XCTAssertNil(unmodifiedError)
         try await Task.sleep(for: .milliseconds(550))
         XCTAssertNil(controller.presentedPreview, "Google links must not preview without Shift")
-        let imageError = await hover("#imageTarget", shift: true)
+        let imageError = await dispatch("mouseover", to: "#imageTarget", shift: true)
         XCTAssertNil(imageError)
         try await Task.sleep(for: .milliseconds(550))
         XCTAssertNil(controller.presentedPreview, "Image links must not produce website previews")
-        let textError = await hover("#textTarget", shift: true)
+        let textError = await dispatch("mouseover", to: "#textTarget", shift: false)
         XCTAssertNil(textError)
+        try await Task.sleep(for: .milliseconds(550))
+        XCTAssertNil(controller.presentedPreview)
+        // The address field can own keyboard focus, so the page may miss Shift's
+        // keydown. A shifted mouse move over the already-hovered link must recover.
+        let moveError = await dispatch("mousemove", to: "#textTarget", shift: true)
+        XCTAssertNil(moveError)
         try await waitUntil { controller.presentedPreview?.result?.title == "article" }
     }
 }
