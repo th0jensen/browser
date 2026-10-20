@@ -12,7 +12,6 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import plistlib
 import re
@@ -20,10 +19,54 @@ import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 def timestamp():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()  # noqa: UP017
+
+
+def global_gpu_sample():
+    """Read global Apple GPU utilization counters; these are system-wide, not process-attributed."""
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/ioreg", "-r", "-c", "AGXAccelerator", "-d", "1", "-a"],
+            capture_output=True, timeout=5, check=True,
+        )
+        roots = plistlib.loads(result.stdout)
+        pending = list(roots)
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                statistics = value.get("PerformanceStatistics")
+                if isinstance(statistics, dict):
+                    fields = {key: statistics.get(key) for key in (
+                        "Device Utilization %", "Renderer Utilization %", "Tiler Utilization %"
+                    )}
+                    if all(isinstance(item, (int, float)) for item in fields.values()):
+                        return {"status": "complete", **fields}
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        return {"status": "incomplete", "error": "AGX PerformanceStatistics not found"}
+    except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError) as error:
+        return {"status": "incomplete", "error": str(error)}
+
+
+def summarize_gpu(samples):
+    rows = [sample["global_gpu"] for sample in samples if sample["global_gpu"].get("status") == "complete"]
+    result = {"scope": "system-wide AGXAccelerator PerformanceStatistics; not process-attributed",
+              "sample_count": len(rows), "requested_sample_count": len(samples),
+              "status": "complete" if len(rows) == len(samples) else "incomplete"}
+    for field in ("Device Utilization %", "Renderer Utilization %", "Tiler Utilization %"):
+        values = sorted(row[field] for row in rows)
+        key = field.lower().replace(" %", "_percent").replace(" ", "_")
+        result[key] = None if not values else {
+            "mean": sum(values) / len(values), "median": values[len(values) // 2],
+            "p90": values[max(0, math.ceil(len(values) * 0.9) - 1)], "peak": max(values),
+            "samples": values,
+        }
+    return result
 
 
 def bundle_sizes(app):
@@ -61,13 +104,10 @@ def bundle_sizes(app):
             raise ValueError(f"Unsupported special file in bundle: {path}")
     entry = executable.stat()
     with executable.open("rb") as handle:
-        digest = hashlib.file_digest(handle, "sha256").hexdigest() if hasattr(hashlib, "file_digest") else None
-        if digest is None:
-            handle.seek(0)
-            sha = hashlib.sha256()
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                sha.update(chunk)
-            digest = sha.hexdigest()
+        sha = hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            sha.update(chunk)
+        digest = sha.hexdigest()
     return {
         "app": str(app),
         "bundle_identifier": info.get("CFBundleIdentifier"),
@@ -243,19 +283,21 @@ def summarize(samples, pids, timebase):
     complete = all(row["status"] == "complete" for row in processes)
     duration = (samples[-1]["monotonic_ns"] - samples[0]["monotonic_ns"]) / 1e9
     def total(sample, metric):
-        return sum(row[metric] for row in sample["processes"]) if complete else None
+        return sum(row[metric] for row in sample["processes"])
+    def sampled_peak(metric):
+        return max(total(sample, metric) for sample in samples) if complete else None
     cpu = sum(row["cpu_seconds"] for row in processes) if complete else None
     return {
         "status": "complete" if complete else "incomplete",
         "observed_duration_seconds": duration,
         "cpu_seconds": cpu,
         "cpu_percent_one_core": cpu / duration * 100 if complete and duration > 0 else None,
-        "sum_rss_before_bytes": total(samples[0], "rss_bytes"),
-        "sum_rss_after_bytes": total(samples[-1], "rss_bytes"),
-        "sum_rss_sampled_peak_bytes": max(total(s, "rss_bytes") for s in samples) if complete else None,
-        "sum_physical_footprint_before_bytes": total(samples[0], "physical_footprint_bytes"),
-        "sum_physical_footprint_after_bytes": total(samples[-1], "physical_footprint_bytes"),
-        "sum_physical_footprint_sampled_peak_bytes": max(total(s, "physical_footprint_bytes") for s in samples) if complete else None,
+        "sum_rss_before_bytes": total(samples[0], "rss_bytes") if complete else None,
+        "sum_rss_after_bytes": total(samples[-1], "rss_bytes") if complete else None,
+        "sum_rss_sampled_peak_bytes": sampled_peak("rss_bytes"),
+        "sum_physical_footprint_before_bytes": total(samples[0], "physical_footprint_bytes") if complete else None,
+        "sum_physical_footprint_after_bytes": total(samples[-1], "physical_footprint_bytes") if complete else None,
+        "sum_physical_footprint_sampled_peak_bytes": sampled_peak("physical_footprint_bytes"),
         "processes": processes,
     }
 
@@ -271,7 +313,8 @@ def sample_processes(args):
         before = time.monotonic_ns()
         rows = [reader.read(pid) for pid in pids]
         after = time.monotonic_ns()
-        samples.append({"monotonic_ns": (before + after) // 2, "read_duration_ns": after - before, "processes": rows})
+        samples.append({"monotonic_ns": (before + after) // 2, "read_duration_ns": after - before,
+                        "processes": rows, "global_gpu": global_gpu_sample()})
         elapsed = time.monotonic() - started
         if elapsed >= args.duration:
             break
@@ -321,6 +364,7 @@ def sample_processes(args):
         "requested_interval_seconds": args.interval,
         "mach_timebase": {"numer": reader.timebase.numer, "denom": reader.timebase.denom},
         "summary": summary,
+        "global_gpu_summary": summarize_gpu(samples),
         "samples": samples,
         "limitations": [
             "No automatic WebKit/XPC ownership attribution; only selected PIDs are included.",
@@ -330,19 +374,26 @@ def sample_processes(args):
             "RSS sums can double-count shared pages; physical-footprint sums are process-ledger sums, not a deduplicated system total.",
             "Sampled peaks can miss between-sample peaks; sequential process reads are not atomic.",
             "CPU is counter delta over elapsed monotonic time; 100 percent means one fully occupied CPU core.",
+            "GPU utilization is the machine-wide instantaneous AGXAccelerator counter, not attributable to Browser or WebKit; keep other GPU workloads stable.",
         ],
     }
 
 
 def positive(value):
-    number = float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be numeric") from None
     if not math.isfinite(number) or number <= 0:
         raise argparse.ArgumentTypeError("must be finite and positive")
     return number
 
 
 def positive_pid(value):
-    number = int(value)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be an integer PID") from None
     if number <= 0 or number > 2**31 - 1:
         raise argparse.ArgumentTypeError("must be a positive PID")
     return number
