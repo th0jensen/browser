@@ -4,7 +4,6 @@ import SwiftUI
 struct LinkPreviewCard: View {
     let preview: LinkPreviewPresentation
     private var state: LinkPreviewState { preview.state }
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let headerHeight: CGFloat = state.isKept ? 36 : 0
@@ -46,18 +45,7 @@ struct LinkPreviewCard: View {
                                 }
                             }
                         }
-                        if let error = state.error {
-                            Text(error).font(.system(size: 12)).foregroundStyle(.secondary)
-                        } else if state.isLoading && state.result == nil {
-                            VStack(alignment: .leading, spacing: 9) {
-                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.12)).frame(height: 11)
-                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: min(235, state.cardWidth - 28), height: 11)
-                                RoundedRectangle(cornerRadius: 3).fill(.primary.opacity(0.08)).frame(width: min(170, state.cardWidth - 28), height: 11)
-                            }.padding(.vertical, 6).modifier(IntelligenceShimmer(active: !reduceMotion))
-                                .accessibilityLabel("Loading link preview")
-                        }
                         HStack {
-                            if state.isLoading { ProgressView().controlSize(.mini) }
                             Spacer()
                             Button { preview.open() } label: {
                                 Label("Open Page", systemImage: "arrow.up.right").font(.system(size: 10))
@@ -77,7 +65,7 @@ struct LinkPreviewCard: View {
             }.scrollBounceBehavior(.basedOnSize)
         }
         .foregroundStyle(.primary)
-        .frame(width: state.cardWidth, height: min(state.contentHeight, state.maximumHeight))
+        .frame(width: state.cardWidth, height: min(max(state.contentHeight, 106), state.maximumHeight))
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .focusEffectDisabled()
         .onHover { preview.hover($0) }
