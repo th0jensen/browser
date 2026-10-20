@@ -58,6 +58,45 @@ final class BrowserExtensionTests: XCTestCase {
         XCTAssertNil(store.context(for: item))
     }
 
+    func testForcedDarkResourcesAreBundledWithBrowser() throws {
+        let resource = try XCTUnwrap(BuiltInExtensions.forcedDarkURL())
+        XCTAssertEqual(resource.lastPathComponent, "ForcedDark")
+        XCTAssertNil(Bundle.main.url(forResource: "ForcedDarkResources", withExtension: "bundle"))
+        XCTAssertTrue(BuiltInExtensions.isForcedDarkResource(resource))
+        for filename in ["background.js", "colors.js", "content.js", "loading.css", "popup.html", "popup.js"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: resource.appending(path: filename).path), filename)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: resource.appending(path: "tests").path))
+    }
+
+    func testBuiltInForcedDarkInstallsUpdatesAndAdoptsExistingImport() async throws {
+        let source = try makeExtension(name: "Forced Dark", description: BrowserExtensions.forcedDarkDescription,
+                                       permissions: ["storage", "nativeMessaging"])
+        try "first".write(to: source.appending(path: "content.js"), atomically: true, encoding: .utf8)
+        let storage = directory.appending(path: "installed")
+        let importer = BrowserExtensions(directory: storage, persistent: false)
+        try await importer.importResources(from: source)
+        let imported = try XCTUnwrap(importer.installed.first)
+        XCTAssertFalse(imported.isEnabled)
+
+        try "updated".write(to: source.appending(path: "content.js"), atomically: true, encoding: .utf8)
+        let managed = BrowserExtensions(directory: storage, persistent: false, builtInForcedDarkURL: source)
+        let adopted = try XCTUnwrap(managed.installed.first)
+        XCTAssertEqual(managed.installed.count, 1)
+        XCTAssertEqual(adopted.id, imported.id)
+        XCTAssertTrue(adopted.isManaged)
+        XCTAssertFalse(adopted.isEnabled)
+        XCTAssertEqual(try String(contentsOf: storage.appending(path: adopted.id.uuidString)
+            .appending(path: adopted.filename).appending(path: "content.js"), encoding: .utf8), "updated")
+        managed.remove(adopted)
+        XCTAssertEqual(managed.installed.map(\.id), [adopted.id])
+
+        let fresh = BrowserExtensions(directory: directory.appending(path: "fresh"), persistent: false,
+                                      builtInForcedDarkURL: source)
+        XCTAssertTrue(try XCTUnwrap(fresh.installed.first).isEnabled)
+        XCTAssertTrue(try XCTUnwrap(fresh.installed.first).isManaged)
+    }
+
     func testForcedDarkNativeMessageSetsAndClearsWebViewCanvasColor() async throws {
         let source = try makeExtension(name: "Forced Dark", description: BrowserExtensions.forcedDarkDescription,
                                        permissions: ["storage", "nativeMessaging"])

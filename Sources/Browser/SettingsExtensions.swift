@@ -14,11 +14,13 @@ struct ExtensionSettings: View {
                                 Task { await extensions.setEnabled(item, enabled) }
                             }))
                             .disabled(extensions.isBusy || item.needsNativeMessaging || (item.ruleCount == 0 && !item.isEnabled))
-                            if item.sourceAppName == nil {
+                            if item.sourceAppName == nil && !item.isManaged {
                                 Button("Remove", role: .destructive) { extensions.remove(item) }.disabled(extensions.isBusy)
                             }
                         }
-                        if item.needsNativeMessaging {
+                        if item.isManaged {
+                            Text("Built in and updated with Browser").font(.caption).foregroundStyle(.secondary)
+                        } else if item.needsNativeMessaging {
                             Text("Requires Safari’s companion app support").font(.caption).foregroundStyle(.secondary)
                         } else if item.kind == .contentBlocker {
                             Text(extensions.activeRuleCounts[item.id].map { "\($0.formatted()) active rules" }

@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-require('../colors.js');
+require('../ForcedDark/colors.js');
 const C = globalThis.ForcedDarkColors;
 const near = (actual,expected,epsilon=0.001) => actual.forEach((x,i) => assert.ok(Math.abs(x-expected[i]) < epsilon, `${actual} ≈ ${expected}`));
 

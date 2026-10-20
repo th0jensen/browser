@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const extension = path.join(__dirname,'..');
+const extension = path.join(__dirname,'..','ForcedDark');
 
 test('dynamic pages debounce subtree additions without rescanning on interaction churn', async () => {
   let mutationCallback;
