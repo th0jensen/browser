@@ -5,7 +5,7 @@ import WebKit
 
 @MainActor
 final class LinkPreviewPresentationTests: XCTestCase {
-    func testPreviewStaysHiddenUntilUsablePartialThenCascadesInPlace() async throws {
+    func testPreviewShowsShimmerThenCascadesContentInPlace() async throws {
         let partialGate = PreviewTestGate()
         let finalGate = PreviewTestGate()
         let partial = LinkSummary(title: "Loading", summary: "Useful partial preview content is ready.")
@@ -26,22 +26,25 @@ final class LinkPreviewPresentationTests: XCTestCase {
         await postPreviewMessage(path: "ready", to: fixture.view)
         try await waitUntil { controller.current != nil }
         let preparation = try XCTUnwrap(controller.current)
-        XCTAssertNil(controller.presentedPreview)
-        XCTAssertNil(preparation.glass)
+        let glass = try XCTUnwrap(preparation.glass)
+        XCTAssertNotNil(controller.presentedPreview)
+        XCTAssertTrue(preparation.state.isLoading)
         XCTAssertNil(preparation.state.result)
 
         await partialGate.open()
         try await waitUntil { controller.presentedPreview?.result?.title == "Loading" }
-        let glass = try XCTUnwrap(preparation.glass)
+        XCTAssertTrue(preparation.glass === glass)
+        XCTAssertTrue(preparation.state.isLoading)
         XCTAssertTrue(controller.current === preparation)
 
         await finalGate.open()
         try await waitUntil { controller.presentedPreview?.result?.title == "Ready" }
         XCTAssertTrue(preparation.glass === glass)
+        XCTAssertFalse(preparation.state.isLoading)
         XCTAssertEqual(controller.presentedPreview?.result?.summary, final.summary)
     }
 
-    func testLeavingLinkCancelsHiddenPreparationBeforeResultCompletes() async throws {
+    func testLeavingLinkCancelsLoadingPreviewBeforeResultCompletes() async throws {
         let resultGate = PreviewTestGate()
         let controller = LinkPreviewController(
             observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
@@ -65,7 +68,7 @@ final class LinkPreviewPresentationTests: XCTestCase {
         XCTAssertNil(preparation.glass)
     }
 
-    func testEarlyRefusalNeverMountsCard() async throws {
+    func testEarlyRefusalStopsShimmerAndShowsUnavailableState() async throws {
         let failureGate = PreviewTestGate()
         let controller = LinkPreviewController(
             observesSettings: false, modifierFlags: { .shift }, streamingSummaryProvider: { _, update in
@@ -81,13 +84,15 @@ final class LinkPreviewPresentationTests: XCTestCase {
         await postPreviewMessage(path: "failure", to: fixture.view)
         try await waitUntil { controller.current != nil }
         let preparation = try XCTUnwrap(controller.current)
-        XCTAssertNil(controller.presentedPreview)
+        XCTAssertNotNil(controller.presentedPreview)
+        XCTAssertTrue(preparation.state.isLoading)
         await failureGate.open()
-        try await waitUntil { controller.current == nil }
-        XCTAssertTrue(preparation.isClosed)
-        XCTAssertNil(preparation.glass)
-        XCTAssertNil(preparation.content)
-        XCTAssertNil(preparation.panel)
+        try await waitUntil { preparation.task == nil && !preparation.state.isLoading }
+        XCTAssertTrue(controller.current === preparation)
+        XCTAssertFalse(preparation.isClosed)
+        XCTAssertNil(preparation.state.result)
+        XCTAssertEqual(preparation.state.error, "Preview unavailable. Open the page to read it.")
+        XCTAssertNotNil(preparation.glass)
     }
 
     func testErrorAfterUsablePartialKeepsCascadedContentOnScreen() async throws {
@@ -107,16 +112,19 @@ final class LinkPreviewPresentationTests: XCTestCase {
         await postPreviewMessage(path: "late-failure", to: fixture.view)
         try await waitUntil { controller.current != nil }
         let preparation = try XCTUnwrap(controller.current)
-        XCTAssertNil(controller.presentedPreview)
+        XCTAssertNotNil(controller.presentedPreview)
+        XCTAssertTrue(preparation.state.isLoading)
         await partialGate.open()
         try await waitUntil { preparation.task == nil }
         XCTAssertTrue(controller.current === preparation)
         XCTAssertFalse(preparation.isClosed)
         XCTAssertEqual(controller.presentedPreview?.result?.summary, partial.summary)
+        XCTAssertFalse(preparation.state.isLoading)
+        XCTAssertNil(preparation.state.error)
         XCTAssertNotNil(preparation.glass)
     }
 
-    func testTimedOutPreviewCancelsBeforeMountingCard() async throws {
+    func testTimedOutPreviewStopsShimmerAndShowsUnavailableState() async throws {
         let deadlineGate = PreviewTestGate()
         let controller = LinkPreviewController(
             observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
@@ -133,13 +141,14 @@ final class LinkPreviewPresentationTests: XCTestCase {
         await postPreviewMessage(path: "timeout", to: fixture.view)
         try await waitUntil { controller.current != nil }
         let preparation = try XCTUnwrap(controller.current)
-        XCTAssertNil(controller.presentedPreview)
+        XCTAssertNotNil(controller.presentedPreview)
+        XCTAssertTrue(preparation.state.isLoading)
         await deadlineGate.open()
-        try await waitUntil { controller.current == nil }
-        XCTAssertTrue(preparation.isClosed)
-        XCTAssertNil(preparation.glass)
-        XCTAssertNil(preparation.content)
-        XCTAssertNil(preparation.panel)
+        try await waitUntil { !preparation.state.isLoading }
+        XCTAssertTrue(controller.current === preparation)
+        XCTAssertFalse(preparation.isClosed)
+        XCTAssertEqual(preparation.state.error, "Preview unavailable. Open the page to read it.")
+        XCTAssertNotNil(preparation.glass)
     }
 
     private func makeFixture(
