@@ -125,7 +125,7 @@ private struct PeekBackdrop: NSViewRepresentable {
     func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
 
-private struct PeekEscapeHandler: NSViewRepresentable {
+struct PeekEscapeHandler: NSViewRepresentable {
     let browser: BrowserModel
     func makeNSView(context: Context) -> EscapeView { EscapeView() }
     func updateNSView(_ view: EscapeView, context: Context) { view.browser = browser }
@@ -144,16 +144,21 @@ private struct PeekEscapeHandler: NSViewRepresentable {
                 self.window?.makeFirstResponder(view)
             }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                let handled = MainActor.assumeIsolated {
-                    guard let self, self.window === event.window, self.window?.attachedSheet == nil,
-                          self.browser?.peek != nil, event.keyCode == 53,
-                          event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else { return false }
-                    if self.browser?.peek?.tab.isFindBarVisible == true { self.browser?.closeFindBar() }
-                    else { self.browser?.dismissPeek() }
-                    return true
-                }
+                let handled = MainActor.assumeIsolated { self?.handleEscape(event) == true }
                 return handled ? nil : event
             }
+        }
+        func handleEscape(_ event: NSEvent) -> Bool {
+            guard event.type == .keyDown, event.keyCode == 53,
+                  event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+                  let window, event.window === window, window.attachedSheet == nil, NSApp.modalWindow == nil,
+                  let browser, let peek = browser.peek, browser.focusedPage === peek.tab,
+                  peek.tab.webView?.window === window else { return false }
+            // The page-local Find surface owns Escape while visible.
+            guard !peek.tab.isFindBarVisible,
+                  !FocusedTextInput.hasMarkedText(window.firstResponder) else { return false }
+            browser.dismissPeek()
+            return true
         }
         isolated deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
     }

@@ -544,14 +544,12 @@ struct BrowserWindow: View {
                     PageErrorView(error: error, isLoading: tab.isLoading) { tab.retry() }
                 }
             }
-            .overlay(alignment: .topTrailing) {
-                if tab.isFindBarVisible {
-                    FindBar(tab: tab, browser: browser)
-                        .padding(10)
-                        .transition(.opacity.combined(with: .offset(y: -4)))
+            .overlay {
+                if tab.isFindBarVisible, browser.focusedPage === tab {
+                    PageFindSurface(tab: tab, browser: browser)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .animation(.easeOut(duration: 0.15), value: tab.isFindBarVisible)
             .overlay(alignment: .topLeading) {
                 if tab.isLoading {
                     GeometryReader { geometry in

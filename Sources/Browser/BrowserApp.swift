@@ -172,6 +172,9 @@ private struct BrowserCommands: Commands {
                     .keyboardShortcut("e", modifiers: .command)
             }
             .disabled(pageTab == nil)
+            Button("Ask on Page…") { browser?.showPageQuestion() }
+                .keyboardShortcut("a", modifiers: [.command, .option])
+                .disabled(browser?.canAskOnPage != true)
             // Replacing the group removes these too, so they're sent to the page or text field as AppKit would.
             Menu("Spelling and Grammar") {
                 Button("Show Spelling and Grammar") { send(#selector(NSText.showGuessPanel(_:))) }

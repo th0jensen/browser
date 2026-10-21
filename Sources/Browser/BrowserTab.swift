@@ -54,7 +54,10 @@ final class BrowserTab: NSObject, Identifiable {
     @ObservationIgnored private var historyVisit: (id: UUID?, url: URL)?
     @ObservationIgnored private(set) var navigationRevision = 0
 
-    func invalidateNavigation() { navigationRevision &+= 1 }
+    func invalidateNavigation() {
+        navigationRevision &+= 1
+        browser?.dismissPageQuestion(for: id)
+    }
 
     func stopLoading() {
         invalidateNavigation()
@@ -143,6 +146,7 @@ final class BrowserTab: NSObject, Identifiable {
         let options: NSKeyValueObservingOptions = isRestoring ? [] : .initial
         observe(webView, \.url, options, updatesHistory: true) { tab, webView in
             tab.thumbnailCapture.invalidate()
+            if tab.url != webView.url { tab.invalidateNavigation() }
             tab.url = tab.loadError?.url ?? webView.url
             if tab.browser?.activeTabID == tab.id { tab.browser?.updateWindowTitle() }
             BrowserExtensions.shared.didChange(.URL, for: tab)
