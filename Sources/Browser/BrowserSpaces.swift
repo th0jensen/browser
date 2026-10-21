@@ -1,11 +1,54 @@
+import Darwin
 import Foundation
 import Observation
+
+enum BrowserSpaceIcon: String, Codable, CaseIterable, Identifiable, Sendable {
+    case circle, home, work, book, code, leaf, heart, lightbulb, travel, music
+    var id: String { rawValue }
+    var symbol: String {
+        switch self {
+        case .circle: "circle.grid.2x2.fill"
+        case .home: "house.fill"
+        case .work: "briefcase.fill"
+        case .book: "book.fill"
+        case .code: "chevron.left.forwardslash.chevron.right"
+        case .leaf: "leaf.fill"
+        case .heart: "heart.fill"
+        case .lightbulb: "lightbulb.fill"
+        case .travel: "airplane"
+        case .music: "music.note"
+        }
+    }
+    var title: String { rawValue.capitalized }
+}
+
+enum BrowserSpaceTheme: String, Codable, CaseIterable, Identifiable, Sendable {
+    case system, blue, purple, pink, orange, green, gray
+    var id: String { rawValue }
+    var title: String { self == .system ? "System Accent" : rawValue.capitalized }
+}
 
 /// A navigation context, not a separate login. This release uses one existing profile.
 struct BrowserSpace: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     var title: String
     let profileID: UUID
+    var icon: BrowserSpaceIcon = .circle
+    var theme: BrowserSpaceTheme = .system
+}
+
+extension BrowserSpace {
+    private enum CodingKeys: String, CodingKey { case id, title, profileID, icon, theme }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        profileID = try values.decode(UUID.self, forKey: .profileID)
+        // Appearance is optional metadata. Unknown future palette values must not hide saved tabs.
+        icon = (try? values.decode(String.self, forKey: .icon)).flatMap(BrowserSpaceIcon.init(rawValue:)) ?? .circle
+        theme = (try? values.decode(String.self, forKey: .theme)).flatMap(BrowserSpaceTheme.init(rawValue:)) ?? .system
+    }
 }
 
 @MainActor @Observable
@@ -16,8 +59,12 @@ final class BrowserSpaceStore {
     private let directory: URL
     private let enabled: Bool
     private var loadFailed = false
+    private var needsAppearanceBackup = false
     @ObservationIgnored private var folderStores: [UUID: TabFolderStore] = [:]
     @ObservationIgnored private var pinnedStores: [UUID: PinnedPageStore] = [:]
+    /// Narrow synchronous fault seam for metadata staging tests. Ordinary writes use no hook.
+    @ObservationIgnored private let writeCheckpoint: ((WriteCheckpoint, URL) throws -> Void)?
+    enum WriteCheckpoint { case partialStagingWrite, beforePublication }
 
     enum Failure: LocalizedError {
         case unavailable, invalidName, unsupportedProfile
@@ -30,15 +77,21 @@ final class BrowserSpaceStore {
         }
     }
 
-    init(directory: URL, enabled: Bool = true) {
+    init(directory: URL, enabled: Bool = true,
+         writeCheckpoint: ((WriteCheckpoint, URL) throws -> Void)? = nil) {
         self.directory = directory
         self.enabled = enabled
+        self.writeCheckpoint = writeCheckpoint
         let initial = BrowserSpace(id: Self.defaultSpaceID, title: "Default", profileID: BrowserProfile.defaultID)
         spaces = [initial]
         let file = directory.appending(path: "Spaces.json")
         guard enabled, FileManager.default.fileExists(atPath: file.path) else { return }
         do {
-            let saved = try JSONDecoder().decode([BrowserSpace].self, from: Data(contentsOf: file))
+            let data = try Data(contentsOf: file)
+            let saved = try JSONDecoder().decode([BrowserSpace].self, from: data)
+            if let records = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                needsAppearanceBackup = records.contains { $0["icon"] == nil || $0["theme"] == nil }
+            }
             var ids = Set<UUID>()
             // Do not reinterpret a foreign profile as the existing profile.
             guard saved.allSatisfy({ $0.profileID == BrowserProfile.defaultID && ids.insert($0.id).inserted }),
@@ -51,19 +104,75 @@ final class BrowserSpaceStore {
 
     @discardableResult
     func createSpace(title: String) throws -> BrowserSpace {
-        guard !loadFailed else { throw Failure.unavailable }
+        try createSpace(title: title, icon: .circle, theme: .system)
+    }
+
+    @discardableResult
+    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws -> BrowserSpace {
+        let space = BrowserSpace(id: UUID(), title: try cleanTitle(title), profileID: BrowserProfile.defaultID, icon: icon, theme: theme)
+        try commit(spaces + [space])
+        return space
+    }
+
+    func updateSpace(_ id: UUID, title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws {
+        guard let index = spaces.firstIndex(where: { $0.id == id }) else { throw Failure.unavailable }
+        var next = spaces
+        next[index].title = try cleanTitle(title)
+        next[index].icon = icon
+        next[index].theme = theme
+        try commit(next)
+    }
+
+    private func cleanTitle(_ title: String) throws -> String {
         let title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
         guard !title.isEmpty else { throw Failure.invalidName }
-        let space = BrowserSpace(id: UUID(), title: title, profileID: BrowserProfile.defaultID)
-        let next = spaces + [space]
+        return title
+    }
+
+    private func commit(_ next: [BrowserSpace]) throws {
+        guard !loadFailed else { throw Failure.unavailable }
         if enabled {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let file = directory.appending(path: "Spaces.json")
-            try JSONEncoder().encode(next).write(to: file, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            if needsAppearanceBackup {
+                let backup = directory.appending(path: "Spaces.before-appearance.json")
+                if FileManager.default.fileExists(atPath: backup.path) {
+                    _ = try JSONDecoder().decode([BrowserSpace].self, from: Data(contentsOf: backup))
+                } else {
+                    // An atomic hard link retains the original bytes before replacing the live file.
+                    try FileManager.default.linkItem(at: file, to: backup)
+                }
+            }
+            try writeMetadata(JSONEncoder().encode(next), to: file)
+            needsAppearanceBackup = false
         }
         spaces = next
-        return space
+    }
+
+    /// Never create an empty canonical file. Until rename succeeds, only this private staging file changes.
+    private func writeMetadata(_ data: Data, to file: URL) throws {
+        let temporary = directory.appending(path: ".Spaces-\(UUID()).tmp")
+        let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: temporary)
+        }
+        guard fchmod(descriptor, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        if let writeCheckpoint {
+            let midpoint = data.count / 2
+            try handle.write(contentsOf: data.prefix(midpoint))
+            try writeCheckpoint(.partialStagingWrite, temporary)
+            try handle.write(contentsOf: data.dropFirst(midpoint))
+        } else {
+            try handle.write(contentsOf: data)
+        }
+        try handle.synchronize()
+        try handle.close()
+        try writeCheckpoint?(.beforePublication, temporary)
+        // Same-directory rename publishes all bytes and mode together, for initial creation and replacement.
+        guard Darwin.rename(temporary.path, file.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     /// Legacy descriptors stay in place. Their identifiers and order do not change.
