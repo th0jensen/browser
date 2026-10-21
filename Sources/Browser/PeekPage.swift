@@ -39,8 +39,8 @@ enum PinnedNavigation {
 
 extension BrowserTab {
     var pinnedHomeURL: URL? {
-        if let page = browser?.folders.item(folderPageID) { return page.url }
-        return browser?.pinnedPages.items.first { $0.id == pinnedPageID }?.url
+        if let page = browser?.folders(forSpaceID: spaceID).item(folderPageID) { return page.url }
+        return browser?.pinnedPages(forSpaceID: spaceID).items.first { $0.id == pinnedPageID }?.url
     }
     var isAwayFromPinnedPage: Bool {
         pinnedHomeURL.map { !PinnedNavigation.isHome(url, home: $0) } ?? false

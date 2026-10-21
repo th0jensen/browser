@@ -6,7 +6,9 @@ import WebKit
 @MainActor
 @Observable
 final class BrowserTab: NSObject, Identifiable {
-    let id = UUID()
+    let id: UUID
+    let spaceID: UUID
+    let profileID: UUID
     /// The page’s web view, allocated on first navigation and released while a page is suspended.
     private(set) var webView: WKWebView?
     /// Hosts the web view, and the Web Inspector when it's docked, so both move together between windows and tabs.
@@ -19,7 +21,9 @@ final class BrowserTab: NSObject, Identifiable {
     @ObservationIgnored var openerID: UUID?
     /// Whether another page's script opened this one, and can still reach it through `window.opener`.
     @ObservationIgnored var isPopUp = false
-    @ObservationIgnored weak var browser: BrowserModel?
+    @ObservationIgnored private(set) weak var browser: BrowserModel?
+    /// Retain the actual store identity as well as the logical profile ID.
+    @ObservationIgnored private let ownedWebsiteDataStore: WKWebsiteDataStore?
     /// Extension pages require a configuration restricted to that extension's origin.
     @ObservationIgnored var extensionOrigin: URL?
     /// When the tab was last selected, so the least recently used tabs are suspended first.
@@ -76,8 +80,13 @@ final class BrowserTab: NSObject, Identifiable {
     @ObservationIgnored private var selectionWaiters: [CheckedContinuation<Bool, Never>] = []
 
     /// Pass the configuration WebKit provides when a page opens a window, so the new page keeps its opener.
-    init(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), browser: BrowserModel? = nil) {
+    init(configuration: WKWebViewConfiguration = BrowserTab.makeConfiguration(), browser: BrowserModel? = nil,
+         spaceID: UUID? = nil) {
+        id = UUID()
+        self.spaceID = spaceID ?? browser?.activeSpaceID ?? BrowserSpaceStore.defaultSpaceID
+        profileID = browser?.profileID ?? BrowserProfile.defaultID
         self.browser = browser
+        ownedWebsiteDataStore = browser?.websiteDataStore
         super.init()
         Self.prepareConfiguration(configuration, includingExtensions: browser?.isPrivate != true)
         if let browser { browser.preparePageConfiguration(configuration) }
@@ -86,16 +95,24 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     /// The native New Tab page needs no WebKit process until an address is opened.
-    init(newTabIn browser: BrowserModel) {
+    init(newTabIn browser: BrowserModel, id: UUID = UUID()) {
+        self.id = id
+        spaceID = browser.activeSpaceID
+        profileID = browser.profileID
         self.browser = browser
+        ownedWebsiteDataStore = browser.websiteDataStore
         super.init()
         pageDelegate.tab = self
     }
 
     /// A suspended tab for a page's saved history, such as a duplicated or reopened tab, which loads when it's selected.
     init(url: URL?, title: String, interactionState: Any?, browser: BrowserModel? = nil,
-         restoresVisit: Bool = false) {
+         restoresVisit: Bool = false, id: UUID = UUID()) {
+        self.id = id
+        spaceID = browser?.activeSpaceID ?? BrowserSpaceStore.defaultSpaceID
+        profileID = browser?.profileID ?? BrowserProfile.defaultID
         self.browser = browser
+        ownedWebsiteDataStore = browser?.websiteDataStore
         isNewTab = false
         self.url = url
         pageTitle = title
@@ -194,10 +211,18 @@ final class BrowserTab: NSObject, Identifiable {
         updateFavicon()
     }
 
+    private var canUseOwnedProfile: Bool {
+        guard let ownedWebsiteDataStore else { return true }
+        guard let browser else { return false }
+        return browser.websiteDataStore(forProfileID: profileID) === ownedWebsiteDataStore
+    }
+
     /// Recreates a suspended tab's web view with its history and scroll position, or loads its address.
     /// A pop-up gets a fresh configuration too, since its tie to the opener can't be restored.
     func restore() {
         guard webView == nil else { return }
+        // A detached or foreign descriptor must never fall back to default-profile cookies.
+        guard canUseOwnedProfile else { return }
         invalidateNavigation()
         let context = browser?.isPrivate == true ? nil : url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
         extensionOrigin = context?.baseURL
@@ -320,7 +345,7 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     var title: String {
-        if let page = browser?.folders.item(folderPageID) { return page.title }
+        if let page = browser?.folders(forSpaceID: spaceID).item(folderPageID) { return page.title }
         if !pageTitle.isEmpty { return pageTitle }
         return url?.host() ?? "New Tab"
     }
@@ -339,6 +364,7 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     func load(_ url: URL) {
+        guard canUseOwnedProfile else { return }
         invalidateNavigation()
         thumbnailCapture.invalidate()
         isNewTab = false
@@ -416,7 +442,8 @@ final class BrowserTab: NSObject, Identifiable {
 
     private func updateVisitTitle() {
         guard let historyVisit, let id = historyVisit.id, url == historyVisit.url, !pageTitle.isEmpty else { return }
-        if let browser, browser.isClosed || browser.tab(withID: self.id) !== self { return }
+        if let browser, browser.isClosed
+            || (browser.tabAcrossSpaces(withID: self.id) !== self && browser.peek?.tab !== self) { return }
         browser?.history?.updateTitle(of: id, to: pageTitle)
     }
 

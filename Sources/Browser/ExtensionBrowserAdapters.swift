@@ -2,7 +2,7 @@ import AppKit
 import WebKit
 
 extension BrowserModel: WKWebExtensionWindow {
-    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { tabs + (peek.map { [$0.tab] } ?? []) }
+    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { allTabs + (peek.map { [$0.tab] } ?? []) }
     func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { peek?.tab ?? activeTab }
     func windowType(for context: WKWebExtensionContext) -> WKWebExtension.WindowType { .normal }
     func isPrivate(for context: WKWebExtensionContext) -> Bool { isPrivate }
@@ -14,8 +14,8 @@ extension BrowserModel: WKWebExtensionWindow {
 
 extension BrowserTab: WKWebExtensionTab {
     func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { browser }
-    func indexInWindow(for context: WKWebExtensionContext) -> Int { browser?.tabs.firstIndex(where: { $0.id == id }) ?? browser?.tabs.count ?? 0 }
-    func parentTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { browser?.tab(withID: openerID) }
+    func indexInWindow(for context: WKWebExtensionContext) -> Int { browser?.allTabs.firstIndex(where: { $0.id == id }) ?? browser?.allTabs.count ?? 0 }
+    func parentTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { openerID.flatMap { browser?.tabAcrossSpaces(withID: $0) } }
     func webView(for context: WKWebExtensionContext) -> WKWebView? { webView }
     func title(for context: WKWebExtensionContext) -> String? { title }
     func url(for context: WKWebExtensionContext) -> URL? { url }
@@ -33,7 +33,12 @@ extension BrowserTab: WKWebExtensionTab {
     func goForward(for context: WKWebExtensionContext) async throws { webView?.goForward() }
     func activate(for context: WKWebExtensionContext) async throws {
         if browser?.peek?.tab === self { browser?.window?.makeFirstResponder(webView) }
-        else { browser?.activeTabID = id }
+        else if let browser {
+            if spaceID != browser.activeSpaceID, !browser.selectSpace(spaceID) {
+                throw ExtensionFailure("The tab's Space is not available in this window.")
+            }
+            browser.activeTabID = id
+        }
     }
     func setSelected(_ selected: Bool, for context: WKWebExtensionContext) async throws {
         if selected { try await activate(for: context) }

@@ -8,7 +8,8 @@ enum PreviewNoteActions {
                          activateApplication: () -> Void = { NSApp.activate() },
                          openElsewhere: (URL) -> Void = { ExternalURLRouter.shared.open([$0]) }) -> Task<Void, Never>? {
         guard let tab, let browser = tab.browser, !browser.isClosed,
-              browser.tab(withID: tab.id) === tab, let window = browser.window else {
+              (browser.tabAcrossSpaces(withID: tab.id) === tab || browser.peek?.tab === tab),
+              let window = browser.window else {
             openElsewhere(url)
             activateApplication()
             return nil
@@ -16,6 +17,11 @@ enum PreviewNoteActions {
         // A kept note can outlive the source tab's selection. A live peek has no
         // entry in the normal tab list and must not be assigned to activeTabID.
         if browser.peek?.tab !== tab {
+            if tab.spaceID != browser.activeSpaceID, !browser.selectSpace(tab.spaceID) {
+                openElsewhere(url)
+                activateApplication()
+                return nil
+            }
             browser.dismissPeek()
             browser.activeTabID = tab.id
         }

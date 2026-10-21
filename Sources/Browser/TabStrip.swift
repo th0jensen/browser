@@ -37,6 +37,7 @@ struct TabStrip: View {
     @State private var hoveredTabID: UUID?
     @State private var suppressedHoverCardTabID: UUID?
     @State private var sidebarViewport: CGRect?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private let spacing: CGFloat = 4
     private let maxTabWidth: CGFloat = 220
@@ -54,6 +55,11 @@ struct TabStrip: View {
         .modifier(SplitDropBadge(controller: browser.tabDrag))
         .task(id: hoveredTabID) { await updateHoverCard() }
         .onChange(of: browser.tabDrag.payload) { _, value in if value != nil { hoverCardTabID = nil } }
+        .onChange(of: browser.activeSpaceID) { _, _ in
+            hoveredTabID = nil
+            hoverCardTabID = nil
+            suppressedHoverCardTabID = nil
+        }
         .alert("On-device Intelligence", isPresented: Binding(get: { browser.intelligenceError != nil }, set: { if !$0 { browser.intelligenceError = nil } })) {
             Button("OK") { browser.intelligenceError = nil }
         } message: { Text(browser.intelligenceError ?? "") }
@@ -65,7 +71,7 @@ struct TabStrip: View {
             let visibleCount = regularTabs.filter { browser.sectionIsExpanded($0.temporarySection) }.count
             let count = CGFloat(max(1, visibleCount))
             let availableWidth = max(minTabWidth, geometry.size.width - BrowserChrome.edgeInset
-                                     - minDragAreaWidth)
+                                     - minDragAreaWidth - (browser.isPrivate || browser.isExtensionWindow ? 0 : 130))
             let sectionCount = regularTabs.enumerated().filter { index, tab in
                 tab.temporarySection != nil && (index == 0 || regularTabs[index - 1].temporarySection?.id != tab.temporarySection?.id)
             }.count
@@ -77,6 +83,9 @@ struct TabStrip: View {
             let tabsWidth = tabWidth * CGFloat(visibleCount) + spacing * CGFloat(max(0, visibleCount - 1)) + headerSpace + editingExtra
 
             HStack(spacing: spacing) {
+                if !browser.isPrivate && !browser.isExtensionWindow {
+                    SpaceSwitcher(browser: browser).frame(width: 130)
+                }
                 ScrollViewReader { scrollProxy in
                     ScrollView(.horizontal) {
                         HStack(spacing: spacing) {
@@ -142,9 +151,14 @@ struct TabStrip: View {
             let pinRows = CGFloat(max(1, (browser.pinnedPages.items.count + 2) / 3))
             let pinHeight = pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset
             let dropGapHeight = sidebarDividerHeight + BrowserChrome.smallGap * 3
-            let newTabFits = dropGapHeight + tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
+            let spaceControlHeight: CGFloat = browser.isPrivate || browser.isExtensionWindow ? 0 : 36
+            let newTabFits = spaceControlHeight + dropGapHeight + tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
 
             VStack(spacing: BrowserChrome.edgeInset) {
+                if !browser.isPrivate && !browser.isExtensionWindow {
+                    SpaceSwitcher(browser: browser)
+                        .padding(.horizontal, BrowserChrome.edgeInset)
+                }
                 PinnedPagesGrid(browser: browser)
                     .padding(.horizontal, BrowserChrome.edgeInset)
                     .zIndex(browser.tabDrag.payload?.hasPrefix("browser-essential:") == true ? 200 : 0)
@@ -184,7 +198,9 @@ struct TabStrip: View {
                     .onChange(of: browser.activeTabID) { _, activeTabID in
                         guard let activeTabID else { return }
                         let representedTab = browser.tab(withID: browser.activeSplit?.anchorID ?? activeTabID)
-                        withAnimation(.easeOut(duration: 0.2)) { scrollProxy.scrollTo(representedTab?.folderPageID ?? representedTab?.id ?? activeTabID) }
+                        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                            scrollProxy.scrollTo(representedTab?.folderPageID ?? representedTab?.id ?? activeTabID)
+                        }
                     }
                 }
                 if !newTabFits {

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Observation
 
@@ -11,17 +12,37 @@ struct TabSession: Codable, Equatable, Sendable {
     var pinnedPageID: UUID? = nil
     var folderPageID: UUID? = nil
     var temporarySection: TemporaryTabSection? = nil
+    var id: UUID? = nil
+    var spaceID: UUID? = nil
+    var profileID: UUID? = nil
+}
+
+struct SpaceSession: Codable, Equatable, Sendable {
+    var spaceID: UUID
+    var profileID: UUID
+    var tabs: [TabSession]
+    var selectedIndex: Int
+    var splits: [BrowserSessionSnapshot.Split]? = nil
 }
 
 struct WindowSession: Codable, Equatable, Sendable {
     var tabs: [TabSession]
     var selectedIndex: Int
     var splits: [BrowserSessionSnapshot.Split]? = nil
+    var activeSpaceID: UUID? = nil
+    var spaceSessions: [SpaceSession]? = nil
+    /// Unknown owners are retained here for recovery, never loaded into another profile.
+    var unavailableSpaceSessions: [SpaceSession]? = nil
 
-    init(tabs: [TabSession], selectedIndex: Int, splits: [BrowserSessionSnapshot.Split]? = nil) {
+    init(tabs: [TabSession], selectedIndex: Int, splits: [BrowserSessionSnapshot.Split]? = nil,
+         activeSpaceID: UUID? = nil, spaceSessions: [SpaceSession]? = nil,
+         unavailableSpaceSessions: [SpaceSession]? = nil) {
         self.tabs = tabs
         self.selectedIndex = selectedIndex
         self.splits = splits
+        self.activeSpaceID = activeSpaceID
+        self.spaceSessions = spaceSessions
+        self.unavailableSpaceSessions = unavailableSpaceSessions
     }
 
     init(legacy: BrowserSessionSnapshot) {
@@ -69,12 +90,22 @@ final class SessionStore {
     /// wait to be reopened from the History menu instead of reopening on launch.
     init(file: StoreFile? = .applicationSupport(named: "Session.plist"), restoresWindows: Bool = true,
          saveDelay: Duration = .milliseconds(150)) {
-        self.file = file
+        var writableFile = file
         self.saveDelay = saveDelay
         // Read right away, since the first window restores the session as soon as it appears.
         let saved: SessionSnapshot
-        if let data = file?.readNow(), let snapshot = try? PropertyListDecoder().decode(SessionSnapshot.self, from: data) {
+        if let file, let data = file.readNow(), let snapshot = try? PropertyListDecoder().decode(SessionSnapshot.self, from: data) {
             saved = snapshot
+            if (snapshot.windows + snapshot.closedWindows).contains(where: { $0.spaceSessions == nil }) {
+                let backup = file.url.deletingLastPathComponent().appending(path: "Session.before-spaces.plist")
+                do {
+                    try Self.preserveRecoveryCopy(data, at: backup)
+                } catch {
+                    // Never replace the only recoverable copy after a failed migration.
+                    writableFile = nil
+                    NSLog("Could not back up the pre-Spaces session: %@", error.localizedDescription)
+                }
+            }
         } else if let file, !FileManager.default.fileExists(atPath: file.url.path),
                   let data = try? Data(contentsOf: file.url.deletingLastPathComponent().appending(path: "Session.json")),
                   let legacy = try? JSONDecoder().decode(BrowserSessionSnapshot.self, from: data) {
@@ -82,7 +113,9 @@ final class SessionStore {
             saved = SessionSnapshot(windows: [WindowSession(legacy: legacy)])
         } else {
             saved = SessionSnapshot()
+            if let file, FileManager.default.fileExists(atPath: file.url.path) { writableFile = nil }
         }
+        self.file = writableFile
         pendingWindows = restoresWindows ? saved.windows : []
         reopenableWindows = !restoresWindows && !saved.windows.isEmpty ? saved.windows
             : saved.windows.isEmpty ? saved.closedWindows : []
@@ -90,6 +123,35 @@ final class SessionStore {
                                                    queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.saveBeforeQuitting() }
         }
+    }
+
+    /// The temporary file is owner-only before any session bytes are written.
+    /// Linking publishes it atomically without replacing an existing recovery file.
+    private static func preserveRecoveryCopy(_ data: Data, at backup: URL) throws {
+        let directory = backup.deletingLastPathComponent()
+        let temporary = directory.appending(path: ".Session-backup-\(UUID()).tmp")
+        let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: temporary)
+        }
+        guard fchmod(descriptor, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
+        try handle.close()
+        if Darwin.link(temporary.path, backup.path) != 0 {
+            guard errno == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            // A directory, symlink, or corrupt file is not a recovery copy.
+            let attributes = try FileManager.default.attributesOfItem(atPath: backup.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else { throw CocoaError(.fileReadCorruptFile) }
+            _ = try PropertyListDecoder().decode(SessionSnapshot.self, from: Data(contentsOf: backup))
+        }
+        let directoryDescriptor = Darwin.open(directory.path, O_RDONLY)
+        guard directoryDescriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(directoryDescriptor) }
+        guard fsync(directoryDescriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     private var openBrowsers: [BrowserModel] {
@@ -145,12 +207,12 @@ final class SessionStore {
         file?.writeNow(try? PropertyListEncoder.binary.encode(snapshot))
     }
 
-    /// Restores the first window into `browser` when it only has a new tab, and returns how many windows to open
-    /// for the rest.
+    /// Reuses `browser` only when every Space is safe to replace, with no unavailable or closed-tab recovery
+    /// state. Returns how many saved windows must open separately.
     func reopenLastSession(reusing browser: BrowserModel?) -> Int {
         var windows = reopenableWindows
         reopenableWindows = []
-        if let browser, !browser.isPrivate, !browser.isExtensionWindow, browser.isBlank, !windows.isEmpty {
+        if let browser, browser.canReplaceWindowWithSession, !windows.isEmpty {
             browser.restoreSession(windows.removeFirst())
         }
         pendingWindows += windows
@@ -172,8 +234,9 @@ final class SessionStore {
         withObservationTracking {
             for browser in openBrowsers {
                 _ = browser.activeTabID
+                _ = browser.activeSpaceID
                 _ = browser.splits
-                for tab in browser.tabs {
+                for tab in browser.allTabs {
                     _ = tab.url
                     _ = tab.pageTitle
                     _ = tab.isNewTab
