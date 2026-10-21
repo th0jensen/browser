@@ -243,6 +243,18 @@ private struct BrowserCommands: Commands {
             Button("Select Last Tab") { browser?.selectLastTab() }
                 .keyboardShortcut("9", modifiers: .command)
         }
+        CommandMenu("Spaces") {
+            ForEach(1...9, id: \.self) { number in
+                let space = browser.flatMap { model in
+                    model.spaces.spaces.indices.contains(number - 1) ? model.spaces.spaces[number - 1] : nil
+                }
+                Button(space.map { "Select Space \(number) — \($0.title)" } ?? "Select Space \(number)") {
+                    browser?.selectSpace(at: number - 1)
+                }
+                .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .control)
+                .disabled(space == nil || browser?.isPrivate != false || browser?.isExtensionWindow != false)
+            }
+        }
         // Native toggleToolbarShown: only changes NSToolbar.isVisible, which
         // auto-hide legitimately reconciles on the next layout. Use the shared
         // preference so View, keyboard, Settings and context menu agree.

@@ -543,10 +543,21 @@ final class BrowserModel: NSObject {
 
     @discardableResult
     func createSpace(title: String) throws -> BrowserSpace {
+        try createSpace(title: title, icon: .circle, theme: .system)
+    }
+
+    @discardableResult
+    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws -> BrowserSpace {
         guard !isPrivate, !isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
-        let space = try spaces.createSpace(title: title)
+        let space = try spaces.createSpace(title: title, icon: icon, theme: theme)
         selectSpace(space.id)
         return space
+    }
+
+    @discardableResult
+    func selectSpace(at index: Int) -> Bool {
+        guard spaces.spaces.indices.contains(index) else { return false }
+        return selectSpace(spaces.spaces[index].id)
     }
 
     @discardableResult
