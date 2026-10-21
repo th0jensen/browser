@@ -817,11 +817,7 @@ struct BrowserWindow: View {
                                  chromeHover.addressIsFocused = $0
                                  if !$0 { closeSuggestions() }
                              }, onSubmit: {
-                guard BrowserAddress.url(for: address) != nil, let tabID = browser.activeTabID else { return }
-                chromeHover.addressNavigationSubmitted(in: tabID)
-                browser.navigate(to: address)
-                browser.window?.makeFirstResponder(browser.activeTab?.webView)
-                chromeHover.addressIsFocused = false
+                _ = performAddressCommand(.submit)
             })
             .frame(minWidth: 0, idealWidth: 200, maxWidth: .infinity)
             zoomButton

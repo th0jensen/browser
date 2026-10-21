@@ -140,6 +140,44 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertEqual(fixture.source.navigationRevision, sourceRevision)
     }
 
+    func testFallbackAddressSubmissionFromEmptySpaceCreatesOnlyTheIntendedDestination() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let browser = fixture.browser
+        let destination = try browser.spaces.createSpace(title: "Empty Fallback", icon: .book, theme: .purple)
+        let sourceRevision = fixture.source.navigationRevision
+        XCTAssertTrue(browser.selectSpace(destination.id, createsInitialTab: false))
+        XCTAssertNil(browser.activeTab)
+        XCTAssertEqual(browser.allTabs.count, 1)
+        browser.requestAddressFocus()
+        try await waitFor("empty fallback editor focus") {
+            let editor = fixture.window.firstResponder as? NSTextView
+            let field = (editor?.delegate as AnyObject?) as? AddressField
+            return browser.consumedAddressFocusRequest == browser.addressFocusRequest && field != nil
+        }
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        let editor = try XCTUnwrap(fixture.window.firstResponder as? NSTextView)
+        let field = try XCTUnwrap((editor.delegate as AnyObject?) as? AddressField)
+        let coordinator = try XCTUnwrap(field.delegate as? AddressTextField.Coordinator)
+        let url = URL(string: "http://127.0.0.1:9/Fallback/Docs?token=AbC#Part")!
+        editor.selectAll(nil)
+        editor.insertText(url.absoluteString, replacementRange: editor.selectedRange())
+        try await waitFor("fallback address binding") { coordinator.parent.text == url.absoluteString }
+        coordinator.parent.onSubmit()
+        try await waitFor("fallback destination navigation") { browser.activeTab?.url == url }
+        let target = try XCTUnwrap(browser.activeTab)
+        XCTAssertEqual(target.spaceID, destination.id)
+        XCTAssertEqual(target.profileID, destination.profileID)
+        XCTAssertTrue(target.webView?.configuration.websiteDataStore === browser.websiteDataStore)
+        XCTAssertTrue(browser.focusedPage === target)
+        XCTAssertEqual(browser.tabs.count, 1)
+        XCTAssertEqual(browser.allTabs.count, 2)
+        XCTAssertTrue(browser.tabAcrossSpaces(withID: fixture.source.id) === fixture.source)
+        XCTAssertEqual(fixture.source.navigationRevision, sourceRevision)
+        XCTAssertEqual(browser.spaces.space(destination.id)?.icon, .book)
+        XCTAssertEqual(browser.spaces.space(destination.id)?.theme, .purple)
+    }
+
     func testSharedStripEntryActionOpensPaletteAndLegacyHostKeepsCompatibility() async throws {
         let fixture = try await fixture()
         defer { fixture.close() }
