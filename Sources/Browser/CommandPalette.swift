@@ -72,7 +72,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     private let bookmarks: BookmarkStore
     let field = AddressField()
     let table = CommandPaletteTable()
-    private let scroll = NSScrollView()
+    private let scroll = CommandPaletteResultsScrollView()
     private let content = CommandPaletteContent()
     private let hint = NSTextField(labelWithString: "Search tabs, Spaces, saved pages, or commands")
     private let separator = NSBox()
@@ -128,13 +128,17 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         let column = NSTableColumn(identifier: .init("result"))
         table.addTableColumn(column)
         table.headerView = nil
+        // The palette supplies its own margins and fixed two-line rows. Inferred
+        // inset styles can add padding outside the manually sized viewport.
+        table.style = .plain
+        table.rowSizeStyle = .custom
         table.rowHeight = 42
         table.intercellSpacing = NSSize(width: 0, height: 1)
         table.backgroundColor = .clear
         table.selectionHighlightStyle = .regular
         table.allowsEmptySelection = true
         table.allowsMultipleSelection = false
-        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.columnAutoresizingStyle = .noColumnAutoresizing
         table.dataSource = self
         table.delegate = self
         table.target = self
@@ -147,8 +151,11 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         scroll.documentView = table
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsetsZero
         for view in [symbol, field, separator, scroll, hint] { content.addSubview(view) }
     }
 
@@ -239,7 +246,8 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         let area = overlay.convert(anchor.bounds, from: anchor).intersection(overlay.bounds)
         guard area.width > 0, area.height > 0 else { return }
         let width = min(720, min(max(280, area.width * 0.78), max(0, area.width - 32)))
-        let resultHeight = results.isEmpty ? 36 : min(CGFloat(results.count * 43), min(336, max(42, area.height - 160)))
+        let rowsHeight = table.rowsHeight
+        let resultHeight = results.isEmpty ? 36 : min(rowsHeight, min(336, max(table.rowHeight, area.height - 160)))
         let height = 80 + resultHeight
         let centerY = area.midY + min(60, area.height * 0.08)
         let y = max(area.minY + 16, min(centerY - height / 2, area.maxY - height - 16))
@@ -249,8 +257,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         field.frame = NSRect(x: 48, y: 14, width: max(0, width - 66), height: 36)
         separator.frame = NSRect(x: 12, y: 64, width: max(0, width - 24), height: 1)
         scroll.frame = NSRect(x: 8, y: 72, width: max(0, width - 16), height: resultHeight)
-        table.frame.size = NSSize(width: scroll.contentSize.width, height: CGFloat(results.count * 43))
-        table.tableColumns.first?.width = scroll.contentSize.width
+        table.setFrameSize(NSSize(width: table.frame.width, height: rowsHeight))
+        scroll.tile()
+        scroll.layoutSubtreeIfNeeded()
         hint.frame = NSRect(x: 18, y: 80, width: max(0, width - 36), height: 20)
         hint.isHidden = !results.isEmpty
         scroll.isHidden = results.isEmpty
@@ -434,7 +443,43 @@ private final class CommandPaletteOverlay: NSView {
     override func scrollWheel(with event: NSEvent) {}
 }
 
+/// Size against the laid-out clip view, not the scroll view's nominal content
+/// size. Overlay scrollers occupy real pixels too; reserve their measured overlap
+/// only when the list actually overflows. Legacy scrollers already reduce the clip.
+final class CommandPaletteResultsScrollView: NSScrollView {
+    override func tile() {
+        super.tile()
+        fitResultColumn()
+    }
+
+    override func layout() {
+        super.layout()
+        fitResultColumn()
+    }
+
+    private func fitResultColumn() {
+        guard let table = documentView as? CommandPaletteTable else { return }
+        let canvasWidth = contentView.bounds.width
+        var columnWidth = canvasWidth
+        if table.rowsHeight > contentView.bounds.height,
+           let scroller = verticalScroller, !scroller.isHidden {
+            let overlap = contentView.convert(scroller.bounds, from: scroller).intersection(contentView.bounds)
+            if !overlap.isNull { columnWidth -= overlap.width }
+        }
+        // NSTableView's document canvas fills the clip even when its single
+        // column is narrower. Keep the measured overlay-scroller gutter in the
+        // column, rather than fighting AppKit's minimum document width.
+        if table.frame.width != canvasWidth { table.setFrameSize(NSSize(width: canvasWidth, height: table.frame.height)) }
+        let width = max(0, columnWidth)
+        if table.tableColumns.first?.width != width { table.tableColumns.first?.width = width }
+    }
+}
+
 final class CommandPaletteTable: NSTableView {
+    /// Includes native row origins and intercell spacing; do not approximate
+    /// this with result count times a separate row-height constant.
+    var rowsHeight: CGFloat { numberOfRows == 0 ? 0 : rect(ofRow: numberOfRows - 1).maxY }
+
     var performCommand: ((SuggestionAddressField.Command) -> Bool)?
     weak var inputField: NSTextField?
     override func keyDown(with event: NSEvent) {
@@ -463,7 +508,8 @@ private final class CommandPaletteResultCell: NSTableCellView {
     init() {
         super.init(frame: .zero)
         identifier = .init("CommandResult")
-        for label in [title, detail, action, space] {
+        for (label, name) in [(title, "title"), (detail, "detail"), (action, "action"), (space, "space")] {
+            label.identifier = .init("CommandResult.\(name)")
             label.lineBreakMode = .byTruncatingTail
             label.font = .systemFont(ofSize: label === title ? 13 : 11)
             addSubview(label)
@@ -481,6 +527,7 @@ private final class CommandPaletteResultCell: NSTableCellView {
         action.stringValue = result.actionLabel
         space.stringValue = result.destinationSpace.map { "In \($0)" } ?? ""
         symbol.image = NSImage(systemSymbolName: result.symbol, accessibilityDescription: nil)
+        for label in [title, detail, action, space] { label.toolTip = label.stringValue }
         setAccessibilityLabel([result.title, result.detail, result.actionLabel, result.destinationSpace].compactMap { $0 }.joined(separator: ", "))
     }
 
@@ -495,10 +542,14 @@ private final class CommandPaletteResultCell: NSTableCellView {
         super.layout()
         let contextWidth = min(170, bounds.width * 0.35)
         let textWidth = max(0, bounds.width - contextWidth - 56)
-        symbol.frame = NSRect(x: 10, y: 13, width: 16, height: 16)
-        title.frame = NSRect(x: 36, y: 5, width: textWidth, height: 17)
-        detail.frame = NSRect(x: 36, y: 23, width: textWidth, height: 15)
-        action.frame = NSRect(x: bounds.width - contextWidth - 10, y: 5, width: contextWidth, height: 17)
-        space.frame = NSRect(x: action.frame.minX, y: 23, width: contextWidth, height: 15)
+        let firstHeight = ceil(max(title.intrinsicContentSize.height, action.intrinsicContentSize.height))
+        let secondHeight = ceil(max(detail.intrinsicContentSize.height, space.intrinsicContentSize.height))
+        let firstY = max(0, (bounds.height - firstHeight - secondHeight - 2) / 2)
+        let secondY = firstY + firstHeight + 2
+        symbol.frame = NSRect(x: 10, y: (bounds.height - 16) / 2, width: 16, height: 16)
+        title.frame = NSRect(x: 36, y: firstY, width: textWidth, height: firstHeight)
+        detail.frame = NSRect(x: 36, y: secondY, width: textWidth, height: secondHeight)
+        action.frame = NSRect(x: bounds.width - contextWidth - 10, y: firstY, width: contextWidth, height: firstHeight)
+        space.frame = NSRect(x: action.frame.minX, y: secondY, width: contextWidth, height: secondHeight)
     }
 }

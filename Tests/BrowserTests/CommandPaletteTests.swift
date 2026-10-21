@@ -510,6 +510,112 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertEqual(fixture.browser.allTabs.count, 1)
     }
 
+    func testResultClipAndTextGeometryFitsAcrossCountsScrollerStylesAndResizes() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let longSpace = "Research Space with a deliberately long destination context name"
+        try fixture.browser.spaces.updateSpace(fixture.browser.activeSpaceID, title: longSpace, icon: .book, theme: .purple)
+        for count in [3, 5, 7, 8] {
+            for index in 0..<(count - 2) {
+                fixture.browser.history?.recordVisit(to: URL(string: "http://geometry.invalid/\(count)/\(index)")!,
+                    title: "Readable\(count) " + String(repeating: "Long history title ", count: 8))
+            }
+        }
+        let palette = try await open(fixture)
+        let scroll = try XCTUnwrap(palette.table.enclosingScrollView as? CommandPaletteResultsScrollView)
+        let webView = try XCTUnwrap(fixture.source.webView)
+        let sourceRevision = fixture.source.navigationRevision
+        for style in [NSScroller.Style.legacy, .overlay] {
+            scroll.scrollerStyle = style // Local test view only; no user preference override.
+            for size in [NSSize(width: 1440, height: 852), NSSize(width: 700, height: 480), NSSize(width: 1440, height: 852)] {
+                fixture.window.setFrame(NSRect(origin: fixture.window.frame.origin, size: size), display: false)
+                fixture.window.layoutIfNeeded()
+                try await waitFor("native resized content area") {
+                    guard let anchor = palette.anchor else { return false }
+                    return anchor.bounds.width > size.width / 2 && anchor.bounds.width < size.width
+                }
+                for count in [1, 3, 5, 7, 8, 5, 3, 1] {
+                    let title = (count == 1 ? "Geometry source" : "Readable\(count) " + String(repeating: "Long live title ", count: 8))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let json = String(decoding: try JSONEncoder().encode(title), as: UTF8.self)
+                    _ = try await webView.evaluateJavaScript("document.title = \(json)")
+                    try await waitFor("local title metadata") { fixture.source.pageTitle == title }
+                    XCTAssertTrue(fixture.window.firstResponder === palette.field.currentEditor())
+                    try await type("Readable\(count)", in: palette)
+                    await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+                    fixture.window.contentView?.layoutSubtreeIfNeeded()
+                    palette.layoutPresentation()
+                    scroll.layoutSubtreeIfNeeded()
+                    XCTAssertEqual(palette.results.count, count)
+                    try assertReadableResultGeometry(palette, longSpace: longSpace)
+                    XCTAssertTrue(fixture.window.firstResponder === palette.field.currentEditor())
+                }
+            }
+        }
+        XCTAssertEqual(fixture.browser.allTabs.count, 1)
+        XCTAssertEqual(fixture.source.navigationRevision, sourceRevision)
+    }
+
+    private func assertReadableResultGeometry(_ palette: CommandPaletteController, longSpace: String,
+                                             file: StaticString = #filePath, line: UInt = #line) throws {
+        let table = palette.table
+        let scroll = try XCTUnwrap(table.enclosingScrollView, file: file, line: line)
+        let anchor = try XCTUnwrap(palette.anchor, file: file, line: line)
+        let clip = scroll.contentView
+        let naturalHeight = table.rect(ofRow: table.numberOfRows - 1).maxY
+        let heightLimit = min(336, max(table.rowHeight, anchor.bounds.height - 160))
+        let fitting = naturalHeight <= heightLimit
+        let diagnostic = "rows=\(table.numberOfRows), style=\(scroll.scrollerStyle), clip=\(clip.bounds), table=\(table.frame), row=\(table.rowHeight), spacing=\(table.intercellSpacing), insets=\(scroll.contentInsets)"
+        XCTAssertEqual(table.effectiveStyle, .plain, diagnostic, file: file, line: line)
+        XCTAssertEqual(table.rowsHeight, naturalHeight, accuracy: 0.5, file: file, line: line)
+        var columnWidth = clip.bounds.width
+        if naturalHeight > clip.bounds.height, let scroller = scroll.verticalScroller, !scroller.isHidden {
+            let overlap = clip.convert(scroller.bounds, from: scroller).intersection(clip.bounds)
+            if !overlap.isNull { columnWidth -= overlap.width }
+        }
+        XCTAssertEqual(table.tableColumns[0].width, columnWidth, accuracy: 0.5, diagnostic, file: file, line: line)
+        XCTAssertEqual(table.frame.width, clip.bounds.width, accuracy: 0.5, diagnostic, file: file, line: line)
+        XCTAssertFalse(scroll.hasHorizontalScroller, file: file, line: line)
+        if fitting {
+            XCTAssertGreaterThanOrEqual(clip.bounds.height + 0.5, naturalHeight, diagnostic, file: file, line: line)
+            // AppKit can align half of the one-point intercell gap outside the
+            // clip. Text rectangles below must still be wholly visible.
+            XCTAssertTrue(scroll.documentVisibleRect.insetBy(dx: -0.5, dy: -0.5).contains(table.rect(ofRow: table.numberOfRows - 1)),
+                          diagnostic, file: file, line: line)
+        } else {
+            XCTAssertLessThan(clip.bounds.height, naturalHeight, diagnostic, file: file, line: line)
+            XCTAssertLessThanOrEqual(clip.bounds.height, heightLimit + 0.5, diagnostic, file: file, line: line)
+            table.scrollRowToVisible(table.numberOfRows - 1)
+            scroll.layoutSubtreeIfNeeded()
+        }
+        let rows = fitting ? Array(0..<table.numberOfRows) : [table.numberOfRows - 1]
+        for row in rows {
+            let cell = try XCTUnwrap(table.view(atColumn: 0, row: row, makeIfNecessary: true), file: file, line: line)
+            cell.layoutSubtreeIfNeeded()
+            let labels = cell.subviews.compactMap { $0 as? NSTextField }
+            XCTAssertEqual(labels.count, 4, file: file, line: line)
+            for label in labels {
+                let frame = label.convert(label.bounds, to: table)
+                XCTAssertTrue(cell.bounds.contains(label.frame), "\(label.identifier?.rawValue ?? "label") outside cell: \(diagnostic)", file: file, line: line)
+                XCTAssertGreaterThanOrEqual(label.frame.height + 0.5, label.intrinsicContentSize.height, diagnostic, file: file, line: line)
+                XCTAssertTrue(scroll.documentVisibleRect.contains(frame), "\(label.identifier?.rawValue ?? "label") clipped: \(diagnostic)", file: file, line: line)
+                if let scroller = scroll.verticalScroller, !scroller.isHidden {
+                    let obstruction = table.convert(scroller.bounds, from: scroller)
+                    XCTAssertFalse(frame.intersects(obstruction), "Label under scroller: \(diagnostic)", file: file, line: line)
+                }
+                if label.identifier?.rawValue == "CommandResult.action" {
+                    XCTAssertGreaterThanOrEqual(label.frame.width + 0.5, label.intrinsicContentSize.width,
+                                               "Action text must fit at these supported window widths", file: file, line: line)
+                }
+                if label.identifier?.rawValue == "CommandResult.space", !label.stringValue.isEmpty {
+                    XCTAssertEqual(label.stringValue, "In \(longSpace)", file: file, line: line)
+                    XCTAssertEqual(label.toolTip, label.stringValue, file: file, line: line)
+                    XCTAssertTrue(cell.accessibilityLabel()?.contains(longSpace) == true, file: file, line: line)
+                }
+            }
+        }
+    }
+
     func testLocationRequestDismissesPaletteAndKeepsTheNativeAddressPath() async throws {
         let fixture = try await fixture()
         defer { fixture.close() }
