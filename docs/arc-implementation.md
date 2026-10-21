@@ -20,12 +20,12 @@ The shared workflow PR allows the existing Debug test job to run on stacked PRs.
 | Tab suspension eligibility | `pi-agent/arc-tab-lifecycle` | Spaces | [Draft PR #25](https://github.com/th0jensen/browser/pull/25); integrated Debug tests passed; latest Space parent inherited |
 | Explicit Shift-click Peek | `pi-agent/arc-peek-gesture` | PR workflow | [Draft PR #28](https://github.com/th0jensen/browser/pull/28); source-owned Split action reviewed and tested; native visual/input checks pending |
 | Spaces and ownership foundation | `pi-agent/arc-spaces` | PR workflow | [Draft PR #26](https://github.com/th0jensen/browser/pull/26); bottom strip, native swipe and atomic metadata tests passed; partial native QA, not full acceptance |
-| Arc-like command palette and local results | `pi-agent/arc-command-bar` | Spaces | Local result engine reviewed; centered Liquid Glass presentation revision active |
+| Arc-like command palette and local results | `pi-agent/arc-command-bar` | Spaces | [Draft PR #34](https://github.com/th0jensen/browser/pull/34); Debug tests and source review passed; installed native QA found clipped result labels/rows, fix active |
 | Reversible temporary-tab archive | `pi-agent/arc-tab-archive` | Spaces | [Draft PR #31](https://github.com/th0jensen/browser/pull/31); editor/durability/policy reviews and Debug tests passed; CI passed |
-| Local page questions and citations | `pi-agent/arc-page-answers` | Naming | Find-linked glass surface tested; webpage-IME Escape correction active |
+| Local page questions and citations | `pi-agent/arc-page-answers` | Naming | [Draft PR #33](https://github.com/th0jensen/browser/pull/33); Find-linked surface and focused-client IME fix reviewed; Debug tests and CI passed; native comparison pending |
 | Deterministic link routing | `pi-agent/arc-link-routing` | Spaces | [Draft PR #30](https://github.com/th0jensen/browser/pull/30); Debug tests passed; native visual/delivery checks pending |
 | Separate persistent profiles | `pi-agent/arc-profiles` | Spaces | [Draft PR #32](https://github.com/th0jensen/browser/pull/32); privacy/recovery reviews passed; final footer/swipe/staging parent passed Debug tests |
-| Profile-shared live Favorites | `pi-agent/arc-favorites` | Profiles and Spaces | Typed ownership/migration contract approved; implementation and validation active |
+| Profile-shared live Favorites | `pi-agent/arc-favorites` | Profiles and Spaces | Initial implementation passed Debug tests; review found destination-ID collision, legacy-source mutation, grouped recovery and lazy-switch defects; fixes active, unpublished |
 
 ## 3. Prompt rules
 
@@ -35,7 +35,7 @@ All inference stays on device. Model output cannot authorize file movement, choo
 
 ## 4. Review and validation gates
 
-The [Arc reference and visual acceptance contract](arc-visual-verification.md) is part of the user's requirements. Use official behavior references and inspect actual public images before accepting a UI section. Keep Arc's useful placement and hierarchy while using Browser's native Liquid Glass. The initial top Space menu and ordinary address suggestions did not meet that requirement. Bottom-strip and centered-palette revisions are implemented and tested; native acceptance remains separate. The [independent cross-feature reference audit](arc-reference-audit.md) records official behavior sources, inspected images, concrete design gaps, deliberate Browser adaptations, and required native comparison states. It is a source/reference snapshot, not a GUI pass. In particular, profile-shared Favorites and Find-linked answers need correction; the themed footer is now present in source and has passed Debug tests.
+The [Arc reference and visual acceptance contract](arc-visual-verification.md) is part of the user's requirements. Use official behavior references and inspect actual public images before accepting a UI section. Keep Arc's useful placement and hierarchy while using Browser's native Liquid Glass. The initial top Space menu and ordinary address suggestions did not meet that requirement. Bottom-strip and centered-palette revisions are implemented and tested; native acceptance remains separate. The [independent cross-feature reference audit](arc-reference-audit.md) records official behavior sources, inspected images, concrete design gaps, deliberate Browser adaptations, and required native comparison states. It is a source/reference snapshot, not a GUI pass. Find-linked answers and the themed footer are now present in reviewed, tested source. Profile-shared Favorites still have concrete safety corrections pending. Installed Command Bar QA confirmed its hierarchy and real material, but found clipped action labels and final rows at normal width. These are acceptance failures, not decoration requests.
 
 - Read current source before changing it. Keep cleanup inside the feature scope.
 - Add deterministic regression tests for state, safety, cancellation, and migration.
