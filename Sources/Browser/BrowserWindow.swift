@@ -158,6 +158,9 @@ struct BrowserWindow: View {
         .sheet(isPresented: $browser.isShowingClearData) {
             if let browsingData { ClearDataView(data: browsingData) }
         }
+        .sheet(isPresented: $browser.isShowingArchive) {
+            if !browser.isPrivate, !browser.isExtensionWindow { TabArchiveView(browser: browser) }
+        }
         .sheet(isPresented: $browser.isShowingHistory) {
             if let history = browser.history {
                 HistoryView(history: history) { url, inNewTab in

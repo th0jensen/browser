@@ -20,6 +20,15 @@ final class BrowserModel: NSObject {
     @ObservationIgnored weak var sessionStore: SessionStore?
     var findFocusRequest = 0
     var isShowingHistory = false
+    var isShowingArchive = false
+    var archiveError: String?
+    let tabArchive: TabArchiveStore
+    private(set) var lastArchivedRecordID: UUID?
+    @ObservationIgnored private var archiveSelectionRevision = 0
+    @ObservationIgnored private var pendingArchiveIDs: Set<UUID> = []
+    @ObservationIgnored private var archiveIdlePolicy = TabArchiveIdlePolicy()
+    @ObservationIgnored var archiveMediaCheck: (BrowserTab) async -> Bool = { await $0.isPlayingMedia() }
+    @ObservationIgnored var archiveWorkCheck: (BrowserTab) async -> Bool = { await ArchivePageWorkObserver.shared.confirm($0) }
     var isShowingClearData = false
     let profileID = BrowserProfile.defaultID
     let spaces: BrowserSpaceStore
@@ -62,6 +71,7 @@ final class BrowserModel: NSObject {
     var activeTabID: UUID? {
         didSet {
             guard oldValue != activeTabID, !isRestoringSpaces else { return }
+            archiveSelectionRevision &+= 1
             // Existing commands select only within the current Space.
             if let activeTabID, !tabs.contains(where: { $0.id == activeTabID }) {
                 self.activeTabID = oldValue
@@ -73,6 +83,7 @@ final class BrowserModel: NSObject {
                 // Keep a preview of the page being left for background-tab hover cards.
                 previousTab.captureThumbnail(afterScreenUpdates: false, minimumAge: .seconds(2))
                 previousTab.lastActive = .now
+                previousTab.lastUsedAt = Date()
             }
             if activeTab?.isNewTab != true { activeTab?.restore() }
             restoreVisibleSplit()
@@ -123,7 +134,7 @@ final class BrowserModel: NSObject {
          history: HistoryStore? = nil, zoomLevels: ZoomStore = .shared,
          websiteDataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore,
          passwords: PasswordManager? = nil, isPrivate: Bool = false, createsInitialTab: Bool = true,
-         spaces: BrowserSpaceStore? = nil) {
+         spaces: BrowserSpaceStore? = nil, tabArchive: TabArchiveStore? = nil) {
         self.chromePreferences = chromePreferences ?? WindowChromePreferences()
         self.downloads = downloads
         self.sitePermissions = isPrivate ? SitePermissions() : sitePermissions
@@ -131,6 +142,8 @@ final class BrowserModel: NSObject {
         self.zoomLevels = isPrivate ? ZoomStore(defaults: nil) : zoomLevels
         self.websiteDataStore = isPrivate && websiteDataStore.isPersistent ? .nonPersistent() : websiteDataStore
         self.isPrivate = isPrivate
+        self.tabArchive = isPrivate ? TabArchiveStore()
+            : tabArchive ?? (BrowserProfile.isTesting ? TabArchiveStore() : .shared)
         self.passwords = !isPrivate && websiteDataStore.isPersistent && BrowserProfile.qaDirectory == nil ? passwords : nil
         let spaceStore = isPrivate ? BrowserSpaceStore(directory: BrowserProfile.directory, enabled: false)
             : spaces ?? (BrowserProfile.isTesting ? BrowserSpaceStore(directory: BrowserProfile.directory, enabled: false) : .shared)
@@ -140,6 +153,7 @@ final class BrowserModel: NSObject {
         self.defaultFolders = isPrivate ? TabFolderStore(directory: BrowserProfile.directory, enabled: false)
             : folders ?? spaceStore.folders(for: BrowserSpaceStore.defaultSpaceID)
         super.init()
+        if !isPrivate { self.tabArchive.attach(self) }
         tabDrag.canSplit = { [weak self] source, target in self?.canSplitDrag(source, with: target) == true }
         if createsInitialTab { addTab(configuration: configuration) }
         suspender = TabSuspender(browser: self)
@@ -552,6 +566,7 @@ final class BrowserModel: NSObject {
         guard !isPrivate, !isExtensionWindow, let space = spaces.space(id),
               space.profileID == profileID else { return false }
         guard id != activeSpaceID else { return true }
+        archiveSelectionRevision &+= 1
         cancelTidyingTabs()
         titleTasks.values.forEach { $0.cancel() }
         titleTasks = [:]
@@ -563,6 +578,7 @@ final class BrowserModel: NSObject {
         if let tab = activeTab {
             if let view = tab.webView { LinkPreviewController.shared.dismiss(for: view) }
             tab.lastActive = .now
+            tab.lastUsedAt = Date()
         }
         inactiveSpaces[activeSpaceID] = BrowserSpaceState(tabs: tabs, selectedTabID: activeTabID, splits: splits)
         closedTabsBySpace[activeSpaceID] = closedTabs
@@ -600,7 +616,7 @@ final class BrowserModel: NSObject {
             TabSession(url: tab.isNewTab ? nil : tab.url, title: tab.pageTitle,
                        interactionState: tab.isNewTab ? nil : tab.interactionState as? Data,
                        pinnedPageID: tab.pinnedPageID, folderPageID: tab.folderPageID, temporarySection: tab.temporarySection,
-                       id: tab.id, spaceID: tab.spaceID, profileID: tab.profileID)
+                       id: tab.id, spaceID: tab.spaceID, profileID: tab.profileID, lastUsedAt: tab.lastUsedAt)
         }, selectedIndex: state.selectedTabID.flatMap { indices[$0] } ?? 0, splits: savedSplits.isEmpty ? nil : savedSplits)
     }
 
@@ -680,6 +696,9 @@ final class BrowserModel: NSObject {
                                        folderPageID: $0.folderPageID, temporarySection: $0.temporarySection)
         }, selectedIndex: selectedIndex)
         restoreSession(legacy, interactionStates: entries.map(\.interactionState), splits: splits, tabIDs: entries.map(\.id))
+        for (tab, entry) in zip(tabs, entries) {
+            if let date = entry.lastUsedAt, date.timeIntervalSince1970.isFinite { tab.lastUsedAt = date }
+        }
     }
 
     func restoreSession(_ session: BrowserSessionSnapshot, interactionStates: [Data?] = [],
@@ -1111,6 +1130,196 @@ final class BrowserModel: NSObject {
     func showWebInspector() {
         guard let tab = focusedPage, !tab.isNewTab, let webView = tab.webView else { return }
         WebInspector.show(for: webView)
+    }
+
+    // MARK: - Reversible temporary archive
+
+    func archivePolicyScope() -> TabArchivePolicyScope? {
+        guard let space = spaces.space(activeSpaceID) else { return nil }
+        let scope = TabArchivePolicyScope(spaceID: space.id, profileID: space.profileID, spaceTitle: space.title)
+        return scope.isCurrent(in: self) ? scope : nil
+    }
+
+    /// Returns false if a write completed for the captured owner after the sheet's context changed.
+    /// Never retry against a newly active profile or undo a successfully acknowledged write silently.
+    func setArchivePolicy(_ policy: TabArchiveProfilePolicy, for scope: TabArchivePolicyScope) async throws -> Bool {
+        guard scope.isCurrent(in: self) else { throw TabArchiveError.policyScopeChanged }
+        try await tabArchive.setPolicy(policy, forProfileID: scope.profileID) { [weak self] in
+            self.map { scope.isCurrent(in: $0) } ?? false
+        }
+        return scope.isCurrent(in: self)
+    }
+
+    func canArchive(_ tab: BrowserTab, automatically: Bool = false) -> Bool {
+        guard !isPrivate, !isExtensionWindow, !isClosed, tab.browser === self,
+              tab.spaceID == activeSpaceID, tab.profileID == profileID,
+              spaces.space(tab.spaceID)?.profileID == profileID,
+              tabAcrossSpaces(withID: tab.id) === tab, tabs.contains(where: { $0 === tab }),
+              !visibleTabIDs.contains(tab.id), split(containing: tab.id) == nil,
+              tab.pinnedPageID == nil, tab.folderPageID == nil, !tab.isPopUp,
+              peek?.openerID != tab.id, peek?.tab !== tab,
+              !allTabs.contains(where: { $0.openerID == tab.id || $0.id == tab.openerID }),
+              !downloads.isDownloading, tab.canArchiveWork,
+              let url = tab.url, ["https", "http"].contains(url.scheme?.lowercased() ?? "") else { return false }
+        // An explicit URL/history archive may include a lazy descriptor with no document signal.
+        // Automatic removal never treats unknown work as clean.
+        return !automatically || (tab.archivePageWork == .readOnly
+            && tabArchive.policy(forProfileID: tab.profileID).automaticEnabled)
+    }
+
+    @discardableResult
+    func archiveTab(_ id: UUID, automatically: Bool = false) async -> Bool {
+        guard let tab = tab(withID: id), !pendingArchiveIDs.contains(id), canArchive(tab, automatically: automatically) else {
+            if !automatically { archiveError = "The tab was kept because it is visible, saved, or has active or unknown work." }
+            return false
+        }
+        archiveError = nil
+        pendingArchiveIDs.insert(id)
+        defer { pendingArchiveIDs.remove(id) }
+        let selection = archiveSelectionRevision
+        let revision = tab.navigationRevision
+        let workRevision = tab.archiveWorkRevision
+        let url = tab.url
+        let lastUsed = tab.lastUsedAt
+        let automaticPolicy = tabArchive.policy(forProfileID: tab.profileID)
+        let order = tabs.map(\.id)
+        func current() -> Bool {
+            !Task.isCancelled && selection == archiveSelectionRevision && revision == tab.navigationRevision
+                && workRevision == tab.archiveWorkRevision && url == tab.url && lastUsed == tab.lastUsedAt
+                && order == tabs.map(\.id) && canArchive(tab, automatically: automatically)
+                && (!automatically || tabArchive.policy(forProfileID: tab.profileID) == automaticPolicy)
+        }
+        guard await archiveWorkCheck(tab), current(), !(await archiveMediaCheck(tab)), current(),
+              let url, let index = tabs.firstIndex(where: { $0 === tab }) else {
+            if !automatically { archiveError = "The tab was kept because it changed or has active or unknown work." }
+            return false
+        }
+        let state = tab.interactionState as? Data
+        guard (state?.count ?? 0) <= TabArchiveStore.maximumStateBytes else {
+            if !automatically { archiveError = TabArchiveError.capacity.localizedDescription }
+            return false
+        }
+        let record = ArchivedTab(id: UUID(), tabID: id, spaceID: tab.spaceID, profileID: tab.profileID,
+                                 url: url, title: String(tab.pageTitle.prefix(1024)), archivedAt: Date(),
+                                 lastUsedAt: tab.lastUsedAt,
+                                 interactionState: state,
+                                 originalIndex: index)
+        do {
+            // Do not remove a descriptor after merely queuing a void write.
+            try await tabArchive.insert(record)
+            guard current(), await archiveWorkCheck(tab), current(), !(await archiveMediaCheck(tab)), current() else {
+                pendingArchiveIDs.remove(id)
+                await reconcileArchiveRecovery()
+                if !automatically { archiveError = "The tab changed or has active work. Its live page was kept." }
+                return false
+            }
+            // No suspension point between the final safety check and descriptor removal.
+            tabs.removeAll { $0 === tab }
+            tab.stopLoading()
+            tab.suspend()
+            BrowserExtensions.shared.didClose(tab)
+            lastArchivedRecordID = record.id
+            window?.undoManager?.registerUndo(withTarget: self) { browser in
+                Task { @MainActor in _ = await browser.restoreArchivedTab(record.id) }
+            }
+            window?.undoManager?.setActionName("Archive Tab")
+            requestSessionSave()
+            // A failed session write is recoverable: a stale live session wins over its archive copy.
+            try? await sessionStore?.saveAcknowledged()
+            return true
+        } catch {
+            if !automatically { archiveError = error.localizedDescription }
+            return false
+        }
+    }
+
+    @discardableResult
+    func restoreArchivedTab(_ id: UUID, select: Bool = true) async -> Bool {
+        guard !isPrivate, !isExtensionWindow, !isClosed,
+              let record = tabArchive.snapshot.records.first(where: { $0.id == id }) else { return false }
+        guard record.profileID == profileID, spaces.space(record.spaceID)?.profileID == record.profileID,
+              websiteDataStore(forProfileID: record.profileID) != nil else {
+            archiveError = TabArchiveError.invalidOwner.localizedDescription
+            return false
+        }
+        if let live = tabArchive.liveTab(record.tabID) {
+            // A crash or a failed rollback may leave a recovery record beside a live descriptor.
+            // Never replace, navigate, or duplicate that descriptor.
+            guard live.spaceID == record.spaceID, live.profileID == record.profileID else {
+                archiveError = TabArchiveError.invalidOwner.localizedDescription
+                return false
+            }
+            if select, let owner = live.browser, owner.selectSpace(record.spaceID) { owner.activeTabID = live.id }
+            await live.browser?.reconcileArchiveRecovery()
+            return true
+        }
+        guard !tabArchive.hasPendingSessionTab(record) else {
+            archiveError = "This tab is waiting for its original session window to reopen. No second copy was loaded."
+            return false
+        }
+        guard selectSpace(record.spaceID) else { return false }
+        let tab = adopt(BrowserTab(url: record.url, title: record.title, interactionState: record.interactionState,
+                                   browser: self, restoresVisit: true, id: record.tabID))
+        tab.lastUsedAt = Date()
+        tabs.insert(tab, at: min(max(0, record.originalIndex), tabs.count))
+        BrowserExtensions.shared.didOpen(tab)
+        if select { activeTabID = tab.id }
+        if lastArchivedRecordID == id { lastArchivedRecordID = nil }
+        requestSessionSave()
+        // Keep the durable recovery record until the live descriptor is itself on disk.
+        // With no SessionStore (tests or isolated callers), retaining it is safer than losing it.
+        await reconcileArchiveRecovery()
+        return true
+    }
+
+    /// Retryable cleanup for interrupted archive/restore operations and startup recovery. The live descriptor
+    /// must be in an acknowledged session before its last archive copy can be removed.
+    func reconcileArchiveRecovery() async {
+        guard !isPrivate, !isExtensionWindow, !isClosed, !tabArchive.isBusy, let sessionStore else { return }
+        let duplicates = tabArchive.snapshot.records.filter { record in
+            guard let live = tabAcrossSpaces(withID: record.tabID) else { return false }
+            return live.browser === self && live.spaceID == record.spaceID && live.profileID == record.profileID
+                && !pendingArchiveIDs.contains(live.id)
+        }
+        let captures = duplicates.compactMap { record in
+            tabAcrossSpaces(withID: record.tabID).map {
+                (record, $0, $0.navigationRevision, $0.archiveWorkRevision, $0.url, $0.pageTitle, $0.lastUsedAt)
+            }
+        }
+        guard !captures.isEmpty else { return }
+        do {
+            try await sessionStore.saveAcknowledged()
+            for (record, live, revision, work, url, title, used) in captures {
+                guard !isClosed, self.sessionStore === sessionStore, tabAcrossSpaces(withID: live.id) === live,
+                      live.navigationRevision == revision, live.archiveWorkRevision == work, live.url == url,
+                      live.pageTitle == title, live.lastUsedAt == used,
+                      !pendingArchiveIDs.contains(live.id) else { continue }
+                try await tabArchive.remove(record.id)
+            }
+        } catch {
+            archiveError = "The live page was kept. Its recovery copy will be retried when storage is available."
+        }
+    }
+
+    func undoArchive() {
+        guard let id = lastArchivedRecordID else { return }
+        Task { _ = await restoreArchivedTab(id) }
+    }
+
+    func resetArchiveIdleGrace() { archiveIdlePolicy = TabArchiveIdlePolicy() }
+
+    func archiveIdleTabs(now: Date = Date(), instant: ContinuousClock.Instant = .now) async {
+        guard !isPrivate, !isExtensionWindow, !isClosed else { return }
+        // Cleanup is independent of the opt-in removal policy and never loads a page.
+        await reconcileArchiveRecovery()
+        guard archiveIdlePolicy.permitsPass(now: now, instant: instant) else { return }
+        // One candidate per minute. Never drain a Space after startup, sleep, or clock changes.
+        guard let candidate = tabs.first(where: {
+            canArchive($0, automatically: true) && TabArchiveIdlePolicy.isIdle(lastUsed: $0.lastUsedAt,
+                lastActive: $0.lastActive, now: now, instant: instant,
+                policy: tabArchive.policy(forProfileID: $0.profileID))
+        }) else { return }
+        _ = await archiveTab(candidate.id, automatically: true)
     }
 
     /// Background tabs that can be suspended to free memory, least recently used first. A pop-up and its opener

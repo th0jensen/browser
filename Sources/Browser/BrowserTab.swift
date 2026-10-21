@@ -14,8 +14,15 @@ final class BrowserTab: NSObject, Identifiable {
     /// Hosts the web view, and the Web Inspector when it's docked, so both move together between windows and tabs.
     let contentView = NSView()
     var isNewTab = true
-    var pinnedPageID: UUID?
-    var folderPageID: UUID?
+    var pinnedPageID: UUID? { didSet { archiveWorkRevision &+= 1 } }
+    var folderPageID: UUID? { didSet { archiveWorkRevision &+= 1 } }
+    var lastUsedAt = Date()
+    @ObservationIgnored private(set) var archiveWorkRevision = 0
+    @ObservationIgnored var archivePageWork: ArchivePageWork = .unknown { didSet {
+        if oldValue != archivePageWork, archivePageWork != .readOnly { archiveWorkRevision &+= 1 }
+    } }
+    /// Downloads and file panels can outlive navigation. Keep this conservative for the tab's lifetime.
+    @ObservationIgnored var hasArchiveTransferWork = false { didSet { archiveWorkRevision &+= 1 } }
     var temporarySection: TemporaryTabSection?
     /// The tab whose page opened this one, so its links and pop-ups open next to each other.
     @ObservationIgnored var openerID: UUID?
@@ -151,6 +158,7 @@ final class BrowserTab: NSObject, Identifiable {
         ContentBlocker.shared.attach(webView.configuration.userContentController)
         self.webView = webView
         PagePaintObserver.shared.install(in: webView, tab: self)
+        ArchivePageWorkObserver.shared.install(in: webView, tab: self)
         PageAppearance.shared.install(in: webView)
         if browser?.isPrivate != true {
             LinkPreviewController.shared.install(in: webView, tab: self)
@@ -266,7 +274,18 @@ final class BrowserTab: NSObject, Identifiable {
     }
 
     func didBecomeSelected() {
+        lastUsedAt = Date()
+        lastActive = .now
         resumeSelectionWaiters(true)
+    }
+
+    /// Archive protects more work than memory suspension, including unknown live documents.
+    var canArchiveWork: Bool {
+        guard !isNewTab, !isLoading, loadError == nil, selectionWaiters.isEmpty,
+              !hasArchiveTransferWork, !isFindBarVisible, archivePageWork != .protected else { return false }
+        guard let webView else { return true }
+        return !WebInspector.isOpen(for: webView)
+            && webView.cameraCaptureState == .none && webView.microphoneCaptureState == .none
     }
 
     func stopWaitingForSelection() {

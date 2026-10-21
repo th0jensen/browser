@@ -331,6 +331,10 @@ private struct BrowserCommands: Commands {
             }
 
             Divider()
+            Button("Show Archive…") { browser?.isShowingArchive = true }
+                .disabled(browser == nil || browser?.isPrivate == true || browser?.isExtensionWindow == true)
+            Button("Undo Last Archive") { browser?.undoArchive() }
+                .disabled(browser?.lastArchivedRecordID == nil)
             Button("Show All History") { browser?.isShowingHistory.toggle() }
                 .keyboardShortcut("y", modifiers: .command)
                 .disabled(browser?.history == nil)

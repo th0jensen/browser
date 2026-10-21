@@ -410,6 +410,15 @@ struct TabStrip: View {
         FolderMoveMenu(browser: browser, tab: tab)
         TabPinActions(browser: browser, tab: tab)
         Divider()
+        Button("Archive Tab") {
+            Task {
+                _ = await browser.archiveTab(tab.id)
+                browser.isShowingArchive = true
+            }
+        }
+        .disabled(!browser.canArchive(tab))
+        Button("Show Archive…") { browser.isShowingArchive = true }
+            .disabled(browser.isPrivate || browser.isExtensionWindow)
         Button("Close Tab") { browser.closeRepresentedTab(tab) }
         Button("Close Other Tabs") { browser.closeOtherTabs(than: tab.id) }
             .disabled(browser.tabs.count < 2)
@@ -422,6 +431,8 @@ struct TabStrip: View {
 
     @ViewBuilder
     private var stripMenu: some View {
+        Button("Show Archive…") { browser.isShowingArchive = true }
+            .disabled(browser.isPrivate || browser.isExtensionWindow)
         Button("New Tab") { browser.addTab() }
         Button("New Folder…") { browser.requestNewFolder() }
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }

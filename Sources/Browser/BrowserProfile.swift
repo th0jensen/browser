@@ -5,7 +5,7 @@ import WebKit
 @MainActor
 enum BrowserProfile {
     /// The existing WebKit profile. Spaces do not create separate cookie jars.
-    static let defaultID = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
+    nonisolated static let defaultID = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
     static let displayName = "Existing Profile"
     static let bundleIdentifier = Bundle.main.bundleIdentifier ?? "dev.athas.browser"
     static let isTesting = NSClassFromString("XCTestCase") != nil
