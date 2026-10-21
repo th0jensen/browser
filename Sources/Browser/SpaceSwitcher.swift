@@ -79,8 +79,13 @@ struct SpaceSwitcher: View {
             if let current { Button("Edit This Space…") { editor = SpaceEditorRequest(space: current) } }
             Button("New Space…") { editor = SpaceEditorRequest() }
         } label: {
-            Label(current?.title ?? "Default", systemImage: current?.icon.symbol ?? BrowserSpaceIcon.circle.symbol)
-                .lineLimit(1)
+            Label {
+                Text(current?.title ?? "Default")
+            } icon: {
+                if let current { SpaceIcon(space: current) }
+                else { Image(systemName: BrowserSpaceIcon.circle.symbol) }
+            }
+            .lineLimit(1)
         }
         .help("Switch Space. Spaces use the Existing Profile and share logins.")
         .accessibilityLabel("Space: \(current?.title ?? "Default")")
@@ -98,7 +103,12 @@ struct SpaceSwitcher: View {
     @ViewBuilder private var spaceMenuItems: some View {
         ForEach(browser.spaces.spaces) { space in
             Button { browser.selectSpace(space.id) } label: {
-                Label(space.title, systemImage: space.id == browser.activeSpaceID ? "checkmark" : space.icon.symbol)
+                Label {
+                    Text(space.title)
+                } icon: {
+                    if space.id == browser.activeSpaceID { Image(systemName: "checkmark") }
+                    else { SpaceIcon(space: space) }
+                }
             }
         }
     }
@@ -302,16 +312,21 @@ final class SpaceChoiceButton: SpaceSelectorButton {
     let spaceID: UUID
     private(set) var isSelectedSpace = false
     private(set) var displayedSymbol: String?
+    private(set) var displayedEmoji = ""
 
     init(spaceID: UUID) { self.spaceID = spaceID; super.init(frame: .zero) }
     required init?(coder: NSCoder) { nil }
 
     func configure(_ space: BrowserSpace, selected: Bool, compact: Bool) {
         isSelectedSpace = selected
-        displayedSymbol = selected ? space.icon.symbol : nil
+        displayedEmoji = selected ? space.emoji : ""
+        displayedSymbol = selected && displayedEmoji.isEmpty ? space.displaySymbol : nil
+        title = displayedEmoji
+        imagePosition = displayedEmoji.isEmpty ? .imageOnly : .noImage
+        font = .systemFont(ofSize: 14)
         image = displayedSymbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
         symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
-        contentTintColor = .labelColor
+        contentTintColor = NSColor(space.color.tint)
         toolTip = compact ? "All Spaces — \(space.title)" : space.title
         setAccessibilityLabel(compact ? "All Spaces, current Space \(space.title)" : "Switch to Space \(space.title)")
         setAccessibilitySelected(selected)
@@ -328,6 +343,16 @@ final class SpaceChoiceButton: SpaceSelectorButton {
     }
 }
 
+struct SpaceIcon: View {
+    let space: BrowserSpace
+    var body: some View {
+        Group {
+            if space.emoji.isEmpty { Image(systemName: space.displaySymbol).foregroundStyle(space.color.tint) }
+            else { Text(space.emoji).font(.system(size: 14)) }
+        }
+    }
+}
+
 /// Space title is adjacent to its saved/temporary content; this control edits, not switches.
 struct BrowserSpaceHeading: View {
     let browser: BrowserModel
@@ -337,7 +362,7 @@ struct BrowserSpaceHeading: View {
         if !browser.isPrivate && !browser.isExtensionWindow,
            let space = browser.spaces.space(browser.activeSpaceID) {
             HStack(spacing: 7) {
-                Image(systemName: space.icon.symbol)
+                SpaceIcon(space: space).frame(width: 14, height: 14)
                 Text(space.title).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 Button { editor = SpaceEditorRequest(space: space) } label: {
                     Image(systemName: "ellipsis").frame(width: 24, height: 24)
@@ -364,7 +389,9 @@ private struct SpaceEditor: View {
     let browser: BrowserModel
     let space: BrowserSpace?
     @State private var name: String
-    @State private var icon: BrowserSpaceIcon
+    @State private var symbol: String
+    @State private var emoji: String
+    @State private var color: FolderColor
     private let theme: BrowserSpaceTheme
     @State private var errorMessage: String?
     @FocusState private var nameIsFocused: Bool
@@ -374,29 +401,18 @@ private struct SpaceEditor: View {
         self.browser = browser
         self.space = space
         _name = State(initialValue: space?.title ?? "")
-        _icon = State(initialValue: space?.icon ?? .circle)
+        _symbol = State(initialValue: space?.displaySymbol ?? "globe")
+        _emoji = State(initialValue: space?.emoji ?? "")
+        _color = State(initialValue: space?.color ?? .primary)
         theme = space?.theme ?? .system
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(space == nil ? "New Space" : "Edit Space").font(.headline)
-            Text("Spaces have separate pinned and temporary tabs. They share logins in the Existing Profile.")
-                .foregroundStyle(.secondary)
             TextField("Space name", text: $name).textFieldStyle(.roundedBorder).focused($nameIsFocused)
                 .accessibilityLabel("Space name")
-            Text("Icon").font(.subheadline.weight(.medium))
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6) {
-                ForEach(BrowserSpaceIcon.allCases) { candidate in
-                    Button { icon = candidate } label: {
-                        Image(systemName: candidate.symbol).font(.system(size: 16))
-                            .frame(maxWidth: .infinity).frame(height: 32)
-                            .background(icon == candidate ? Color.primary.opacity(0.1) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 7))
-                    }
-                    .buttonStyle(.plain).help(candidate.title).accessibilityLabel("\(candidate.title) icon")
-                }
-            }
+            SavedItemIconPicker(symbol: $symbol, emoji: $emoji, color: $color, emojiAccessibilityLabel: "Space emoji")
             if let errorMessage { Text(errorMessage).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 Spacer()
@@ -414,8 +430,12 @@ private struct SpaceEditor: View {
     private func save() {
         do {
             guard !browser.isPrivate, !browser.isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
-            if let space { try browser.spaces.updateSpace(space.id, title: name, icon: icon, theme: theme) }
-            else { try browser.createSpace(title: name, icon: icon, theme: theme) }
+            let legacyIcon = BrowserSpaceIcon.allCases.first { $0.symbol == symbol } ?? space?.icon ?? .circle
+            if let space {
+                try browser.spaces.updateSpace(space.id, title: name, icon: legacyIcon, theme: theme, symbol: symbol, emoji: emoji, color: color)
+            } else {
+                try browser.createSpace(title: name, icon: legacyIcon, theme: theme, symbol: symbol, emoji: emoji, color: color)
+            }
             dismiss()
         } catch { errorMessage = error.localizedDescription }
     }

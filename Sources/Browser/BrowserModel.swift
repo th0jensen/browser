@@ -533,9 +533,10 @@ final class BrowserModel: NSObject {
     }
 
     @discardableResult
-    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws -> BrowserSpace {
+    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme,
+                     symbol: String? = nil, emoji: String = "", color: FolderColor = .primary) throws -> BrowserSpace {
         guard !isPrivate, !isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
-        let space = try spaces.createSpace(title: title, icon: icon, theme: theme)
+        let space = try spaces.createSpace(title: title, icon: icon, theme: theme, symbol: symbol, emoji: emoji, color: color)
         selectSpace(space.id)
         return space
     }
