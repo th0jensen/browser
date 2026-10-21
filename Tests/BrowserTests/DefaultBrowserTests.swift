@@ -53,7 +53,7 @@ final class DefaultBrowserTests: XCTestCase {
     }
 
     func testLinksWaitForANormalWindowToOpen() {
-        let router = ExternalURLRouter()
+        let router = ExternalURLRouter(activate: { _ in })
         router.open([URL(string: "https://swift.org")!, URL(string: "javascript:void(0)")!])
 
         let privateWindow = BrowserModel.makePrivate(downloads: DownloadManager())
@@ -71,7 +71,7 @@ final class DefaultBrowserTests: XCTestCase {
     }
 
     func testClosedWindowModelsAndExtensionWindowsDoNotTakeExternalLinks() {
-        let router = ExternalURLRouter()
+        let router = ExternalURLRouter(activate: { _ in })
         let closed = BrowserModel()
         router.register(closed)
         router.unregister(closed)
@@ -89,7 +89,7 @@ final class DefaultBrowserTests: XCTestCase {
     }
 
     func testExternalLinksAppendAfterExistingTabsRegardlessOfSelection() {
-        let router = ExternalURLRouter()
+        let router = ExternalURLRouter(activate: { _ in })
         let browser = BrowserModel()
         let original = ["first", "second", "third"].map { URL(string: "https://routing-test.invalid/\($0)")! }
         browser.openInNewTabs(original)

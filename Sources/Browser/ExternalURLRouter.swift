@@ -1,20 +1,46 @@
 import AppKit
 import SwiftUI
 
-/// Opens the links and files other apps hand to the browser, such as a link clicked in Mail once it's the default
-/// browser: in new tabs of the frontmost normal window, or in a new window when only private windows are open.
+/// Routes external web links with explicit host rules. Files and unmatched links keep ordinary-window behavior.
 @MainActor
 final class ExternalURLRouter {
     static let shared = ExternalURLRouter()
 
     private var browsers: [WeakBrowser] = []
-    /// Links waiting for the window that was asked to open for them.
     private var pendingURLs: [URL] = []
     private var isOpeningWindow = false
-    private var openWindow: OpenWindowAction?
+    private var isDraining = false
+    private var requestWindow: (() -> Void)?
+    private let rules: LinkRouteRuleStore
+    private let orderBrowsers: ([BrowserModel]) -> [BrowserModel]
+    private let activate: (BrowserModel) -> Void
+    private let openTabs: (BrowserModel, [URL]) -> Void
 
     private struct WeakBrowser {
         weak var browser: BrowserModel?
+    }
+
+    init(rules: LinkRouteRuleStore = .shared, requestWindow: (() -> Void)? = nil,
+         orderBrowsers: @escaping ([BrowserModel]) -> [BrowserModel] = { browsers in
+             let windows = NSApp.orderedWindows
+             return browsers.sorted { left, right in
+                 (windows.firstIndex { $0 === left.window } ?? .max)
+                     < (windows.firstIndex { $0 === right.window } ?? .max)
+             }
+         },
+         activate: @escaping (BrowserModel) -> Void = { browser in
+             if let window = browser.window {
+                 if window.isMiniaturized { window.deminiaturize(nil) }
+                 window.makeKeyAndOrderFront(nil)
+             }
+             NSApp.activate()
+         },
+         openTabs: @escaping (BrowserModel, [URL]) -> Void = { $0.openInNewTabs($1) }) {
+        self.rules = rules
+        self.requestWindow = requestWindow
+        self.orderBrowsers = orderBrowsers
+        self.activate = activate
+        self.openTabs = openTabs
     }
 
     /// Web pages and local files open; other schemes, like `javascript:`, are ignored.
@@ -26,59 +52,85 @@ final class ExternalURLRouter {
         }
     }
 
-    /// The first normal window of those open, front to back. A private window never takes links from other apps,
-    /// since the user didn't choose to open them privately.
-    static func destination(among browsers: [BrowserModel]) -> BrowserModel? {
-        browsers.first { !$0.isPrivate && !$0.isExtensionWindow && !$0.isClosed }
+    private static func isOrdinary(_ browser: BrowserModel) -> Bool {
+        !browser.isPrivate && !browser.isExtensionWindow && !browser.isClosed
     }
 
-    /// A window joins when it appears, and takes the links that were waiting for a window to open.
+    /// A private, extension, or closed window never takes links from other apps.
+    static func destination(among browsers: [BrowserModel]) -> BrowserModel? {
+        browsers.first(where: isOrdinary)
+    }
+
+    /// Restoration runs before registration. Repeated registration never opens a queued URL twice.
     func register(_ browser: BrowserModel, openWindow: OpenWindowAction? = nil) {
-        guard !browser.isExtensionWindow else { return }
-        if let openWindow { self.openWindow = openWindow }
+        if let openWindow { requestWindow = { openWindow(id: BrowserApp.windowID) } }
         browsers.removeAll { $0.browser == nil || $0.browser === browser }
-        browsers.append(WeakBrowser(browser: browser))
-        guard !browser.isPrivate else {
+        guard Self.isOrdinary(browser) else {
+            // A requested ordinary scene can close before its late appearance callback.
+            if browser.isClosed { isOpeningWindow = false }
             openPendingWindowIfNeeded()
             return
         }
+        browsers.append(WeakBrowser(browser: browser))
         isOpeningWindow = false
-        let urls = pendingURLs
-        pendingURLs = []
-        browser.openInNewTabs(urls)
+        drain(activating: false)
     }
 
-    /// SwiftUI may retain a closed window's model; it must stop being a link destination immediately.
     func unregister(_ browser: BrowserModel) {
         browsers.removeAll { $0.browser == nil || $0.browser === browser }
+        if !pendingURLs.isEmpty { drain(activating: false) }
     }
 
     func open(_ urls: [URL]) {
-        let urls = urls.filter(Self.canOpen)
-        guard !urls.isEmpty else { return }
-        let windows = NSApp.orderedWindows
-        let frontToBack = { (browser: BrowserModel) in
-            windows.firstIndex { $0 === browser.window } ?? .max
-        }
-        let open = browsers.compactMap(\.browser).sorted { frontToBack($0) < frontToBack($1) }
-        if let browser = Self.destination(among: open) {
-            browser.openInNewTabs(urls)
-            if let window = browser.window {
-                if window.isMiniaturized { window.deminiaturize(nil) }
-                window.makeKeyAndOrderFront(nil)
+        pendingURLs += urls.filter(Self.canOpen)
+        drain(activating: true)
+    }
+
+    private func orderedOrdinaryBrowsers() -> [BrowserModel] {
+        orderBrowsers(browsers.compactMap(\.browser)).filter(Self.isOrdinary)
+    }
+
+    private func drain(activating: Bool) {
+        guard !isDraining else { return }
+        isDraining = true
+        // In a mixed batch, an unmatched link must not inherit a previous rule's Space selection.
+        var fallbackSpaces: [ObjectIdentifier: UUID] = [:]
+        var lastDestination: BrowserModel?
+        while let url = pendingURLs.first {
+            let ordinary = orderedOrdinaryBrowsers()
+            guard let fallback = ordinary.first else { break }
+            for browser in ordinary where fallbackSpaces[ObjectIdentifier(browser)] == nil {
+                fallbackSpaces[ObjectIdentifier(browser)] = browser.activeSpaceID
             }
-            NSApp.activate()
-            return
+            var destination = fallback
+            var selectedRule = false
+            if let rule = rules.firstMatch(for: url),
+               let target = ordinary.first(where: { browser in
+                   guard let space = browser.spaces.space(rule.destinationSpaceID) else { return false }
+                   return space.profileID == browser.profileID && browser.websiteDataStore(forProfileID: space.profileID) != nil
+               }), target.selectSpace(rule.destinationSpaceID) {
+                destination = target
+                selectedRule = true
+            }
+            if !selectedRule, let spaceID = fallbackSpaces[ObjectIdentifier(fallback)] {
+                _ = fallback.selectSpace(spaceID)
+            }
+            // There is no suspension between validation and opening. Recheck after Space selection callbacks.
+            guard Self.isOrdinary(destination) else { continue }
+            // Remove before calling out, so registration or another open cannot replay this URL.
+            pendingURLs.removeFirst()
+            openTabs(destination, [url])
+            lastDestination = destination
         }
-        // At launch the first window appears on its own, and takes the links when it registers.
-        pendingURLs += urls
+        isDraining = false
+        if activating, let lastDestination, Self.isOrdinary(lastDestination) { activate(lastDestination) }
         openPendingWindowIfNeeded()
     }
 
     private func openPendingWindowIfNeeded() {
-        if !pendingURLs.isEmpty, let openWindow, !isOpeningWindow {
+        if !pendingURLs.isEmpty, let requestWindow, !isOpeningWindow {
             isOpeningWindow = true
-            openWindow(id: BrowserApp.windowID)
+            requestWindow()
         }
     }
 }
