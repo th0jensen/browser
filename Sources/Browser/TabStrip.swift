@@ -206,7 +206,7 @@ struct TabStrip: View {
     }
 
     private var showsTidyDivider: Bool {
-        showsTidyTabs && (browser.regularTabs.count > 6 || browser.isTidyingTabs
+        showsTidyTabs && (browser.regularTabs.count > 6 || browser.isTidyingTabs || browser.canUndoTidyTabs
             || browser.regularTabs.contains { $0.temporarySection != nil })
     }
 
@@ -243,9 +243,18 @@ struct TabStrip: View {
             .accessibilityLabel(browser.isTidyingTabs ? "Cancel Tidy Tabs" : "Tidy Tabs")
             .onHover { value in if value { Task { await LocalIntelligence.shared.prepare(.tidy) } } }
             TidyActivityDivider(isLoading: browser.isTidyingTabs)
+            if browser.canUndoTidyTabs {
+                Button("Undo", systemImage: "arrow.uturn.backward") { browser.undoTidyTabs() }
+                    .buttonStyle(.plain).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                    .help("Restore the previous tab order and temporary groups where tabs have not changed")
+                    .accessibilityLabel("Undo Tidy Tabs")
+                    .padding(.trailing, BrowserChrome.edgeInset)
+            }
         }.frame(maxWidth: .infinity).padding(.leading, BrowserChrome.edgeInset)
             .contentShape(Rectangle())
             .contextMenu {
+                Button("Undo Tidy Tabs") { browser.undoTidyTabs() }
+                    .disabled(!browser.canUndoTidyTabs)
                 Button("Remove All Temporary Groups") { browser.removeTemporarySections() }
                     .disabled(!browser.regularTabs.contains { $0.temporarySection != nil })
             }
@@ -391,6 +400,8 @@ struct TabStrip: View {
         Button(browser.isTidyingTabs ? "Cancel Tidy Tabs" : "Tidy Tabs") {
             if browser.isTidyingTabs { browser.cancelTidyingTabs() } else { browser.tidyTemporaryTabs() }
         }.disabled(!browser.isTidyingTabs && (!browser.canTidyTabs || BrowserIntelligence.unavailableReason != nil))
+        Button("Undo Tidy Tabs") { browser.undoTidyTabs() }
+            .disabled(!browser.canUndoTidyTabs)
         if browser.regularTabs.contains(where: { $0.temporarySection != nil }) {
             Button("Remove All Temporary Groups") { browser.removeTemporarySections() }
         }

@@ -12,9 +12,19 @@ final class BrowserTab: NSObject, Identifiable {
     /// Hosts the web view, and the Web Inspector when it's docked, so both move together between windows and tabs.
     let contentView = NSView()
     var isNewTab = true
-    var pinnedPageID: UUID?
-    var folderPageID: UUID?
-    var temporarySection: TemporaryTabSection?
+    var pinnedPageID: UUID? {
+        didSet { if oldValue != pinnedPageID { groupingRevision &+= 1 } }
+    }
+    var folderPageID: UUID? {
+        didSet { if oldValue != folderPageID { groupingRevision &+= 1 } }
+    }
+    var temporarySection: TemporaryTabSection? {
+        didSet { if oldValue != temporarySection { groupingRevision &+= 1 } }
+    }
+    /// Detect manual edits even when a tab moves away and then comes back.
+    private(set) var groupingRevision = 0
+
+    func invalidateGroupingOrder() { groupingRevision &+= 1 }
     /// The tab whose page opened this one, so its links and pop-ups open next to each other.
     @ObservationIgnored var openerID: UUID?
     /// Whether another page's script opened this one, and can still reach it through `window.opener`.
@@ -52,9 +62,17 @@ final class BrowserTab: NSObject, Identifiable {
     @ObservationIgnored private var findTask: Task<Void, Never>?
     /// The page last added to history, so its title follows the page's and a reload isn't another visit.
     @ObservationIgnored private var historyVisit: (id: UUID?, url: URL)?
+    /// Cancels pending policy decisions, including when a web view is released or replaced.
     @ObservationIgnored private(set) var navigationRevision = 0
+    /// Content-navigation attempts invalidate grouping; resource-only suspension does not.
+    private(set) var contentNavigationRevision = 0
 
-    func invalidateNavigation() { navigationRevision &+= 1 }
+    func invalidateNavigation() {
+        contentNavigationRevision &+= 1
+        invalidateNavigationRequest()
+    }
+
+    private func invalidateNavigationRequest() { navigationRevision &+= 1 }
 
     func stopLoading() {
         invalidateNavigation()
@@ -175,7 +193,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// Releases the web view, and with it the page's memory, keeping what the tab strip shows and the state to restore.
     func suspend() {
         guard let webView, !isNewTab else { return }
-        invalidateNavigation()
+        invalidateNavigationRequest()
         stopWaitingForSelection()
         suspendedState = webView.interactionState
         observations.forEach { $0.invalidate() }
@@ -198,7 +216,7 @@ final class BrowserTab: NSObject, Identifiable {
     /// A pop-up gets a fresh configuration too, since its tie to the opener can't be restored.
     func restore() {
         guard webView == nil else { return }
-        invalidateNavigation()
+        invalidateNavigationRequest()
         let context = browser?.isPrivate == true ? nil : url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
         extensionOrigin = context?.baseURL
         let webView = WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url) ?? context?.webViewConfiguration ?? Self.makeConfiguration())

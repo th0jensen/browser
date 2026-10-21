@@ -204,6 +204,8 @@ private struct BrowserCommands: Commands {
             Button(browser?.isTidyingTabs == true ? "Cancel Tidy Tabs" : "Tidy Tabs") {
                 if browser?.isTidyingTabs == true { browser?.cancelTidyingTabs() } else { browser?.tidyTemporaryTabs() }
             }.disabled(browser?.isTidyingTabs != true && (browser?.canTidyTabs != true || BrowserIntelligence.unavailableReason != nil))
+            Button("Undo Tidy Tabs") { browser?.undoTidyTabs() }
+                .disabled(browser?.canUndoTidyTabs != true)
             if browser?.regularTabs.contains(where: { $0.temporarySection != nil }) == true {
                 Button("Remove All Temporary Groups") { browser?.removeTemporarySections() }
             }
