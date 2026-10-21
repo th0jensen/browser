@@ -33,6 +33,10 @@ struct AppearanceSettings: View {
             }
             Section("Sidebar") {
                 Toggle("Automatically hide sidebar", isOn: Binding(get: { windowSettingsTarget.preferences.autoHideSidebar }, set: { windowSettingsTarget.preferences.autoHideSidebar = $0 })).disabled(tabLayout != .vertical)
+                Toggle("Show Space title", isOn: Binding(get: { windowSettingsTarget.preferences.showsSpaceTitle }, set: { windowSettingsTarget.preferences.showsSpaceTitle = $0 }))
+                    .disabled(tabLayout != .vertical)
+                    .help("Show the current Space name and icon above pinned tabs. The bottom Space selector stays visible.")
+                    .accessibilityIdentifier("ShowSpaceTitleToggle")
                 Toggle("Compact tabs", isOn: $usesCompactTabs)
                 LabeledContent("Width") {
                     HStack {

@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-enum FolderColor: String, Codable, CaseIterable {
+enum FolderColor: String, Codable, CaseIterable, Sendable {
     case primary, blue, purple, pink, red, orange, yellow, green
 }
 

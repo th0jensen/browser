@@ -1,31 +1,49 @@
 import AppKit
 import SwiftUI
 
+enum ChromePresentationRegion: Equatable { case toolbar, sidebar }
+
 @MainActor
 protocol ChromePresentationControlling: AnyObject {
-    func beginPresentation()
-    func endPresentation()
+    func beginPresentation(in region: ChromePresentationRegion)
+    func endPresentation(in region: ChromePresentationRegion)
 }
 
-extension ChromeHoverController: ChromePresentationControlling {}
+extension ChromeHoverController: ChromePresentationControlling {
+    func beginPresentation(in region: ChromePresentationRegion) {
+        switch region {
+        case .toolbar: beginPresentation()
+        case .sidebar: beginSidebarPresentation()
+        }
+    }
+    func endPresentation(in region: ChromePresentationRegion) {
+        switch region {
+        case .toolbar: endPresentation()
+        case .sidebar: endSidebarPresentation()
+        }
+    }
+}
 
 /// One presentation owns one balanced hold, even when SwiftUI repeats lifecycle updates.
 @MainActor
 final class ChromePresentationHold {
     private weak var controller: (any ChromePresentationControlling)?
+    private var region: ChromePresentationRegion = .toolbar
 
-    func setPresented(_ isPresented: Bool, controller nextController: (any ChromePresentationControlling)?) {
+    func setPresented(_ isPresented: Bool, controller nextController: (any ChromePresentationControlling)?,
+                      region nextRegion: ChromePresentationRegion = .toolbar) {
         let next = isPresented ? nextController : nil
-        guard controller !== next else { return }
+        guard controller !== next || region != nextRegion else { return }
         end()
+        region = nextRegion
         controller = next
-        next?.beginPresentation()
+        next?.beginPresentation(in: region)
     }
 
     func end() {
         let previous = controller
         controller = nil
-        previous?.endPresentation()
+        previous?.endPresentation(in: region)
     }
 
     isolated deinit { end() }
@@ -45,23 +63,28 @@ extension EnvironmentValues {
 private struct ChromePresentationModifier: ViewModifier {
     let isPresented: Bool
     let controller: ChromeHoverController?
+    let region: ChromePresentationRegion
     @State private var hold = ChromePresentationHold()
 
     func body(content: Content) -> some View {
         content
             .onChange(of: isPresented, initial: true) { _, value in
-                hold.setPresented(value, controller: controller)
+                hold.setPresented(value, controller: controller, region: region)
             }
             .onChange(of: controller.map(ObjectIdentifier.init)) { _, _ in
-                hold.setPresented(isPresented, controller: controller)
+                hold.setPresented(isPresented, controller: controller, region: region)
+            }
+            .onChange(of: region) { _, _ in
+                hold.setPresented(isPresented, controller: controller, region: region)
             }
             .onDisappear { hold.end() }
     }
 }
 
 extension View {
-    func chromePresentation(isPresented: Bool, controller: ChromeHoverController?) -> some View {
-        modifier(ChromePresentationModifier(isPresented: isPresented, controller: controller))
+    func chromePresentation(isPresented: Bool, controller: ChromeHoverController?,
+                            region: ChromePresentationRegion = .toolbar) -> some View {
+        modifier(ChromePresentationModifier(isPresented: isPresented, controller: controller, region: region))
     }
 }
 
