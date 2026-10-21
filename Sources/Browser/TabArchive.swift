@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import Observation
 
-/// Local Browser design. Arc's shipped names do not establish an idle duration.
+/// Local Browser design. Default-off, one-day removal is not Arc's documented mandatory default.
 struct ArchivedTab: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     let tabID: UUID
@@ -16,14 +16,76 @@ struct ArchivedTab: Codable, Equatable, Identifiable, Sendable {
     let originalIndex: Int
 }
 
-struct TabArchiveSnapshot: Codable, Sendable {
-    var version = 1
+enum TabArchiveIdleInterval: String, Codable, Sendable {
+    case oneDay
+    var seconds: TimeInterval { 24 * 60 * 60 }
+}
+
+/// Timing and consent belong to the immutable profile owner, never the active window's preferences.
+struct TabArchiveProfilePolicy: Codable, Equatable, Sendable {
     var automaticEnabled = false
+    var idleInterval: TabArchiveIdleInterval = .oneDay
+}
+
+struct TabArchiveSnapshot: Codable, Sendable {
+    var version = 2
+    var profilePolicies: [UUID: TabArchiveProfilePolicy] = [:]
     var records: [ArchivedTab] = []
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey { case version, automaticEnabled, profilePolicies, records }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let savedVersion = try values.decode(Int.self, forKey: .version)
+        guard savedVersion == 1 || savedVersion == 2 else {
+            throw DecodingError.dataCorruptedError(forKey: .version, in: values, debugDescription: "Unknown archive version")
+        }
+        records = try values.decode([ArchivedTab].self, forKey: .records)
+        if savedVersion == 1 {
+            // The old global choice was made when only Existing Profile was supported.
+            // Never copy it to new/unknown profile IDs or infer consent from record ownership.
+            let enabled = try values.decodeIfPresent(Bool.self, forKey: .automaticEnabled) ?? false
+            profilePolicies = [BrowserProfile.defaultID: TabArchiveProfilePolicy(automaticEnabled: enabled)]
+        } else {
+            // A v2 snapshot never inherits the obsolete global key, even if a mixed file contains it.
+            profilePolicies = try values.decodeIfPresent([UUID: TabArchiveProfilePolicy].self, forKey: .profilePolicies) ?? [:]
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(version, forKey: .version)
+        try values.encode(profilePolicies, forKey: .profilePolicies)
+        try values.encode(records, forKey: .records)
+    }
+
+    func policy(forProfileID id: UUID) -> TabArchiveProfilePolicy {
+        profilePolicies[id] ?? TabArchiveProfilePolicy()
+    }
+}
+
+/// A sheet owns this capture for its lifetime. It must not recompute a policy destination after an await.
+struct TabArchivePolicyScope: Equatable, Sendable {
+    let spaceID: UUID
+    let profileID: UUID
+    let spaceTitle: String
+
+    var profileLabel: String {
+        profileID == BrowserProfile.defaultID ? "Existing Profile" : "Profile \(profileID.uuidString)"
+    }
+
+    @MainActor func isCurrent(in browser: BrowserModel) -> Bool {
+        !browser.isPrivate && !browser.isExtensionWindow && !browser.isClosed
+            && browser.activeSpaceID == spaceID && browser.profileID == profileID
+            && browser.spaces.space(spaceID)?.profileID == profileID
+            && browser.websiteDataStore(forProfileID: profileID) != nil
+    }
 }
 
 enum TabArchiveError: LocalizedError {
-    case unavailable, busy, capacity, invalidOwner, stale
+    case unavailable, busy, capacity, invalidOwner, stale, policyScopeChanged
     var errorDescription: String? {
         switch self {
         case .unavailable: "The archive could not be saved. The live tab has not been removed."
@@ -31,6 +93,7 @@ enum TabArchiveError: LocalizedError {
         case .capacity: "The archive is full. Restore some entries before archiving more tabs."
         case .invalidOwner: "The original Space or profile is not available. This page was not loaded."
         case .stale: "The tab changed. It has not been archived."
+        case .policyScopeChanged: "The Space or profile changed. Reopen Archive to edit its profile policy."
         }
     }
 }
@@ -77,6 +140,7 @@ actor TabArchiveFile {
 final class TabArchiveStore {
     static let shared = TabArchiveStore(url: BrowserProfile.directory.appending(path: "TabArchive.plist"))
     nonisolated static let maximumRecords = 500
+    nonisolated static let maximumProfilePolicies = 256
     nonisolated static let maximumStateBytes = 2 * 1024 * 1024
     nonisolated static let maximumTotalStateBytes = 32 * 1024 * 1024
     nonisolated static let maximumEncodedBytes = 40 * 1024 * 1024
@@ -118,7 +182,8 @@ final class TabArchiveStore {
 
     nonisolated static func valid(_ snapshot: TabArchiveSnapshot) -> Bool {
         var ids = Set<UUID>(), tabs = Set<UUID>(), bytes = 0
-        return snapshot.version == 1 && snapshot.records.count <= maximumRecords && snapshot.records.allSatisfy {
+        return snapshot.version == 2 && snapshot.profilePolicies.count <= maximumProfilePolicies
+            && snapshot.records.count <= maximumRecords && snapshot.records.allSatisfy {
             bytes += $0.interactionState?.count ?? 0
             return ids.insert($0.id).inserted && tabs.insert($0.tabID).inserted
                 && ["http", "https"].contains($0.url.scheme?.lowercased() ?? "")
@@ -155,7 +220,8 @@ final class TabArchiveStore {
         }.sorted { $0.archivedAt > $1.archivedAt }
     }
 
-    private func save(_ next: TabArchiveSnapshot) async throws {
+    private func save(_ next: TabArchiveSnapshot, isCurrent: @MainActor () -> Bool = { true }) async throws {
+        guard isCurrent() else { throw TabArchiveError.policyScopeChanged }
         guard writable else { throw TabArchiveError.unavailable }
         guard !isBusy else { throw TabArchiveError.busy }
         guard Self.valid(next) else { throw TabArchiveError.capacity }
@@ -169,6 +235,7 @@ final class TabArchiveStore {
             return data
         }.value
         try Task.checkCancellation()
+        guard isCurrent() else { throw TabArchiveError.policyScopeChanged }
         try await persist(data)
         snapshot = next
     }
@@ -194,17 +261,21 @@ final class TabArchiveStore {
         try await save(next)
     }
 
-    func setAutomaticEnabled(_ enabled: Bool) async throws {
+    func policy(forProfileID id: UUID) -> TabArchiveProfilePolicy { snapshot.policy(forProfileID: id) }
+
+    /// The UI must supply a captured, validated owner. A write already in progress may finish for that
+    /// original owner after a switch, but can never borrow or retarget the new active profile.
+    func setPolicy(_ policy: TabArchiveProfilePolicy, forProfileID id: UUID,
+                   isCurrent: @MainActor () -> Bool = { true }) async throws {
         var next = snapshot
-        next.automaticEnabled = enabled
-        try await save(next)
+        next.profilePolicies[id] = policy
+        try await save(next, isCurrent: isCurrent)
     }
 }
 
 /// One-day idle is an opt-in local policy, not a recovered Arc default. A launch/wake grace period and
 /// bounded passes prevent a wall-clock jump or a restart from archiving every old descriptor at once.
 struct TabArchiveIdlePolicy {
-    static let idleSeconds: TimeInterval = 24 * 60 * 60
     static let grace: Duration = .seconds(30 * 60)
     private var graceStart: ContinuousClock.Instant = .now
     private var lastSample: (Date, ContinuousClock.Instant)?
@@ -227,8 +298,9 @@ struct TabArchiveIdlePolicy {
     }
 
     static func isIdle(lastUsed: Date, lastActive: ContinuousClock.Instant,
-                       now: Date, instant: ContinuousClock.Instant) -> Bool {
+                       now: Date, instant: ContinuousClock.Instant, policy: TabArchiveProfilePolicy) -> Bool {
         let age = now.timeIntervalSince(lastUsed)
-        return age.isFinite && age >= idleSeconds && instant - lastActive >= grace
+        return policy.automaticEnabled && age.isFinite && age >= policy.idleInterval.seconds
+            && instant - lastActive >= grace
     }
 }

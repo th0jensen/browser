@@ -266,6 +266,8 @@ final class TabArchiveTests: XCTestCase {
         tab.archivePageWork = .protected
         XCTAssertFalse(browser.canArchive(tab))
         tab.archivePageWork = .readOnly
+        XCTAssertFalse(browser.canArchive(tab, automatically: true))
+        try await browser.tabArchive.setPolicy(.init(automaticEnabled: true), forProfileID: tab.profileID)
         XCTAssertTrue(browser.canArchive(tab, automatically: true))
         tab.hasArchiveTransferWork = true
         XCTAssertFalse(browser.canArchive(tab))
@@ -423,13 +425,13 @@ final class TabArchiveTests: XCTestCase {
         XCTAssertFalse(policy.permitsPass(now: wall.addingTimeInterval(-90000), instant: start + .seconds(1860)))
         XCTAssertFalse(policy.permitsPass(now: wall.addingTimeInterval(900000), instant: start + .seconds(1920)))
         XCTAssertFalse(policy.permitsPass(now: wall.addingTimeInterval(910000), instant: start + .seconds(11920)))
-        XCTAssertFalse(TabArchiveIdlePolicy.isIdle(lastUsed: wall.addingTimeInterval(100), lastActive: start - .seconds(10000), now: wall, instant: start))
-        XCTAssertFalse(TabArchiveIdlePolicy.isIdle(lastUsed: wall.addingTimeInterval(-100000), lastActive: start, now: wall, instant: start))
+        XCTAssertFalse(TabArchiveIdlePolicy.isIdle(lastUsed: wall.addingTimeInterval(100), lastActive: start - .seconds(10000), now: wall, instant: start, policy: .init(automaticEnabled: true)))
+        XCTAssertFalse(TabArchiveIdlePolicy.isIdle(lastUsed: wall.addingTimeInterval(-100000), lastActive: start, now: wall, instant: start, policy: .init(automaticEnabled: true)))
 
         let store = TabArchiveStore()
         let browser = browser(store: store)
-        XCTAssertFalse(store.snapshot.automaticEnabled)
-        try await store.setAutomaticEnabled(true)
+        XCTAssertFalse(store.policy(forProfileID: browser.tabs[0].profileID).automaticEnabled)
+        try await store.setPolicy(.init(automaticEnabled: true), forProfileID: browser.tabs[0].profileID)
         for tab in browser.tabs.prefix(2) {
             tab.archivePageWork = .readOnly
             tab.lastUsedAt = wall.addingTimeInterval(-100000)
@@ -454,12 +456,12 @@ final class TabArchiveTests: XCTestCase {
         let store = TabArchiveStore(url: file)
         let first = record(state: Data([1, 2, 3]))
         try await store.insert(first)
-        try await store.setAutomaticEnabled(true)
+        try await store.setPolicy(.init(automaticEnabled: true), forProfileID: first.profileID)
         let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
         let reloaded = TabArchiveStore(url: file)
         XCTAssertEqual(reloaded.snapshot.records, [first])
-        XCTAssertTrue(reloaded.snapshot.automaticEnabled)
+        XCTAssertTrue(reloaded.policy(forProfileID: first.profileID).automaticEnabled)
         try Data("broken".utf8).write(to: file)
         let recovered = TabArchiveStore(url: file)
         XCTAssertTrue(recovered.recovered)
@@ -626,7 +628,7 @@ final class TabArchiveTests: XCTestCase {
         try encoded.write(to: file)
         let store = TabArchiveStore(url: file)
         XCTAssertEqual(store.snapshot.records.count, count)
-        try await store.setAutomaticEnabled(true) // Real writer creates a boundary-sized recovery file.
+        try await store.setPolicy(.init(automaticEnabled: true), forProfileID: BrowserProfile.defaultID) // Creates a boundary-sized recovery file.
         XCTAssertEqual(TabArchiveStore(url: file).snapshot.records.count, count)
         XCTAssertEqual(TabArchiveStore(url: file.appendingPathExtension("recovery")).snapshot.records.count, count)
         var writes = 0

@@ -1133,6 +1133,22 @@ final class BrowserModel: NSObject {
 
     // MARK: - Reversible temporary archive
 
+    func archivePolicyScope() -> TabArchivePolicyScope? {
+        guard let space = spaces.space(activeSpaceID) else { return nil }
+        let scope = TabArchivePolicyScope(spaceID: space.id, profileID: space.profileID, spaceTitle: space.title)
+        return scope.isCurrent(in: self) ? scope : nil
+    }
+
+    /// Returns false if a write completed for the captured owner after the sheet's context changed.
+    /// Never retry against a newly active profile or undo a successfully acknowledged write silently.
+    func setArchivePolicy(_ policy: TabArchiveProfilePolicy, for scope: TabArchivePolicyScope) async throws -> Bool {
+        guard scope.isCurrent(in: self) else { throw TabArchiveError.policyScopeChanged }
+        try await tabArchive.setPolicy(policy, forProfileID: scope.profileID) { [weak self] in
+            self.map { scope.isCurrent(in: $0) } ?? false
+        }
+        return scope.isCurrent(in: self)
+    }
+
     func canArchive(_ tab: BrowserTab, automatically: Bool = false) -> Bool {
         guard !isPrivate, !isExtensionWindow, !isClosed, tab.browser === self,
               tab.spaceID == activeSpaceID, tab.profileID == profileID,
@@ -1146,7 +1162,8 @@ final class BrowserModel: NSObject {
               let url = tab.url, ["https", "http"].contains(url.scheme?.lowercased() ?? "") else { return false }
         // An explicit URL/history archive may include a lazy descriptor with no document signal.
         // Automatic removal never treats unknown work as clean.
-        return !automatically || tab.archivePageWork == .readOnly
+        return !automatically || (tab.archivePageWork == .readOnly
+            && tabArchive.policy(forProfileID: tab.profileID).automaticEnabled)
     }
 
     @discardableResult
@@ -1163,12 +1180,13 @@ final class BrowserModel: NSObject {
         let workRevision = tab.archiveWorkRevision
         let url = tab.url
         let lastUsed = tab.lastUsedAt
+        let automaticPolicy = tabArchive.policy(forProfileID: tab.profileID)
         let order = tabs.map(\.id)
         func current() -> Bool {
             !Task.isCancelled && selection == archiveSelectionRevision && revision == tab.navigationRevision
                 && workRevision == tab.archiveWorkRevision && url == tab.url && lastUsed == tab.lastUsedAt
                 && order == tabs.map(\.id) && canArchive(tab, automatically: automatically)
-                && (!automatically || tabArchive.snapshot.automaticEnabled)
+                && (!automatically || tabArchive.policy(forProfileID: tab.profileID) == automaticPolicy)
         }
         guard await archiveWorkCheck(tab), current(), !(await archiveMediaCheck(tab)), current(),
               let url, let index = tabs.firstIndex(where: { $0 === tab }) else {
@@ -1293,11 +1311,12 @@ final class BrowserModel: NSObject {
         guard !isPrivate, !isExtensionWindow, !isClosed else { return }
         // Cleanup is independent of the opt-in removal policy and never loads a page.
         await reconcileArchiveRecovery()
-        guard archiveIdlePolicy.permitsPass(now: now, instant: instant), tabArchive.snapshot.automaticEnabled else { return }
+        guard archiveIdlePolicy.permitsPass(now: now, instant: instant) else { return }
         // One candidate per minute. Never drain a Space after startup, sleep, or clock changes.
         guard let candidate = tabs.first(where: {
             canArchive($0, automatically: true) && TabArchiveIdlePolicy.isIdle(lastUsed: $0.lastUsedAt,
-                lastActive: $0.lastActive, now: now, instant: instant)
+                lastActive: $0.lastActive, now: now, instant: instant,
+                policy: tabArchive.policy(forProfileID: $0.profileID))
         }) else { return }
         _ = await archiveTab(candidate.id, automatically: true)
     }
