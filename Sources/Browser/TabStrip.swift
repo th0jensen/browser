@@ -50,9 +50,14 @@ struct TabStrip: View {
         layout == .vertical && !browser.isPrivate && !browser.isExtensionWindow && browser.chromePreferences.showsSpaceTitle
     }
 
+    var showsSpaceSelector: Bool {
+        layout == .vertical && !browser.isPrivate && !browser.isExtensionWindow
+            && browser.chromePreferences.showsSpaceControls(spaceCount: browser.spaces.spaces.count)
+    }
+
     var sidebarSpaceControlsHeight: CGFloat {
-        guard layout == .vertical, !browser.isPrivate, !browser.isExtensionWindow else { return 0 }
-        return 36 + BrowserChrome.edgeInset * 2 + (showsSpaceTitle ? spaceTitleRowHeight + BrowserChrome.edgeInset : 0)
+        (showsSpaceSelector ? 36 + BrowserChrome.edgeInset * 2 : 0)
+            + (showsSpaceTitle ? spaceTitleRowHeight + BrowserChrome.edgeInset : 0)
     }
 
     var body: some View {
@@ -220,8 +225,8 @@ struct TabStrip: View {
                         .padding(.horizontal, BrowserChrome.edgeInset)
                         .padding(.bottom, BrowserChrome.edgeInset)
                 }
-                if !browser.isPrivate && !browser.isExtensionWindow {
-                    // Persistent navigation, outside both the tab scroller and its New Tab row.
+                if showsSpaceSelector {
+                    // Optional navigation, outside both the tab scroller and its New Tab row.
                     SpaceSwitcher(browser: browser, style: .sidebar)
                         .padding(.horizontal, BrowserChrome.edgeInset)
                         .padding(.bottom, BrowserChrome.edgeInset)

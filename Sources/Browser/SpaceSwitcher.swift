@@ -55,7 +55,8 @@ struct SpaceSwitcher: View {
     private var current: BrowserSpace? { browser.spaces.space(browser.activeSpaceID) }
 
     var body: some View {
-        if !browser.isPrivate && !browser.isExtensionWindow {
+        if !browser.isPrivate && !browser.isExtensionWindow,
+           style != .sidebar || browser.chromePreferences.showsSpaceControls(spaceCount: browser.spaces.spaces.count) {
             Group {
                 if style == .sidebar { iconStrip }
                 else { fallbackMenu }
@@ -93,6 +94,8 @@ struct SpaceSwitcher: View {
 
     private var iconStrip: some View {
         NativeSpaceSelector(spaces: browser.spaces.spaces, activeID: browser.activeSpaceID,
+            showsIndicator: browser.chromePreferences.spaceIndicatorHiding.showsIndicator(spaceCount: browser.spaces.spaces.count),
+            showsNewSpaceButton: browser.chromePreferences.showsNewSpaceButton,
             select: { browser.selectSpace($0) },
             edit: { editor = SpaceEditorRequest(space: $0) },
             create: { editor = SpaceEditorRequest() })
@@ -117,6 +120,8 @@ struct SpaceSwitcher: View {
 private struct NativeSpaceSelector: NSViewRepresentable {
     let spaces: [BrowserSpace]
     let activeID: UUID
+    let showsIndicator: Bool
+    let showsNewSpaceButton: Bool
     let select: (UUID) -> Void
     let edit: (BrowserSpace) -> Void
     let create: () -> Void
@@ -124,7 +129,9 @@ private struct NativeSpaceSelector: NSViewRepresentable {
     func makeNSView(context: Context) -> SpaceSelectorView { SpaceSelectorView() }
     func updateNSView(_ view: SpaceSelectorView, context: Context) {
         view.update(spaces: spaces, activeID: activeID, enabled: context.environment.isEnabled,
-            rightToLeft: context.environment.layoutDirection == .rightToLeft, select: select, edit: edit, create: create)
+            rightToLeft: context.environment.layoutDirection == .rightToLeft,
+            showsIndicator: showsIndicator, showsNewSpaceButton: showsNewSpaceButton,
+            select: select, edit: edit, create: create)
     }
     static func dismantleNSView(_ view: SpaceSelectorView, coordinator: ()) { view.clearActions() }
 }
@@ -141,6 +148,8 @@ final class SpaceSelectorView: NSView {
     private var activeID: UUID?
     private var enabled = true
     private var rightToLeft = false
+    private var showsIndicator = true
+    private var showsNewSpaceButton = true
     private var select: ((UUID) -> Void)?
     private var edit: ((BrowserSpace) -> Void)?
     private var create: (() -> Void)?
@@ -178,11 +187,14 @@ final class SpaceSelectorView: NSView {
     required init?(coder: NSCoder) { nil }
 
     func update(spaces: [BrowserSpace], activeID: UUID, enabled: Bool, rightToLeft: Bool = false,
+                showsIndicator: Bool = true, showsNewSpaceButton: Bool = true,
                 select: @escaping (UUID) -> Void, edit: @escaping (BrowserSpace) -> Void, create: @escaping () -> Void) {
         self.spaces = spaces
         self.activeID = activeID
         self.enabled = enabled
         self.rightToLeft = rightToLeft
+        self.showsIndicator = showsIndicator
+        self.showsNewSpaceButton = showsNewSpaceButton
         self.select = select
         self.edit = edit
         self.create = create
@@ -205,14 +217,22 @@ final class SpaceSelectorView: NSView {
     override func layout() {
         super.layout()
         let selected = spaces.firstIndex { $0.id == activeID } ?? 0
-        let layout = SpaceStripLayout(count: spaces.count, selectedIndex: selected, width: bounds.width)
+        let oldControls: [NSButton] = choiceButtons + [plusButton, overflowButton]
+        let layout = SpaceStripLayout(count: showsIndicator ? spaces.count : 0, selectedIndex: selected, width: bounds.width)
+        selectorGroup.isHidden = !showsIndicator
         compact = layout.usesCompactMenu
         let side = layout.targetSize
         let groupWidth = CGFloat(layout.visibleIndices.count) * side
         selectorGroup.frame = NSRect(x: bounds.midX - groupWidth / 2, y: bounds.midY - side / 2, width: groupWidth, height: side)
         let old = Dictionary(uniqueKeysWithValues: choiceButtons.map { ($0.spaceID, $0) })
         let visible = layout.visibleIndices.map { spaces[$0] }
-        for button in choiceButtons where !visible.contains(where: { $0.id == button.spaceID }) { button.removeFromSuperview() }
+        for button in choiceButtons where !visible.contains(where: { $0.id == button.spaceID }) {
+            button.isEnabled = false
+            button.target = nil
+            button.action = nil
+            button.menu = nil
+            button.removeFromSuperview()
+        }
         choiceButtons = visible.enumerated().map { index, space in
             let button = old[space.id] ?? SpaceChoiceButton(spaceID: space.id)
             button.configure(space, selected: space.id == activeID, compact: compact)
@@ -237,10 +257,15 @@ final class SpaceSelectorView: NSView {
         let trailingX = bounds.maxX - inset - side
         plusButton.frame = NSRect(x: rightToLeft ? leadingX : trailingX, y: bounds.midY - side / 2, width: side, height: side)
         overflowButton.frame = NSRect(x: rightToLeft ? trailingX : leadingX, y: bounds.midY - side / 2, width: side, height: side)
-        overflowButton.isHidden = !layout.showsOverflow || compact
-        plusButton.isEnabled = enabled
-        overflowButton.isEnabled = enabled
-        let controls: [NSButton] = choiceButtons + (overflowButton.isHidden ? [] : [overflowButton]) + [plusButton]
+        overflowButton.isHidden = !showsIndicator || !layout.showsOverflow || compact
+        plusButton.isHidden = !showsNewSpaceButton
+        plusButton.isEnabled = enabled && showsNewSpaceButton
+        overflowButton.isEnabled = enabled && !overflowButton.isHidden
+        let controls: [NSButton] = choiceButtons + (overflowButton.isHidden ? [] : [overflowButton]) + (plusButton.isHidden ? [] : [plusButton])
+        if let focused = window?.firstResponder as? NSButton,
+           oldControls.contains(where: { $0 === focused }), !controls.contains(where: { $0 === focused }) {
+            window?.makeFirstResponder(nil)
+        }
         setAccessibilityChildren(controls)
         setAccessibilitySelectedChildren(choiceButtons.filter { $0.isSelectedSpace })
         // The window owns both boundaries of this representable's key-view loop.
@@ -256,21 +281,22 @@ final class SpaceSelectorView: NSView {
     }
 
     @objc private func selectChoice(_ sender: SpaceChoiceButton) {
+        guard enabled, showsIndicator, choiceButtons.contains(where: { $0 === sender }) else { return }
         if compact { presentMenu(relativeTo: sender) }
         else if enabled { select?(sender.spaceID) }
     }
     @objc private func selectMenuItem(_ sender: NSMenuItem) {
-        guard enabled, let id = sender.representedObject as? UUID, spaces.contains(where: { $0.id == id }) else { return }
+        guard enabled, showsIndicator, let id = sender.representedObject as? UUID, spaces.contains(where: { $0.id == id }) else { return }
         select?(id)
     }
     @objc private func editSpace(_ sender: NSMenuItem) {
-        guard enabled, let id = sender.representedObject as? UUID, let space = spaces.first(where: { $0.id == id }) else { return }
+        guard enabled, showsIndicator, let id = sender.representedObject as? UUID, let space = spaces.first(where: { $0.id == id }) else { return }
         edit?(space)
     }
-    @objc private func createSpace() { if enabled { create?() } }
+    @objc private func createSpace() { if enabled && showsNewSpaceButton { create?() } }
     @objc private func showAllSpaces() { presentMenu(relativeTo: overflowButton) }
     private func presentMenu(relativeTo button: NSButton) {
-        guard enabled else { return }
+        guard enabled, showsIndicator else { return }
         spaceMenu.popUp(positioning: nil, at: NSPoint(x: button.bounds.midX, y: button.bounds.maxY), in: button)
     }
     func clearActions() {

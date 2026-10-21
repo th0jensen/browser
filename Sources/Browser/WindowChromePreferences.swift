@@ -2,6 +2,25 @@ import AppKit
 import Observation
 import SwiftUI
 
+enum SpaceIndicatorHiding: String, CaseIterable, Identifiable {
+    case always, whenSingleSpace, never
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .always: "Always"
+        case .whenSingleSpace: "When only one Space"
+        case .never: "Never"
+        }
+    }
+    func showsIndicator(spaceCount: Int) -> Bool {
+        switch self {
+        case .always: false
+        case .whenSingleSpace: spaceCount > 1
+        case .never: spaceCount > 0
+        }
+    }
+}
+
 /// Each window owns its layout and visibility. Only defaults for future windows are saved,
 /// under separate build-variant keys; other open windows never observe those defaults.
 @MainActor @Observable
@@ -20,6 +39,12 @@ final class WindowChromePreferences {
     @ObservationIgnored private let prefix: String
     var tabLayout: TabLayout { didSet { defaults.set(tabLayout.rawValue, forKey: prefix + ".tabLayout") } }
     var showsSpaceTitle: Bool { didSet { defaults.set(showsSpaceTitle, forKey: prefix + ".spaceTitle") } }
+    var showsNewSpaceButton: Bool { didSet { defaults.set(showsNewSpaceButton, forKey: prefix + ".newSpaceButton") } }
+    var spaceIndicatorHiding: SpaceIndicatorHiding { didSet { defaults.set(spaceIndicatorHiding.rawValue, forKey: prefix + ".spaceIndicatorHiding") } }
+
+    func showsSpaceControls(spaceCount: Int) -> Bool {
+        showsNewSpaceButton || spaceIndicatorHiding.showsIndicator(spaceCount: spaceCount)
+    }
     private var hidesToolbar: Bool { didSet { defaults.set(hidesToolbar, forKey: prefix + ".toolbar") } }
     private var hidesSidebar: Bool { didSet { defaults.set(hidesSidebar, forKey: prefix + ".sidebar") } }
     var autoHideToolbar: Bool {
@@ -35,6 +60,8 @@ final class WindowChromePreferences {
         self.defaults = defaults
         prefix = "windowChrome.\(variant.rawValue)"
         showsSpaceTitle = defaults.object(forKey: prefix + ".spaceTitle") as? Bool ?? true
+        showsNewSpaceButton = defaults.object(forKey: prefix + ".newSpaceButton") as? Bool ?? true
+        spaceIndicatorHiding = SpaceIndicatorHiding(rawValue: defaults.string(forKey: prefix + ".spaceIndicatorHiding") ?? "") ?? .never
         tabLayout = TabLayout(rawValue: defaults.string(forKey: prefix + ".tabLayout") ?? defaults.string(forKey: TabLayout.storageKey) ?? "") ?? .horizontal
         hidesToolbar = defaults.object(forKey: prefix + ".toolbar") as? Bool
             ?? defaults.bool(forKey: CompactToolbar.storageKey)
