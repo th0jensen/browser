@@ -31,6 +31,7 @@ final class BrowserModel: NSObject {
         NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .drawCompleted)
     }
     @ObservationIgnored private var tidyTask: Task<Void, Never>?
+    private var tidyUndo: TidyUndoSnapshot?
     @ObservationIgnored private var titleTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored private var titleTaskTokens: [UUID: UUID] = [:]
     private(set) var namingSavedPageIDs: Set<UUID> = []
@@ -605,6 +606,7 @@ final class BrowserModel: NSObject {
         guard let sourceIndex = tabs.firstIndex(where: { $0.id == id }),
               tabs.indices.contains(destinationIndex),
               sourceIndex != destinationIndex else { return false }
+        tabs[sourceIndex].invalidateGroupingOrder()
         tabs[sourceIndex].temporarySection = tabs[destinationIndex].temporarySection
         tabs.move(fromOffsets: IndexSet(integer: sourceIndex),
                   toOffset: destinationIndex > sourceIndex ? destinationIndex + 1 : destinationIndex)
@@ -976,6 +978,7 @@ extension BrowserModel {
               let destination = regularTabs.first(where: { $0.temporarySection?.id == sectionID })?.temporarySection else { return false }
         let previous = tabs.map(\.id)
         let groups = temporaryTabGroups
+        tab.invalidateGroupingOrder()
         tab.temporarySection = destination
         let order = groups.flatMap { group -> [UUID] in
             let members = group.tabs.filter { $0.id != id }.map(\.id)
@@ -986,27 +989,88 @@ extension BrowserModel {
         return true
     }
 
-    var canTidyTabs: Bool { !isPrivate && regularTabs.filter { !$0.isNewTab && $0.url.map(PinnedPageStore.valid) == true }.count > 6 }
+    /// Value-only state: undo does not keep a tab or its web view alive.
+    private struct TidyTabState: Equatable {
+        let id: UUID
+        let identity: ObjectIdentifier
+        let url: URL?
+        let contentNavigationRevision: Int
+        let groupingRevision: Int
+        let section: TemporaryTabSection?
+
+        @MainActor init(_ tab: BrowserTab) {
+            id = tab.id
+            identity = ObjectIdentifier(tab)
+            url = tab.url
+            contentNavigationRevision = tab.contentNavigationRevision
+            groupingRevision = tab.groupingRevision
+            section = tab.temporarySection
+        }
+    }
+
+    private struct TidyUndoSnapshot {
+        let before: [TidyTabState]
+        let after: [TidyTabState]
+    }
+
+    private var tidyCandidates: [BrowserTab] {
+        regularTabs.filter {
+            $0.pinnedPageID == nil && $0.folderPageID == nil
+                && !$0.isNewTab && $0.url.map(PinnedPageStore.valid) == true
+        }
+    }
+
+    private func matchingTidyTabs(_ states: [TidyTabState]) -> Set<UUID> {
+        let current = Dictionary(uniqueKeysWithValues: tidyCandidates.map { ($0.id, TidyTabState($0)) })
+        return Set(states.filter { current[$0.id] == $0 }.map(\.id))
+    }
+
+    var canTidyTabs: Bool { !isPrivate && tidyCandidates.count > 6 }
+
+    var canUndoTidyTabs: Bool {
+        guard !isPrivate, !isTidyingTabs, let tidyUndo else { return false }
+        return !matchingTidyTabs(tidyUndo.after).isEmpty
+    }
+
+    func undoTidyTabs() {
+        guard !isPrivate, !isTidyingTabs, let snapshot = tidyUndo else { return }
+        let eligible = matchingTidyTabs(snapshot.after)
+        guard !eligible.isEmpty else { return }
+        tidyUndo = nil
+        for state in snapshot.before where eligible.contains(state.id) {
+            tab(withID: state.id)?.temporarySection = state.section
+        }
+        // Only replace eligible slots. New, saved, navigated and manually edited
+        // tabs stay where they are now; closed tabs are never recreated.
+        reorderTemporaryTabs(snapshot.before.map(\.id), eligible: eligible)
+    }
 
     func tidyTemporaryTabs() {
         guard canTidyTabs, !isTidyingTabs else { return }
         if let reason = BrowserIntelligence.unavailableReason { intelligenceError = reason; return }
-        let input = regularTabs.compactMap { tab -> TidyTabInput? in
-            guard !tab.isNewTab, let url = tab.url, PinnedPageStore.valid(url) else { return nil }
-            return TidyTabInput(id: tab.id, title: tab.pageTitle, url: url)
+        tidyTemporaryTabs { try await LocalIntelligence.shared.tidy($0) }
+    }
+
+    /// The provider seam keeps regression tests independent of model availability.
+    func tidyTemporaryTabs(using provider: @escaping @MainActor ([TidyTabInput]) async throws -> [TidyTabAssignment]) {
+        guard canTidyTabs, !isTidyingTabs else { return }
+        let candidates = tidyCandidates
+        let state = candidates.map(TidyTabState.init)
+        let input = candidates.compactMap { tab in
+            tab.url.map { TidyTabInput(id: tab.id, title: tab.pageTitle, url: $0) }
         }
         isTidyingTabs = true
         intelligenceError = nil
         tidyTask = Task { [weak self] in
             do {
-                let result = try await LocalIntelligence.shared.tidy(input)
+                let result = try await provider(input)
                 try Task.checkCancellation()
                 guard let self else { return }
-                // Do not categorize a tab that navigated or became saved during inference.
-                let eligible = Set(input.filter { item in self.regularTabs.contains { $0.id == item.id && $0.url == item.url } }.map(\.id))
-                self.applyTidyTabs(result, eligible: eligible)
+                self.applyTidyTabs(result, eligible: self.matchingTidyTabs(state))
             } catch is CancellationError { }
-            catch { self?.intelligenceError = "Couldn’t tidy tabs. \(error.localizedDescription)" }
+            catch {
+                if !Task.isCancelled { self?.intelligenceError = "Couldn’t tidy tabs. \(error.localizedDescription)" }
+            }
             self?.isTidyingTabs = false
             self?.tidyTask = nil
         }
@@ -1016,29 +1080,37 @@ extension BrowserModel {
 
     /// Invalid, repeated or vanished IDs cannot remove or duplicate any tab.
     func applyTidyTabs(_ result: [TidyTabAssignment], eligible: Set<UUID>) {
-        guard !result.isEmpty else { return }
-        let current = Set(regularTabs.map(\.id)).intersection(eligible)
-        var seen = Set<UUID>(), order: [UUID] = []
-        for assignment in result {
-            for id in assignment.tabIDs where current.contains(id) && seen.insert(id).inserted {
-                tab(withID: id)?.temporarySection = assignment.section
+        guard !isPrivate else { return }
+        let candidates = tidyCandidates.filter { eligible.contains($0.id) }
+        let current = Set(candidates.map(\.id))
+        var sections: [UUID: TemporaryTabSection] = [:], order: [UUID] = []
+        for assignment in result where !assignment.section.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            for id in assignment.tabIDs where current.contains(id) && sections[id] == nil {
+                sections[id] = assignment.section
                 order.append(id)
             }
         }
-        let remaining = regularTabs.filter { !seen.contains($0.id) }
-        remaining.filter { current.contains($0.id) }.forEach { $0.temporarySection = nil }
-        order += remaining.map(\.id)
-        reorderTemporaryTabs(order)
+        // An empty or wholly invalid response must not erase existing groups or undo.
+        guard !order.isEmpty else { return }
+        let before = candidates.map(TidyTabState.init)
+        for tab in candidates { tab.temporarySection = sections[tab.id] }
+        order += candidates.filter { sections[$0.id] == nil }.map(\.id)
+        reorderTemporaryTabs(order, eligible: current)
+        let after = tidyCandidates.filter { current.contains($0.id) }.map(TidyTabState.init)
+        if before != after {
+            tidyUndo = TidyUndoSnapshot(before: before, after: after)
+        }
     }
 
-    private func reorderTemporaryTabs(_ ids: [UUID]) {
-        let temporary = Set(regularTabs.map(\.id))
-        var ordered = ids.compactMap { tab(withID: $0) }.filter { temporary.contains($0.id) }
-        let seen = Set(ordered.map(\.id))
-        ordered += regularTabs.filter { !seen.contains($0.id) }
+    private func reorderTemporaryTabs(_ ids: [UUID], eligible: Set<UUID>? = nil) {
+        let candidates = regularTabs.filter { eligible?.contains($0.id) ?? true }
+        let byID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
+        var seen = Set<UUID>()
+        var ordered = ids.compactMap { id in seen.insert(id).inserted ? byID[id] : nil }
+        ordered += candidates.filter { !seen.contains($0.id) }
         let oldIndices = Dictionary(uniqueKeysWithValues: tabs.enumerated().map { ($0.element.id, $0.offset) })
         var iterator = ordered.makeIterator()
-        for index in tabs.indices where temporary.contains(tabs[index].id) {
+        for index in tabs.indices where byID[tabs[index].id] != nil {
             if let next = iterator.next() { tabs[index] = next }
         }
         for (index, tab) in tabs.enumerated() {
@@ -1200,6 +1272,7 @@ extension BrowserModel {
         var groups = temporaryTabGroups
         guard let from = groups.firstIndex(where: { $0.id == id }), let to = groups.firstIndex(where: { $0.id == targetID }),
               direction > 0 ? to > from : to < from else { return }
+        groups[from].tabs.forEach { $0.invalidateGroupingOrder() }
         groups.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
         reorderTemporaryTabs(groups.flatMap { $0.tabs.map(\.id) })
         reorderFeedback()
