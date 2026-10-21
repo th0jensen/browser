@@ -11,8 +11,15 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     var isLoadingFromBrowser = false
     private var dialogs = DialogLimiter()
 
-    /// WebKit reports mouse buttons as a mask, like `NSEvent.pressedMouseButtons`, not as a button number.
-    private static let middleButtonMask = 1 << 2
+    private func linkIntent(for action: WKNavigationAction, in webView: WKWebView) -> PageLinkIntent {
+        guard let tab, tab.webView === webView, let browser = tab.browser,
+              !browser.isClosed, browser.tab(for: webView) === tab else { return .standard }
+        let canPeek = action.request.url.map { browser.canPeek($0, from: tab) } ?? false
+        return PageLinkIntent.decide(isLinkActivated: action.navigationType == .linkActivated,
+                                     modifiers: action.modifierFlags, buttonMask: action.buttonNumber,
+                                     canPeek: canPeek && !action.shouldPerformDownload,
+                                     automaticPeek: action.request.url.map { browser.shouldPeek($0, from: tab) } ?? false)
+    }
 
     func webView(_ webView: WKWebView,
                  decidePolicyFor navigationAction: WKNavigationAction) async -> WKNavigationActionPolicy {
@@ -47,18 +54,20 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
                 return .cancel
             }
         }
-        if navigationAction.navigationType == .linkActivated,
-           navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == Self.middleButtonMask,
-           let tab, let browser = tab.browser {
-            browser.openChildTab(of: tab, loading: navigationAction.request, select: false)
-            return .cancel
-        }
-        if navigationAction.navigationType == .linkActivated,
-           navigationAction.targetFrame?.isMainFrame == true,
-           let url = navigationAction.request.url, let tab, let browser = tab.browser,
-           browser.shouldPeek(url, from: tab) {
-            browser.openPeek(from: tab, request: navigationAction.request)
-            return .cancel
+        // New-window actions must reach the UI delegate. It returns a view with
+        // WebKit's supplied configuration, preserving the opener and loading once.
+        guard let target = navigationAction.targetFrame else { return .allow }
+        if let tab, let browser = tab.browser {
+            switch linkIntent(for: navigationAction, in: webView) {
+            case .backgroundTab:
+                browser.openChildTab(of: tab, loading: navigationAction.request, select: false)
+                return .cancel
+            case .peek where target.isMainFrame:
+                browser.openPeek(from: tab, request: navigationAction.request)
+                return .cancel
+            default:
+                break
+            }
         }
         return .allow
     }
@@ -182,17 +191,27 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// web view, which must use the configuration it provides so `window.opener` keeps working.
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        guard let tab, let browser = tab.browser else { return nil }
+        guard let tab, let browser = tab.browser, !browser.isClosed,
+              tab.webView === webView, browser.tab(for: webView) === tab else { return nil }
+        let intent = linkIntent(for: navigationAction, in: webView)
+        // Modifier-clicks stay in the source browser, including on extension pages.
+        // Keep WebKit's configuration and its extension ownership together.
+        if intent == .backgroundTab {
+            let child = browser.openChildTab(of: tab, configuration: configuration, select: false)
+            child.extensionOrigin = tab.extensionOrigin
+            return child.webView
+        }
         if webView.url?.scheme == "webkit-extension" {
             let popup = BrowserExtensions.shared.openWindow(configuration: configuration, opener: tab).activeTab
             popup?.extensionOrigin = tab.extensionOrigin
             return popup?.webView
         }
-        if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url,
-           browser.shouldPeek(url, from: tab) {
+        if intent == .peek {
             return browser.openPeek(from: tab, configuration: configuration).webView
         }
-        if navigationAction.navigationType == .linkActivated, let home = tab.pinnedHomeURL,
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty,
+           let home = tab.pinnedHomeURL,
            let url = navigationAction.request.url, PinnedNavigation.isSameSite(url, as: home) {
             webView.load(navigationAction.request)
             return nil

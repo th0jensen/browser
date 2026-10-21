@@ -523,9 +523,17 @@ final class BrowserModel: NSObject {
         return tabs.first { $0.id == id }
     }
 
+    /// Explicit Peek is available on the active live tab, including private tabs.
+    /// It is independent of the automatic saved-tab cross-site preference.
+    func canPeek(_ url: URL, from tab: BrowserTab) -> Bool {
+        !isClosed && !isExtensionWindow && tab.browser === self && activeTab === tab
+            && tabs.contains { $0 === tab } && tab.extensionOrigin == nil
+            && tab.webView?.url?.scheme != "webkit-extension"
+            && PinnedNavigation.isWebURL(url) && url.host()?.isEmpty == false
+    }
+
     func shouldPeek(_ url: URL, from tab: BrowserTab) -> Bool {
-        guard tab.id == activeTabID, let home = tab.pinnedHomeURL, PinnedNavigation.isWebURL(url),
-              !isExtensionWindow else { return false }
+        guard canPeek(url, from: tab), let home = tab.pinnedHomeURL else { return false }
         let enabled = UserDefaults.standard.object(forKey: PinnedNavigation.peekEnabledKey) as? Bool ?? true
         return enabled && !PinnedNavigation.isSameSite(url, as: home)
     }
