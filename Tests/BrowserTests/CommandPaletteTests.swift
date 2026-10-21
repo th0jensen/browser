@@ -598,6 +598,17 @@ final class CommandPaletteTests: XCTestCase {
             let cell = try XCTUnwrap(table.view(atColumn: 0, row: row, makeIfNecessary: true) as? CommandPaletteResultCell,
                                      file: file, line: line)
             cell.layoutSubtreeIfNeeded()
+            let rowView = try XCTUnwrap(table.rowView(atRow: row, makeIfNecessary: true), file: file, line: line)
+            rowView.layoutSubtreeIfNeeded()
+            let glass = try XCTUnwrap(rowView.subviews.compactMap { $0 as? NSGlassEffectView }.first, file: file, line: line)
+            XCTAssertEqual(glass.style, .regular, file: file, line: line)
+            XCTAssertEqual(glass.isHidden, !table.isRowSelected(row), file: file, line: line)
+            XCTAssertEqual(glass.cornerRadius, glass.bounds.height / 2, accuracy: 0.5, file: file, line: line)
+            XCTAssertTrue(rowView.bounds.contains(glass.frame), diagnostic, file: file, line: line)
+            if let scroller = scroll.verticalScroller, !scroller.isHidden {
+                let obstruction = rowView.convert(scroller.bounds, from: scroller)
+                XCTAssertFalse(glass.frame.intersects(obstruction), "Glass under scroller: \(diagnostic)", file: file, line: line)
+            }
             let labels = cell.subviews.compactMap { $0 as? NSTextField }
             XCTAssertEqual(labels.count, 2, file: file, line: line)
             XCTAssertEqual(cell.returnSymbol.isHidden, !table.isRowSelected(row), file: file, line: line)

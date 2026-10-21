@@ -167,7 +167,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         table.rowHeight = 42
         table.intercellSpacing = NSSize(width: 0, height: 1)
         table.backgroundColor = .clear
-        table.selectionHighlightStyle = .regular
+        table.selectionHighlightStyle = .none // The selected row owns its native glass pill.
         table.allowsEmptySelection = true
         table.allowsMultipleSelection = false
         table.columnAutoresizingStyle = .noColumnAutoresizing
@@ -681,15 +681,53 @@ final class CommandPaletteTable: NSTableView {
     }
 }
 
+private final class CommandPaletteSelectionGlass: NSGlassEffectView {
+    // A decorative selection background must not take clicks from the row.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 private final class CommandPaletteResultRow: NSTableRowView {
+    private let selectionGlass = CommandPaletteSelectionGlass()
     override var isSelected: Bool { didSet { updateCells() } }
+    // Glass uses semantic foregrounds, not the flat highlight's white-text mode.
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        selectionGlass.style = .regular
+        selectionGlass.identifier = .init("CommandResult.selectionGlass")
+        selectionGlass.setAccessibilityElement(false)
+        selectionGlass.isHidden = true
+        addSubview(selectionGlass, positioned: .below, relativeTo: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func drawSelection(in dirtyRect: NSRect) {} // No square AppKit fill behind the glass.
+
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         updateCells()
     }
+
+    override func layout() {
+        super.layout()
+        let readable = (enclosingScrollView as? CommandPaletteResultsScrollView)
+            .map { convert($0.readableContentBounds, from: $0.contentView) } ?? bounds
+        // Only inset the horizontal readable region. The clip view clips vertical
+        // scrolling; intersecting it here would reshape partially visible pills.
+        let left = max(bounds.minX, readable.minX)
+        let right = min(bounds.maxX, readable.maxX)
+        selectionGlass.frame = NSRect(x: left + 4, y: bounds.minY + 1,
+                                     width: max(0, right - left - 8), height: max(0, bounds.height - 2))
+        selectionGlass.cornerRadius = selectionGlass.bounds.height / 2
+    }
+
     private func updateCells() {
+        let selected = superview != nil && isSelected
+        selectionGlass.isHidden = !selected
+        needsLayout = true
         for cell in subviews.compactMap({ $0 as? CommandPaletteResultCell }) {
-            cell.setSelected(superview != nil && isSelected)
+            cell.setSelected(selected)
         }
     }
 }
