@@ -26,10 +26,21 @@ enum BrowserIntelligence {
     }
 }
 
+// Reconstructed local contracts inspired by Arc P01/P02. The recovered P01
+// fields are `filtered`/`rewritten`; P02 uses `newName` including an extension.
+// These smaller contracts are not exact Arc prompts or verified Arc call paths.
 @Generable
-struct TidyName {
-    @Guide(description: "A clear, specific 2–5 word name. Preserve the subject, proper nouns, dates and versions. No notification counts, site boilerplate, separators, quotes or commentary.")
-    var name: String
+struct TitleCandidates {
+    @Guide(description: "The title with notifications and site boilerplate removed. Preserve the subject, names and input language. No word limit.")
+    var cleaned: String
+    @Guide(description: "A short label, ideally 1–3 words, without losing identifying names or meaning. Keep more words when needed. Do not translate.")
+    var short: String
+}
+
+@Generable
+struct DownloadNameCandidate {
+    @Guide(description: "A readable filename stem in the input language. No path or extension. Keep the original stem if uncertain.")
+    var stem: String
 }
 
 @Generable
@@ -103,7 +114,7 @@ actor LocalIntelligence {
     private var waiters: [Waiter] = []
     private var prepared: [RequestKind: (LanguageModelSession, Date)] = [:]
     private var expiry: Task<Void, Never>?
-    private var nameCache: [String: String] = [:]
+    private var nameCache: [NamingPolicy.CacheKey: String] = [:]
 
     private func acquire(priority: Int) async throws {
         try Task.checkCancellation()
@@ -156,9 +167,9 @@ actor LocalIntelligence {
     private nonisolated static func instructions(_ kind: RequestKind) -> String {
         switch kind {
         case .name:
-            "Rename the page in 2–5 words. Preserve identifying product, language, or project names. Remove notifications and site suffixes. Example: Understanding Ownership - The Rust Programming Language becomes {\"name\":\"Rust Ownership\"}."
+            "Create a saved-tab label. Preserve the subject, identifying proper nouns and input language. Remove notifications and site boilerplate only when useful content remains. Keep an informative short title unchanged. Return a cleaned fallback and a short candidate, ideally 1–3 words; never shorten by dropping identity. Return {\"cleaned\":\"Ownership in Rust\",\"short\":\"Rust Ownership\"}."
         case .download:
-            "Name the download in 2–5 words. Preserve subject, dates and versions; omit extension and repeated facts. If ambiguous, keep the original stem. Return JSON like {\"name\":\"Annual Report 2026\"}."
+            "Suggest a readable download-name stem. Keep informative names mostly unchanged. Remove generated copy markers and meaningless IDs, but preserve the subject, product versions, builds and useful dates. Keep timestamps clear without seconds. Use the source title only when it gives clear identifying information. Preserve the input language. No path or extension. If ambiguous, keep the original stem. Return {\"stem\":\"Annual Report 2026\"}."
         case .tidy:
             "Organize ALL the supplied temporary tabs by specific shared interests or tasks. Put every numeric ID in exactly one group. Group by SUBJECT, never by website, domain, format, or whether it is a search. A search tab is about its search query shown in its title. For example Jai window creation and Jai vector types belong in Jai programming even if both are Google searches. A lone unrelated tab gets its own specific topic; do not use a miscellaneous group. Prefer concrete subjects such as Rust Learning or WW2 Study over broad labels like Programming Concepts or Historical Conflicts. Check all IDs before finishing. Reuse matching existing topics."
         case .preview:
@@ -174,39 +185,57 @@ actor LocalIntelligence {
         let warm = prepared.removeValue(forKey: kind)
         let session = warm.map { Date().timeIntervalSince($0.1) < 30 ? $0.0 : makeSession(kind) } ?? makeSession(kind)
         let options = GenerationOptions(samplingMode: .greedy, maximumResponseTokens: tokens)
-        // Full examples above let constrained decoding enforce the schema without
-        // adding its verbose descriptions to every prompt.
+        // Small naming examples define field names; constrained decoding enforces
+        // the schema without adding verbose descriptions to each naming request.
         let response = try await session.respond(to: data, generating: type, includeSchemaInPrompt: kind == .tidy, options: options)
         try Task.checkCancellation()
         return response.content
     }
 
     func savedTabName(title: String, url: URL) async throws -> String {
-        let data = Self.json(["title": String(Self.withoutNotificationCount(title).prefix(180)), "page": String(Self.pageHint(url).prefix(100))])
-        if let cached = nameCache["tab:" + data] { return cached }
-        let result = try await generate(TidyName.self, kind: .name, data: data, tokens: 60)
-        let name = Self.displayTitle(try Self.cleanName(Self.withoutNotificationCount(result.name), limit: 72))
-        cacheName(name, key: "tab:" + data)
-        return name
+        try Task.checkCancellation()
+        let fallback = NamingPolicy.cleanedTitle(title)
+        guard !fallback.isEmpty else { throw IntelligenceError.message("The page has no useful title.") }
+        // Never infer from a truncated title: its missing tail may identify it.
+        guard NamingPolicy.titleNeedsModel(title) else { return fallback }
+        let page = String(Self.pageHint(url).prefix(100))
+        let key = NamingPolicy.CacheKey(kind: .title, input: fallback, context: "", page: page)
+        if let cached = nameCache[key] { return cached }
+        do {
+            let data = Self.json(["title": fallback, "page": page])
+            let result = try await generate(TitleCandidates.self, kind: .name, data: data, tokens: 150)
+            let name = NamingPolicy.selectTitle(original: title, cleaned: result.cleaned, short: result.short)
+            cacheName(name, key: key)
+            return name
+        } catch {
+            try Task.checkCancellation()
+            if error is CancellationError { throw error }
+            return fallback
+        }
     }
 
     func downloadName(filename: String, sourceTitle: String, sourceURL: URL?) async throws -> String {
-        let data = Self.json(["filename": String(filename.prefix(160)), "pageTitle": String(sourceTitle.prefix(160)),
-                              "page": sourceURL.map { String(Self.pageHint($0).prefix(100)) } ?? ""])
-        if let cached = nameCache["download:" + data] { return cached }
-        let result = try await generate(TidyName.self, kind: .download, data: data, tokens: 70)
-        let words = try Self.cleanName(result.name, limit: 100).split(separator: " ")
-        var numbers = Set<String>()
-        let name = words.filter { word in
-            if ["-", "|", "—", "–"].contains(String(word)) { return false }
-            if word.count == 4 && word.allSatisfy(\.isNumber) { return numbers.insert(String(word)).inserted }
-            return true
-        }.joined(separator: " ")
-        cacheName(name, key: "download:" + data)
-        return name
+        try Task.checkCancellation()
+        let fallback = NamingPolicy.cleanedDownloadStem(NamingPolicy.filenameParts(filename).stem)
+        let title = NamingPolicy.cleanedTitle(sourceTitle)
+        guard NamingPolicy.downloadNeedsModel(filename: filename, sourceTitle: title) else { return fallback }
+        let page = sourceURL.map { String(Self.pageHint($0).prefix(100)) } ?? ""
+        let key = NamingPolicy.CacheKey(kind: .download, input: filename, context: title, page: page)
+        if let cached = nameCache[key] { return cached }
+        do {
+            let data = Self.json(["stem": fallback, "pageTitle": title, "page": page])
+            let result = try await generate(DownloadNameCandidate.self, kind: .download, data: data, tokens: 80)
+            let name = NamingPolicy.selectDownloadStem(filename: filename, sourceTitle: title, candidate: result.stem)
+            cacheName(name, key: key)
+            return name
+        } catch {
+            try Task.checkCancellation()
+            if error is CancellationError { throw error }
+            return fallback
+        }
     }
 
-    private func cacheName(_ name: String, key: String) {
+    private func cacheName(_ name: String, key: NamingPolicy.CacheKey) {
         if nameCache.count >= 64, let first = nameCache.keys.first { nameCache.removeValue(forKey: first) }
         nameCache[key] = name
     }
@@ -308,7 +337,7 @@ actor LocalIntelligence {
     }
 
     nonisolated static func withoutNotificationCount(_ title: String) -> String {
-        title.replacingOccurrences(of: "^\\s*(?:\\(\\d+\\)|\\[\\d+\\])\\s*", with: "", options: .regularExpression)
+        NamingPolicy.withoutNotificationCount(title)
     }
 
     nonisolated static func pageHint(_ url: URL) -> String {

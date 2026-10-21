@@ -407,15 +407,14 @@ final class DownloadManager: NSObject, WKDownloadDelegate {
     }
 
     nonisolated static func tidyFilename(stem: String, original: String) -> String {
-        let compounds = ["tar.gz", "tar.bz2", "tar.xz", "tar.zst"]
-        let suffix = compounds.first { original.lowercased().hasSuffix("." + $0) }
-            .map { String(original.suffix($0.count)) } ?? (original as NSString).pathExtension
+        let suffix = NamingPolicy.filenameParts(original).suffix
         var clean = stem.components(separatedBy: CharacterSet.controlCharacters.union(CharacterSet(charactersIn: "/:\\")))
             .joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ")
             .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
         if !suffix.isEmpty, clean.lowercased().hasSuffix("." + suffix.lowercased()) { clean.removeLast(suffix.count + 1) }
-        clean = String(clean.prefix(100)).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
-        guard !clean.isEmpty else { return original }
+        clean = clean.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        // Do not cut off a subject, version or date to meet a display budget.
+        guard !clean.isEmpty, clean.count <= 100 else { return original }
         return suffix.isEmpty ? clean : clean + "." + suffix
     }
 
