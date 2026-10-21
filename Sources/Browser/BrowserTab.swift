@@ -241,8 +241,13 @@ final class BrowserTab: NSObject, Identifiable {
     /// has no cheap way to ask; their history still restores.
     var canSuspend: Bool {
         guard let webView, !isNewTab, !isLoading, loadError == nil, selectionWaiters.isEmpty else { return false }
-        if WebInspector.isOpen(for: webView) { return false }
-        return webView.cameraCaptureState == .none && webView.microphoneCaptureState == .none
+        return Self.permitsSuspension(isInspecting: WebInspector.isOpen(for: webView),
+                                      camera: webView.cameraCaptureState, microphone: webView.microphoneCaptureState)
+    }
+
+    /// Native page work protects the view. Muted capture still belongs to a live call.
+    static func permitsSuspension(isInspecting: Bool, camera: WKMediaCaptureState, microphone: WKMediaCaptureState) -> Bool {
+        !isInspecting && camera == .none && microphone == .none
     }
 
     /// Waits until the tab is selected, so a background page's panel can't take over the window.
@@ -277,11 +282,6 @@ final class BrowserTab: NSObject, Identifiable {
         let waiters = selectionWaiters
         selectionWaiters = []
         waiters.forEach { $0.resume(returning: isSelected) }
-    }
-
-    /// WebKit only answers this asynchronously, so it's checked separately from `canSuspend`.
-    func isPlayingMedia() async -> Bool {
-        await webView?.requestMediaPlaybackState() == .playing
     }
 
     static func makeConfiguration(includingExtensions: Bool = true) -> WKWebViewConfiguration {

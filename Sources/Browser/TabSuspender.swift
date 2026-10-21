@@ -14,7 +14,8 @@ final class TabSuspender {
     init(browser: BrowserModel) {
         idleCheck = Task { [weak browser] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: Self.checkInterval)
+                do { try await Task.sleep(for: Self.checkInterval) }
+                catch { return }
                 guard let browser else { return }
                 let cutoff = ContinuousClock.now - Self.idleInterval
                 await browser.suspendTabs(browser.suspendableTabs.filter { $0.lastActive < cutoff })
