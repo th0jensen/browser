@@ -522,6 +522,7 @@ final class CommandPaletteTests: XCTestCase {
             }
         }
         let palette = try await open(fixture)
+        palette.table.reduceSelectionMotion = { true }
         let scroll = try XCTUnwrap(palette.table.enclosingScrollView as? CommandPaletteResultsScrollView)
         let webView = try XCTUnwrap(fixture.source.webView)
         let sourceRevision = fixture.source.navigationRevision
@@ -593,6 +594,18 @@ final class CommandPaletteTests: XCTestCase {
             table.scrollRowToVisible(table.numberOfRows - 1)
             scroll.layoutSubtreeIfNeeded()
         }
+        let glass = table.selectionGlass
+        table.updateSelection(animated: false)
+        glass.layoutSubtreeIfNeeded()
+        XCTAssertEqual(table.subviews.compactMap { $0 as? NSGlassEffectView }.count, 1, file: file, line: line)
+        XCTAssertEqual(glass.style, .regular, file: file, line: line)
+        XCTAssertFalse(glass.isHidden, file: file, line: line)
+        XCTAssertEqual(glass.cornerRadius, glass.bounds.height / 2, accuracy: 0.5, file: file, line: line)
+        XCTAssertTrue(table.rect(ofRow: table.selectedRow).contains(glass.frame), diagnostic, file: file, line: line)
+        if let scroller = scroll.verticalScroller, !scroller.isHidden {
+            let obstruction = table.convert(scroller.bounds, from: scroller)
+            XCTAssertFalse(glass.frame.intersects(obstruction), "Glass under scroller: \(diagnostic)", file: file, line: line)
+        }
         let rows = fitting ? Array(0..<table.numberOfRows) : [table.numberOfRows - 1]
         for row in rows {
             let cell = try XCTUnwrap(table.view(atColumn: 0, row: row, makeIfNecessary: true) as? CommandPaletteResultCell,
@@ -600,18 +613,10 @@ final class CommandPaletteTests: XCTestCase {
             cell.layoutSubtreeIfNeeded()
             let rowView = try XCTUnwrap(table.rowView(atRow: row, makeIfNecessary: true), file: file, line: line)
             rowView.layoutSubtreeIfNeeded()
-            let glass = try XCTUnwrap(rowView.subviews.compactMap { $0 as? NSGlassEffectView }.first, file: file, line: line)
-            XCTAssertEqual(glass.style, .regular, file: file, line: line)
-            XCTAssertEqual(glass.isHidden, !table.isRowSelected(row), file: file, line: line)
-            XCTAssertEqual(glass.cornerRadius, glass.bounds.height / 2, accuracy: 0.5, file: file, line: line)
-            XCTAssertTrue(rowView.bounds.contains(glass.frame), diagnostic, file: file, line: line)
-            if let scroller = scroll.verticalScroller, !scroller.isHidden {
-                let obstruction = rowView.convert(scroller.bounds, from: scroller)
-                XCTAssertFalse(glass.frame.intersects(obstruction), "Glass under scroller: \(diagnostic)", file: file, line: line)
-            }
+            XCTAssertTrue(rowView.subviews.compactMap { $0 as? NSGlassEffectView }.isEmpty, file: file, line: line)
             let labels = cell.subviews.compactMap { $0 as? NSTextField }
             XCTAssertEqual(labels.count, 2, file: file, line: line)
-            XCTAssertEqual(cell.returnSymbol.isHidden, !table.isRowSelected(row), file: file, line: line)
+            XCTAssertEqual(cell.isResultSelected, table.isRowSelected(row), file: file, line: line)
             XCTAssertTrue(cell.accessibilityLabel()?.contains(palette.results[row].actionLabel) == true, file: file, line: line)
             if let space = palette.results[row].destinationSpace {
                 XCTAssertEqual(space, longSpace, file: file, line: line)
@@ -685,8 +690,9 @@ final class CommandPaletteTests: XCTestCase {
         }
         XCTAssertEqual((top + bottom) / 2, rowIcon.midY, accuracy: 0.5, "Typographic row group and icon must share a centre", file: file, line: line)
         XCTAssertEqual(rowIcon.midY, content.convert(cell.bounds, from: cell).midY, accuracy: 0.5, file: file, line: line)
-        if !cell.returnSymbol.isHidden {
-            let glyph = try imageAlignment(cell.returnSymbol)
+        if cell.isResultSelected {
+            palette.table.selectionGlass.layoutSubtreeIfNeeded()
+            let glyph = try imageAlignment(palette.table.selectionGlass.returnSymbol)
             XCTAssertEqual(glyph.midY, rowIcon.midY, accuracy: 0.5, file: file, line: line)
             let titleEnd = content.convert(cell.title.frame, from: cell).maxX
             XCTAssertLessThanOrEqual(titleEnd, glyph.minX, file: file, line: line)

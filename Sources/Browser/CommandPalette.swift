@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import SwiftUI
 
 enum CommandPaletteMode: Equatable, Sendable {
@@ -164,7 +165,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         // inset styles can add padding outside the manually sized viewport.
         table.style = .plain
         table.rowSizeStyle = .custom
-        table.rowHeight = 42
+        table.rowHeight = CommandPaletteLayout.rowHeight
         table.intercellSpacing = NSSize(width: 0, height: 1)
         table.backgroundColor = .clear
         table.selectionHighlightStyle = .none // The selected row owns its native glass pill.
@@ -321,7 +322,8 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         glass.frame = NSRect(x: area.midX - width / 2, y: y, width: width, height: height)
         content.frame = NSRect(origin: .zero, size: glass.bounds.size)
         separator.frame = NSRect(x: 12, y: 64, width: max(0, width - 24), height: 1)
-        scroll.frame = NSRect(x: 8, y: 72, width: max(0, width - 16), height: resultHeight)
+        scroll.frame = NSRect(x: CommandPaletteLayout.resultsInset, y: 72,
+                              width: max(0, width - 2 * CommandPaletteLayout.resultsInset), height: resultHeight)
         table.setFrameSize(NSSize(width: table.frame.width, height: rowsHeight))
         scroll.tile()
         scroll.layoutSubtreeIfNeeded()
@@ -381,7 +383,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
             }
         }
         table.reloadData()
-        if !results.isEmpty { table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
+        if !results.isEmpty { table.selectInitialResult() }
         else { table.deselectAll(nil) }
         layoutPresentation()
     }
@@ -471,6 +473,10 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         return cell
     }
 
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        table.updateSelection(animated: true)
+    }
+
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         let view = CommandPaletteResultRow()
         view.isSelected = tableView.isRowSelected(row)
@@ -537,8 +543,15 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
 @MainActor
 enum CommandPaletteLayout {
     static let inset: CGFloat = 18
-    static let iconCenterX: CGFloat = 26
-    static let textX: CGFloat = 44
+    static let rowHeight: CGFloat = 42
+    static let resultsInset: CGFloat = 8
+    static let selectionInset: CGFloat = 4
+    static let selectionVerticalInset: CGFloat = 1
+    static let iconToText: CGFloat = 20
+    // Icons sit at the leading cap's centre; Return sits at the trailing cap's
+    // centre. Header and row text share the same guide, not unrelated padding.
+    static let iconCenterX = resultsInset + selectionInset + (rowHeight - 2 * selectionVerticalInset) / 2
+    static let textX = iconCenterX + iconToText
 
     static func image(_ name: String) -> NSImage? {
         NSImage(systemSymbolName: name, accessibilityDescription: nil)?
@@ -657,16 +670,160 @@ final class CommandPaletteResultsScrollView: NSScrollView {
         if table.frame.width != canvasWidth { table.setFrameSize(NSSize(width: canvasWidth, height: table.frame.height)) }
         let width = max(0, columnWidth)
         if table.tableColumns.first?.width != width { table.tableColumns.first?.width = width }
+        let readable = readableContentBounds
+        table.selectionViewportDidChange(NSRect(x: readable.minX, y: 0,
+                                                width: readable.width, height: contentView.bounds.height))
     }
 }
 
 final class CommandPaletteTable: NSTableView {
-    /// Includes native row origins and intercell spacing; do not approximate
-    /// this with result count times a separate row-height constant.
-    var rowsHeight: CGFloat { numberOfRows == 0 ? 0 : rect(ofRow: numberOfRows - 1).maxY }
+    /// One persistent material and Return affordance travel together, behind all
+    /// native rows. Reusing rows never creates another selection surface.
+    let selectionGlass = CommandPaletteSelectionGlass()
+    private(set) var selectionTargetFrame: NSRect?
+    private(set) var isSelectionAnimating = false
+    private var selectionRow = -1
+    private var selectionViewport: NSRect?
+    private var motionGeneration = 0
+    private var suppressSelectionMotion = false
+    private var accessibilityObserver: NSObjectProtocol?
+    var reduceSelectionMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
+    /// Includes native row origins and intercell spacing.
+    var rowsHeight: CGFloat { numberOfRows == 0 ? 0 : rect(ofRow: numberOfRows - 1).maxY }
     var performCommand: ((SuggestionAddressField.Command) -> Bool)?
     weak var inputField: NSTextField?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        addSubview(selectionGlass, positioned: .below, relativeTo: nil)
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateSelection(animated: false) }
+        }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    isolated deinit {
+        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateSelection(animated: false)
+    }
+
+    override func layout() {
+        super.layout()
+        // A native selection change can lay out rows before its delegate fires.
+        // Do not snap to that new row ahead of the animated selection update.
+        if selectionRow == selectedRow || selectionGlass.isHidden { updateSelection(animated: false) }
+    }
+
+    override func reloadData() {
+        stopSelectionMotion()
+        suppressSelectionMotion = true
+        super.reloadData()
+        suppressSelectionMotion = false
+        updateSelection(animated: false)
+        // AppKit can restore cached native row selection after reloadData's
+        // immediate pass. Reconcile once it has attached the replacement rows.
+        let generation = motionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.motionGeneration == generation else { return }
+            self.updateSelection(animated: false)
+        }
+    }
+
+    func selectInitialResult() {
+        suppressSelectionMotion = true
+        selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        suppressSelectionMotion = false
+        updateSelection(animated: false)
+    }
+
+    override func selectRowIndexes(_ indexes: IndexSet, byExtendingSelection extend: Bool) {
+        super.selectRowIndexes(indexes, byExtendingSelection: extend)
+        updateSelection(animated: !suppressSelectionMotion)
+    }
+
+    override func deselectAll(_ sender: Any?) {
+        super.deselectAll(sender)
+        updateSelection(animated: false)
+    }
+
+    func selectionViewportDidChange(_ viewport: NSRect) {
+        let changed = selectionViewport != nil && selectionViewport != viewport
+        selectionViewport = viewport
+        guard changed else { return }
+        stopSelectionMotion()
+        if let selectionTargetFrame { selectionGlass.frame = selectionTargetFrame }
+        updateSelection(animated: false)
+    }
+
+    func updateSelection(animated: Bool) {
+        guard window != nil, selectedRow >= 0, selectedRow < numberOfRows else {
+            stopSelectionMotion()
+            selectionTargetFrame = nil
+            selectionRow = -1
+            selectionGlass.isHidden = true
+            return
+        }
+        let row = rect(ofRow: selectedRow)
+        let readable = (enclosingScrollView as? CommandPaletteResultsScrollView)
+            .map { convert($0.readableContentBounds, from: $0.contentView) } ?? bounds
+        let x = max(row.minX, readable.minX) + CommandPaletteLayout.selectionInset
+        let right = min(row.maxX, readable.maxX) - CommandPaletteLayout.selectionInset
+        // rect(ofRow:) includes intercell spacing; the cap is based on native
+        // row content height, not that gap. Centre it in the complete row slot.
+        let contentHeight = min(row.height, rowHeight)
+        let target = NSRect(x: x, y: row.midY - contentHeight / 2 + CommandPaletteLayout.selectionVerticalInset,
+                            width: max(0, right - x), height: max(0, contentHeight - 2 * CommandPaletteLayout.selectionVerticalInset))
+        guard target.width > 0, target.height > 0 else { return }
+        if selectionTargetFrame == target, !selectionGlass.isHidden {
+            // A Reduce Motion change also settles an already-running transition.
+            if isSelectionAnimating, reduceSelectionMotion() {
+                stopSelectionMotion()
+                selectionGlass.frame = target
+            }
+            return
+        }
+        let canAnimate = animated && !suppressSelectionMotion && !selectionGlass.isHidden
+            && !reduceSelectionMotion() && window?.isVisible == true
+        let visibleFrame = selectionGlass.layer?.presentation()?.frame ?? selectionGlass.frame
+        stopSelectionMotion()
+        selectionTargetFrame = target
+        selectionRow = selectedRow
+        selectionGlass.isHidden = false
+        selectionGlass.cornerRadius = target.height / 2
+        guard canAnimate else {
+            selectionGlass.frame = target
+            return
+        }
+        // Retarget from the current presentation, not the previous destination.
+        // Fast repeated keys replace this transition rather than enqueueing it.
+        selectionGlass.frame = visibleFrame
+        isSelectionAnimating = true
+        let generation = motionGeneration
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+            selectionGlass.animator().frame = target
+        } completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.motionGeneration == generation else { return }
+                self.selectionGlass.frame = target // Finish on the exact native geometry.
+                self.isSelectionAnimating = false
+            }
+        }
+    }
+
+    private func stopSelectionMotion() {
+        motionGeneration += 1
+        selectionGlass.layer?.removeAllAnimations()
+        isSelectionAnimating = false
+    }
+
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 48 { window?.makeFirstResponder(inputField); return }
         let command: SuggestionAddressField.Command? = switch event.keyCode {
@@ -681,54 +838,51 @@ final class CommandPaletteTable: NSTableView {
     }
 }
 
-private final class CommandPaletteSelectionGlass: NSGlassEffectView {
-    // A decorative selection background must not take clicks from the row.
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-}
-
-private final class CommandPaletteResultRow: NSTableRowView {
-    private let selectionGlass = CommandPaletteSelectionGlass()
-    override var isSelected: Bool { didSet { updateCells() } }
-    // Glass uses semantic foregrounds, not the flat highlight's white-text mode.
-    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+final class CommandPaletteSelectionGlass: NSGlassEffectView {
+    let returnSymbol = NSImageView()
+    private let contents = CommandPaletteSelectionContent()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        selectionGlass.style = .regular
-        selectionGlass.identifier = .init("CommandResult.selectionGlass")
-        selectionGlass.setAccessibilityElement(false)
-        selectionGlass.isHidden = true
-        addSubview(selectionGlass, positioned: .below, relativeTo: nil)
+        style = .regular
+        identifier = .init("CommandResult.selectionGlass")
+        setAccessibilityElement(false)
+        isHidden = true
+        wantsLayer = true
+        returnSymbol.identifier = .init("CommandResult.return")
+        returnSymbol.image = CommandPaletteLayout.image("return")
+        returnSymbol.imageScaling = .scaleNone
+        returnSymbol.contentTintColor = .labelColor
+        returnSymbol.setAccessibilityElement(false)
+        contents.addSubview(returnSymbol)
+        contentView = contents
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func layout() {
+        super.layout()
+        contents.frame = bounds
+        CommandPaletteLayout.place(returnSymbol, center: NSPoint(x: bounds.maxX - bounds.height / 2, y: bounds.midY))
+    }
+}
 
-    override func drawSelection(in dirtyRect: NSRect) {} // No square AppKit fill behind the glass.
+private final class CommandPaletteSelectionContent: NSView {
+    override var isFlipped: Bool { true }
+}
 
+private final class CommandPaletteResultRow: NSTableRowView {
+    override var isSelected: Bool { didSet { updateCells() } }
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+    override func drawSelection(in dirtyRect: NSRect) {} // The shared glass is the only selection.
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
         updateCells()
     }
-
-    override func layout() {
-        super.layout()
-        let readable = (enclosingScrollView as? CommandPaletteResultsScrollView)
-            .map { convert($0.readableContentBounds, from: $0.contentView) } ?? bounds
-        // Only inset the horizontal readable region. The clip view clips vertical
-        // scrolling; intersecting it here would reshape partially visible pills.
-        let left = max(bounds.minX, readable.minX)
-        let right = min(bounds.maxX, readable.maxX)
-        selectionGlass.frame = NSRect(x: left + 4, y: bounds.minY + 1,
-                                     width: max(0, right - left - 8), height: max(0, bounds.height - 2))
-        selectionGlass.cornerRadius = selectionGlass.bounds.height / 2
-    }
-
     private func updateCells() {
-        let selected = superview != nil && isSelected
-        selectionGlass.isHidden = !selected
-        needsLayout = true
         for cell in subviews.compactMap({ $0 as? CommandPaletteResultCell }) {
-            cell.setSelected(selected)
+            cell.setSelected(superview != nil && isSelected)
         }
+        (superview as? CommandPaletteTable)?.needsLayout = true
     }
 }
 
@@ -736,7 +890,6 @@ final class CommandPaletteResultCell: NSTableCellView {
     let symbol = NSImageView()
     let title = NSTextField(labelWithString: "")
     let detail = NSTextField(labelWithString: "")
-    let returnSymbol = NSImageView()
     private weak var reference: NSView?
     private(set) var isResultSelected = false
     override var isFlipped: Bool { true }
@@ -754,14 +907,9 @@ final class CommandPaletteResultCell: NSTableCellView {
             addSubview(label)
         }
         symbol.identifier = .init("CommandResult.icon")
-        returnSymbol.identifier = .init("CommandResult.return")
-        returnSymbol.image = CommandPaletteLayout.image("return")
-        for image in [symbol, returnSymbol] {
-            image.imageScaling = .scaleNone
-            image.setAccessibilityElement(false)
-            addSubview(image)
-        }
-        returnSymbol.isHidden = true
+        symbol.imageScaling = .scaleNone
+        symbol.setAccessibilityElement(false)
+        addSubview(symbol)
         updateColors()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -769,7 +917,7 @@ final class CommandPaletteResultCell: NSTableCellView {
     func update(_ result: AddressResult, selected: Bool, reference: NSView) {
         self.reference = reference
         userInterfaceLayoutDirection = reference.userInterfaceLayoutDirection
-        for view in [title, detail, symbol, returnSymbol] { view.userInterfaceLayoutDirection = userInterfaceLayoutDirection }
+        for view in [title, detail, symbol] { view.userInterfaceLayoutDirection = userInterfaceLayoutDirection }
         title.stringValue = result.title
         switch result.action {
         case .search, .command, .switchSpace: detail.stringValue = ""
@@ -793,7 +941,6 @@ final class CommandPaletteResultCell: NSTableCellView {
 
     func setSelected(_ selected: Bool) {
         isResultSelected = selected
-        returnSymbol.isHidden = !selected
         needsLayout = true
     }
 
@@ -802,7 +949,6 @@ final class CommandPaletteResultCell: NSTableCellView {
         title.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
         detail.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
         symbol.contentTintColor = title.textColor
-        returnSymbol.contentTintColor = title.textColor
     }
 
     override func layout() {
@@ -813,8 +959,12 @@ final class CommandPaletteResultCell: NSTableCellView {
         let iconX = convert(NSPoint(x: CommandPaletteLayout.iconCenterX + adjustment, y: 0), from: reference).x
         let readable = enclosingScrollView.flatMap { $0 as? CommandPaletteResultsScrollView }
             .map { convert($0.readableContentBounds, from: $0.contentView).intersection(bounds) } ?? bounds
-        let trailing = readable.maxX - 10
-        let textWidth = max(0, trailing - textX - (isResultSelected ? 26 : 0))
+        let capRadius = max(0, bounds.height - 2 * CommandPaletteLayout.selectionVerticalInset) / 2
+        let returnX = readable.maxX - CommandPaletteLayout.selectionInset - capRadius
+        // Reserve the small affordance slot on every row so text does not
+        // reflow or truncate differently as the shared glass moves past it.
+        let trailing = returnX - CommandPaletteLayout.iconToText
+        let textWidth = max(0, trailing - textX)
         let firstInkHeight = titleFont.capHeight - titleFont.descender
         let secondInkHeight = detail.isHidden ? 0 : detailFont.capHeight - detailFont.descender
         let groupHeight = firstInkHeight + (detail.isHidden ? 0 : 2 + secondInkHeight)
@@ -825,6 +975,5 @@ final class CommandPaletteResultCell: NSTableCellView {
             CommandPaletteLayout.place(detail, textX: textX, baselineY: secondBaseline, width: textWidth)
         }
         CommandPaletteLayout.place(symbol, center: NSPoint(x: iconX, y: bounds.midY))
-        CommandPaletteLayout.place(returnSymbol, center: NSPoint(x: trailing - 7, y: bounds.midY))
     }
 }
