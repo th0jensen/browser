@@ -62,6 +62,11 @@ final class CommandPaletteAnchor: NSView {
         // Read the live window intent. An earlier queued SwiftUI update must not
         // reopen a bar that a second Cmd-G has already cancelled.
         guard let browser else { return }
+        // Exit visuals do not own destination focus. Remove stale exit state
+        // even with an unconsumed close request, without cancelling that handoff.
+        if palette.exitingOverlay != nil, !palette.contextIsValid {
+            palette.finishExit(generation: palette.presentationGeneration)
+        }
         if palette.isPresented, !palette.contextIsValid, browser.commandPaletteRequest == applied {
             palette.dismiss(restoreFocus: false)
         }
@@ -122,6 +127,11 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     private var observers: [NSObjectProtocol] = []
     private var pendingMouseUp: NSEvent.EventType?
     private var focusTask: Task<Void, Never>?
+    private(set) var exitingOverlay: NSView?
+    private var exitTask: Task<Void, Never>?
+    private(set) var presentationGeneration = 0
+    private var accessibilityObserver: NSObjectProtocol?
+    var reducePresentationMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     var isPresented: Bool { overlay != nil }
     var contextIsValid: Bool {
@@ -190,10 +200,23 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         scroll.automaticallyAdjustsContentInsets = false
         scroll.contentInsets = NSEdgeInsetsZero
         for view in [symbol, field, separator, scroll] { content.addSubview(view) }
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.reducePresentationMotion() else { return }
+                self.glass?.layer?.removeAnimation(forKey: CommandPaletteTransition.key)
+                self.finishExit(generation: self.presentationGeneration)
+            }
+        }
     }
 
     isolated deinit {
         focusTask?.cancel()
+        exitTask?.cancel()
+        exitingOverlay?.removeFromSuperview()
+        overlay?.removeFromSuperview()
+        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
@@ -216,6 +239,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
             return true
         }
         if isPresented { dismiss(restoreFocus: false, updatesRequest: false) }
+        // Shared content must leave an old exit before a new glass adopts it.
+        finishExit(generation: presentationGeneration)
+        presentationGeneration += 1
         removeEventMonitor()
         if let peek = browser.peek { previousResponder = peek.tab.webView }
         else { previousResponder = ((window.firstResponder as? NSTextView)?.delegate as? NSResponder) ?? window.firstResponder }
@@ -249,6 +275,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         layoutPresentation()
         installEvents(in: window)
         focusInput(in: window)
+        if !reducePresentationMotion(), window.isVisible {
+            CommandPaletteTransition.animate(glass, appearing: true)
+        }
         NSAccessibility.post(element: field, notification: .focusedUIElementChanged)
         return true
     }
@@ -281,29 +310,62 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     func dismiss(restoreFocus: Bool = true, updatesRequest: Bool = true) {
         focusTask?.cancel()
         if updatesRequest { browser?.commandPaletteDidDismiss(self) }
-        guard let overlay else { return }
+        guard let overlay else {
+            if !restoreFocus { finishExit(generation: presentationGeneration) }
+            return
+        }
         let window = overlay.window
         if let editor = field.currentEditor() as? NSTextView { editor.unmarkText() }
         if field.currentEditor() != nil || window?.firstResponder === table { window?.makeFirstResponder(nil) }
-        overlay.removeFromSuperview()
-        self.overlay = nil
+        let closingGlass = glass
+        self.overlay = nil // Logical close, hit testing, and actions end now, not after animation.
         glass = nil
+        overlay.onDismiss = nil
+        overlay.onLayout = nil
+        overlay.isInteractive = false
+        overlay.setAccessibilityModal(false)
+        overlay.setAccessibilityHidden(true)
         results = []
         table.deselectAll(nil)
-        table.reloadData()
+        exitingOverlay = overlay
+        presentationGeneration += 1
+        let generation = presentationGeneration
+        if restoreFocus, contextIsValid, !reducePresentationMotion(), window?.isVisible == true, let closingGlass {
+            CommandPaletteTransition.animate(closingGlass, appearing: false)
+            exitTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(CommandPaletteTransition.closeDuration))
+                guard !Task.isCancelled else { return }
+                self?.finishExit(generation: generation)
+            }
+        } else { finishExit(generation: generation) }
         typedText = ""
         prefilledSourceURL = nil
         currentSourceResultID = nil
         inputLeadingInset = nil
         completionStart = nil
-        for observer in observers { NotificationCenter.default.removeObserver(observer) }
-        observers = []
         if pendingMouseUp == nil { removeEventMonitor() }
         guard restoreFocus, contextIsValid, let window else { return }
         if let view = previousResponder as? NSView, view.window === window {
             window.makeFirstResponder(view)
         } else if let browser { focusTask = AddressResults.focusDestination(in: browser) }
         previousResponder = nil
+    }
+
+    /// Generation-bound cleanup is also used by reopen, teardown, and Reduce Motion.
+    /// It never changes focus or the current logical presentation.
+    func finishExit(generation: Int) {
+        guard generation == presentationGeneration, let exitingOverlay else { return }
+        exitTask?.cancel()
+        exitTask = nil
+        for child in exitingOverlay.subviews {
+            child.layer?.removeAnimation(forKey: CommandPaletteTransition.key)
+            (child as? NSGlassEffectView)?.contentView = nil
+        }
+        exitingOverlay.removeFromSuperview()
+        self.exitingOverlay = nil
+        table.reloadData()
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers = []
     }
 
     /// The reference centers the palette horizontally, slightly above the page's
@@ -319,7 +381,13 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         let height = results.isEmpty ? 64 : 80 + resultHeight
         let centerY = area.midY + min(60, area.height * 0.08)
         let y = max(area.minY + 16, min(centerY - height / 2, area.maxY - height - 16))
-        glass.frame = NSRect(x: area.midX - width / 2, y: y, width: width, height: height)
+        let frame = NSRect(x: area.midX - width / 2, y: y, width: width, height: height)
+        if glass.frame != frame {
+            // A resize or changed result count must not keep a transform about
+            // the old card centre. Routine layout does not restart the entrance.
+            glass.layer?.removeAnimation(forKey: CommandPaletteTransition.key)
+            glass.frame = frame
+        }
         content.frame = NSRect(origin: .zero, size: glass.bounds.size)
         separator.frame = NSRect(x: 12, y: 64, width: max(0, width - 24), height: 1)
         scroll.frame = NSRect(x: CommandPaletteLayout.resultsInset, y: 72,
@@ -469,7 +537,10 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         guard results.indices.contains(row) else { return nil }
         let cell = (tableView.makeView(withIdentifier: .init("CommandResult"), owner: nil) as? CommandPaletteResultCell)
             ?? CommandPaletteResultCell()
-        cell.update(results[row], selected: tableView.isRowSelected(row), reference: content)
+        let favicon = contextIsValid ? browser.flatMap {
+            CommandPaletteFavicon.image(for: results[row], in: $0, source: sourceFocusedPage)
+        } : nil
+        cell.update(results[row], selected: tableView.isRowSelected(row), reference: content, favicon: favicon)
         return cell
     }
 
@@ -535,6 +606,109 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
         eventMonitor = nil
         pendingMouseUp = nil
+    }
+}
+
+/// Palette-local snapshots only: no disk reads, requests, WebKit allocation, or
+/// asynchronous cell mutation. Newly loaded icons appear on the next result
+/// refresh or reopen. The shared favicon store retains its existing clear/bounds.
+@MainActor
+enum CommandPaletteFavicon {
+    static func snapshot(for result: AddressResult, in browser: BrowserModel, source: BrowserTab? = nil,
+                         cachedIcon: (URL?) -> Image? = { FaviconStore.cachedIcon(for: $0) }) -> Image? {
+        guard result.owner == ObjectIdentifier(browser), !browser.isClosed,
+              browser.profileID == BrowserProfile.defaultID else { return nil }
+        let tabs = browser.isPrivate || browser.isExtensionWindow ? browser.tabs : browser.allTabs
+        func owned(_ tab: BrowserTab) -> Bool {
+            tab.browser === browser && tab.profileID == browser.profileID
+                && browser.spaces.space(tab.spaceID)?.profileID == tab.profileID
+                && (tabs.contains(where: { $0 === tab }) || browser.peek?.tab === tab)
+        }
+        func webURL(_ url: URL?) -> Bool {
+            guard let url else { return false }
+            return ["http", "https"].contains(url.scheme?.lowercased() ?? "") && url.host() != nil
+        }
+        let url: URL
+        switch result.action {
+        case .switchTab(let destination):
+            guard let tab = tabs.first(where: { $0.id == destination.id }), owned(tab),
+                  ObjectIdentifier(tab) == destination.instance, tab.spaceID == destination.spaceID,
+                  tab.profileID == destination.profileID, let pageURL = tab.url, webURL(pageURL) else { return nil }
+            if let favicon = tab.favicon { return favicon }
+            url = pageURL
+        case .navigate(let pageURL): url = pageURL
+        case .openURL(let page):
+            guard !browser.isPrivate, !browser.isExtensionWindow else { return nil }
+            url = page.url
+        case .openSavedPage(let id, let spaceID, let kind, let pageURL):
+            guard !browser.isPrivate, !browser.isExtensionWindow,
+                  browser.spaces.space(spaceID)?.profileID == browser.profileID else { return nil }
+            switch kind {
+            case .folderPage:
+                guard let page = browser.folders(forSpaceID: spaceID).item(id), page.kind == .page,
+                      page.url == pageURL else { return nil }
+            case .essential:
+                guard browser.pinnedPages(forSpaceID: spaceID).items.contains(where: { $0.id == id && $0.url == pageURL }) else { return nil }
+            }
+            url = pageURL
+        case .command, .switchSpace, .search: return nil
+        }
+        guard webURL(url) else { return nil }
+        if let source, source.url == url, owned(source), let favicon = source.favicon { return favicon }
+        if let tab = tabs.first(where: { $0.url == url && owned($0) && $0.favicon != nil }) { return tab.favicon }
+        // Existing Profile is the only normal profile on this branch. Future
+        // Profiles integration must replace this gate with a profile-owned store;
+        // never retarget this global cache to a foreign/private/extension owner.
+        guard !browser.isPrivate, !browser.isExtensionWindow else { return nil }
+        return cachedIcon(url)
+    }
+
+    static func image(for result: AddressResult, in browser: BrowserModel, source: BrowserTab?) -> NSImage? {
+        guard let snapshot = snapshot(for: result, in: browser, source: source) else { return nil }
+        let renderer = ImageRenderer(content: snapshot.resizable().aspectRatio(contentMode: .fit).frame(width: 16, height: 16))
+        renderer.scale = 2
+        guard let image = renderer.nsImage else { return nil }
+        image.isTemplate = false
+        return image
+    }
+}
+
+/// Only the outer card appears/disappears. Row selection has a separate lifetime.
+/// Explicit layer transforms preserve the native view frame, anchor, and editor.
+@MainActor
+enum CommandPaletteTransition {
+    static let key = "CommandPalette.presentation"
+    static let openDuration = 0.12
+    static let closeDuration = 0.08
+    static let scale: CGFloat = 0.985
+
+    static func centeredTransform(in layer: CALayer) -> CATransform3D {
+        var transform = CATransform3DMakeScale(scale, scale, 1)
+        transform.m41 = (1 - scale) * layer.bounds.width * (0.5 - layer.anchorPoint.x)
+        transform.m42 = (1 - scale) * layer.bounds.height * (0.5 - layer.anchorPoint.y)
+        return transform
+    }
+
+    static func animate(_ glass: NSGlassEffectView, appearing: Bool) {
+        glass.wantsLayer = true
+        guard let layer = glass.layer else { return }
+        let displayed = layer.presentation()
+        let opacity = CABasicAnimation(keyPath: "opacity")
+        opacity.fromValue = appearing ? 0 : (displayed?.opacity ?? 1)
+        opacity.toValue = appearing ? 1 : 0
+        let transform = CABasicAnimation(keyPath: "transform")
+        transform.fromValue = NSValue(caTransform3D: appearing ? centeredTransform(in: layer) : (displayed?.transform ?? CATransform3DIdentity))
+        transform.toValue = NSValue(caTransform3D: appearing ? CATransform3DIdentity : centeredTransform(in: layer))
+        let group = CAAnimationGroup()
+        group.animations = [opacity, transform]
+        group.duration = appearing ? openDuration : closeDuration
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = appearing ? 1 : 0
+        layer.transform = CATransform3DIdentity
+        layer.add(group, forKey: key) // Replace; never queue or change the view's anchor.
+        CATransaction.commit()
     }
 }
 
@@ -614,6 +788,8 @@ private final class CommandPaletteContent: NSView {
 private final class CommandPaletteOverlay: NSView {
     var onDismiss: (() -> Void)?
     var onLayout: (() -> Void)?
+    var isInteractive = true
+    override func hitTest(_ point: NSPoint) -> NSView? { isInteractive ? super.hitTest(point) : nil }
     override init(frame: NSRect) {
         super.init(frame: frame)
     }
@@ -892,6 +1068,7 @@ final class CommandPaletteResultCell: NSTableCellView {
     let detail = NSTextField(labelWithString: "")
     private weak var reference: NSView?
     private(set) var isResultSelected = false
+    private(set) var showsFavicon = false
     override var isFlipped: Bool { true }
     override var backgroundStyle: NSView.BackgroundStyle { didSet { updateColors() } }
 
@@ -914,7 +1091,7 @@ final class CommandPaletteResultCell: NSTableCellView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(_ result: AddressResult, selected: Bool, reference: NSView) {
+    func update(_ result: AddressResult, selected: Bool, reference: NSView, favicon: NSImage? = nil) {
         self.reference = reference
         userInterfaceLayoutDirection = reference.userInterfaceLayoutDirection
         for view in [title, detail, symbol] { view.userInterfaceLayoutDirection = userInterfaceLayoutDirection }
@@ -924,7 +1101,10 @@ final class CommandPaletteResultCell: NSTableCellView {
         default: detail.stringValue = result.detail == result.title ? "" : result.detail
         }
         detail.isHidden = detail.stringValue.isEmpty
-        symbol.image = CommandPaletteLayout.image(result.symbol)
+        // Always replace both image and tint, including on reused native cells.
+        showsFavicon = favicon != nil
+        symbol.image = favicon ?? CommandPaletteLayout.image(result.symbol)
+        updateColors()
         for label in [title, detail] { label.toolTip = label.stringValue }
         var context = [result.title, detail.stringValue, result.actionLabel]
         if let space = result.destinationSpace, space != result.title { context.append(space) }
@@ -948,7 +1128,7 @@ final class CommandPaletteResultCell: NSTableCellView {
         let selected = backgroundStyle == .emphasized
         title.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
         detail.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
-        symbol.contentTintColor = title.textColor
+        symbol.contentTintColor = showsFavicon ? nil : title.textColor
     }
 
     override func layout() {

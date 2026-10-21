@@ -1,4 +1,6 @@
 import AppKit
+import QuartzCore
+import SwiftUI
 import XCTest
 @testable import Browser
 
@@ -150,6 +152,234 @@ final class CommandPaletteMotionTests: XCTestCase {
         XCTAssertTrue(reopened.table.isSelectionAnimating, "Cancelled completion must not finish the new transition")
         try await waitFor("new animation finishes") { !reopened.table.isSelectionAnimating }
         XCTAssertEqual(glass.frame, reopened.table.selectionTargetFrame)
+    }
+
+    func testHostedCurrentSourceAndTabRowsRenderLiveFaviconWithoutTintOrNavigation() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let url = URL(string: "http://127.0.0.1:9/Icons")!
+        fixture.source.webView?.loadHTMLString("<title>Motion Icon</title><p>Local icon source</p>", baseURL: url)
+        try await waitFor("local icon source") { fixture.source.url == url && fixture.source.pageTitle == "Motion Icon" && !fixture.source.isLoading }
+        let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            NSColor.red.setFill()
+            rect.fill()
+            return true
+        }
+        fixture.source.favicon = Image(nsImage: image)
+        let page = fixture.source.webView
+        let revision = fixture.source.navigationRevision
+        fixture.browser.toggleCommandPalette()
+        fixture.anchor.applyRequest()
+        let palette = fixture.anchor.palette
+        let current = try XCTUnwrap(palette.table.view(atColumn: 0, row: 0, makeIfNecessary: true) as? CommandPaletteResultCell)
+        XCTAssertTrue(current.showsFavicon)
+        XCTAssertNil(current.symbol.contentTintColor)
+        XCTAssertFalse(try XCTUnwrap(current.symbol.image).isTemplate)
+        try await type("Motion Icon", in: palette)
+        let row = try XCTUnwrap(palette.results.firstIndex { if case .switchTab = $0.action { true } else { false } })
+        let tab = try XCTUnwrap(palette.table.view(atColumn: 0, row: row, makeIfNecessary: true) as? CommandPaletteResultCell)
+        XCTAssertTrue(tab.showsFavicon)
+        XCTAssertNil(tab.symbol.contentTintColor)
+        XCTAssertEqual(tab.symbol.image?.size, NSSize(width: 16, height: 16))
+        XCTAssertTrue(fixture.source.webView === page)
+        XCTAssertEqual(fixture.source.navigationRevision, revision)
+        XCTAssertEqual(fixture.browser.allTabs.count, 1)
+    }
+
+    func testOuterCardUsesShortCenteredTransitionsAndClosesLogicallyBeforeExit() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = fixture.anchor.palette
+        palette.reducePresentationMotion = { false }
+        fixture.window.makeFirstResponder(fixture.source.webView)
+        fixture.browser.showCommandPalette()
+        fixture.anchor.applyRequest()
+        let glass = try XCTUnwrap(palette.glass)
+        let overlay = try XCTUnwrap(glass.superview)
+        let layer = try XCTUnwrap(glass.layer)
+        let frame = glass.frame
+        let anchor = layer.anchorPoint
+        let group = try XCTUnwrap(layer.animation(forKey: CommandPaletteTransition.key) as? CAAnimationGroup)
+        XCTAssertEqual(group.duration, 0.12, accuracy: 0.001)
+        XCTAssertEqual(group.animations?.count, 2)
+        XCTAssertEqual((group.animations?.first as? CABasicAnimation)?.keyPath, "opacity")
+        XCTAssertEqual((group.animations?.last as? CABasicAnimation)?.keyPath, "transform")
+        XCTAssertEqual(glass.style, .regular)
+        XCTAssertTrue(CATransform3DIsIdentity(layer.transform))
+        palette.layoutPresentation()
+        XCTAssertEqual(glass.frame, frame)
+        XCTAssertEqual(layer.anchorPoint, anchor, "Native layer anchors and model layout must stay unchanged")
+        XCTAssertTrue(fixture.window.firstResponder === palette.field.currentEditor())
+        let revision = fixture.source.navigationRevision
+        let ids = fixture.browser.allTabs.map(\.id)
+        palette.dismiss()
+        XCTAssertFalse(palette.isPresented)
+        XCTAssertFalse(fixture.browser.commandPaletteWantsPresentation)
+        XCTAssertNil(palette.glass)
+        XCTAssertTrue(palette.exitingOverlay === overlay)
+        XCTAssertFalse(overlay.isAccessibilityModal())
+        XCTAssertTrue(overlay.isAccessibilityHidden())
+        XCTAssertNil(overlay.hitTest(NSPoint(x: frame.midX, y: frame.midY)))
+        XCTAssertNil(fixture.anchor.hitTest(NSPoint(x: frame.midX, y: frame.midY)))
+        XCTAssertFalse(palette.perform(.submit))
+        XCTAssertTrue(fixture.window.firstResponder === fixture.source.webView, "Focus returns before the exit finishes")
+        let exit = try XCTUnwrap(layer.animation(forKey: CommandPaletteTransition.key) as? CAAnimationGroup)
+        XCTAssertEqual(exit.duration, 0.08, accuracy: 0.001)
+        XCTAssertEqual(glass.frame, frame)
+        XCTAssertEqual(fixture.source.navigationRevision, revision)
+        XCTAssertEqual(fixture.browser.allTabs.map(\.id), ids)
+        try await Task.sleep(for: .milliseconds(160))
+        XCTAssertNil(palette.exitingOverlay)
+        XCTAssertNil(overlay.superview)
+        XCTAssertNil(glass.contentView)
+    }
+
+    func testCenterScaleRespectsNativeAnchorCoordinates() {
+        let layer = CALayer()
+        layer.bounds = CGRect(x: 13, y: 7, width: 640, height: 220)
+        for anchor in [CGPoint.zero, CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0, y: 1)] {
+            layer.anchorPoint = anchor
+            let transform = CommandPaletteTransition.centeredTransform(in: layer)
+            let x = layer.bounds.width * (0.5 - anchor.x)
+            let y = layer.bounds.height * (0.5 - anchor.y)
+            XCTAssertEqual(transform.m11 * x + transform.m41, x, accuracy: 0.001)
+            XCTAssertEqual(transform.m22 * y + transform.m42, y, accuracy: 0.001)
+            XCTAssertEqual(layer.anchorPoint, anchor)
+            XCTAssertEqual(transform.m11, 0.985)
+        }
+    }
+
+    func testRapidReopenRemovesOldGlassBeforeSharedContentMovesAndRejectsOldCompletion() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = try await open(fixture)
+        palette.reducePresentationMotion = { false }
+        let field = palette.field
+        let editor = try XCTUnwrap(field.currentEditor())
+        let oldGlass = try XCTUnwrap(palette.glass)
+        let content = try XCTUnwrap(oldGlass.contentView)
+        palette.dismiss()
+        let oldOverlay = try XCTUnwrap(palette.exitingOverlay)
+        let generation = palette.presentationGeneration
+        XCTAssertTrue(oldGlass.contentView === content)
+        fixture.browser.showCommandPalette()
+        fixture.anchor.applyRequest()
+        XCTAssertTrue(palette.isPresented)
+        XCTAssertNil(palette.exitingOverlay)
+        XCTAssertNil(oldOverlay.superview)
+        XCTAssertNil(oldGlass.contentView)
+        XCTAssertTrue(palette.glass?.contentView === content)
+        XCTAssertTrue(palette.field === field)
+        XCTAssertTrue(palette.field.currentEditor() === editor)
+        XCTAssertEqual(fixture.anchor.subviews.count, 1, "There must not be a ghost presentation")
+        XCTAssertEqual(palette.typedText, "")
+        XCTAssertNil(palette.completionStart)
+        palette.dismiss()
+        let newExit = try XCTUnwrap(palette.exitingOverlay)
+        palette.finishExit(generation: generation)
+        XCTAssertTrue(palette.exitingOverlay === newExit, "An old completion cannot finish a newer exit")
+        try await waitFor("new exit finishes") { palette.exitingOverlay == nil }
+        XCTAssertTrue(fixture.anchor.subviews.isEmpty)
+    }
+
+    func testReduceMotionSnapsEntranceExitAndAnAlreadyRunningTransition() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = fixture.anchor.palette
+        palette.reducePresentationMotion = { true }
+        fixture.browser.showCommandPalette()
+        fixture.anchor.applyRequest()
+        XCTAssertNil(palette.glass?.layer?.animation(forKey: CommandPaletteTransition.key))
+        palette.dismiss()
+        XCTAssertFalse(palette.isPresented)
+        XCTAssertNil(palette.exitingOverlay)
+        XCTAssertTrue(fixture.anchor.subviews.isEmpty)
+        palette.reducePresentationMotion = { false }
+        fixture.browser.showCommandPalette()
+        fixture.anchor.applyRequest()
+        XCTAssertNotNil(palette.glass?.layer?.animation(forKey: CommandPaletteTransition.key))
+        palette.reducePresentationMotion = { true }
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        XCTAssertNil(palette.glass?.layer?.animation(forKey: CommandPaletteTransition.key))
+        palette.reducePresentationMotion = { false }
+        palette.dismiss()
+        XCTAssertNotNil(palette.exitingOverlay)
+        palette.reducePresentationMotion = { true }
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        XCTAssertNil(palette.exitingOverlay)
+    }
+
+    func testDeactivationDismantleAndInvalidContextCleanExitImmediately() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = try await open(fixture)
+        palette.reducePresentationMotion = { false }
+        palette.dismiss()
+        XCTAssertNotNil(palette.exitingOverlay)
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: fixture.window)
+        XCTAssertNil(palette.exitingOverlay)
+        _ = try await open(fixture)
+        palette.dismiss()
+        XCTAssertNotNil(palette.exitingOverlay)
+        CommandPaletteHost.dismantleNSView(fixture.anchor, coordinator: ())
+        XCTAssertNil(palette.exitingOverlay)
+        XCTAssertTrue(fixture.anchor.subviews.isEmpty)
+        _ = try await open(fixture)
+        fixture.source.invalidateNavigation()
+        fixture.anchor.applyRequest()
+        XCTAssertFalse(palette.isPresented)
+        XCTAssertNil(palette.exitingOverlay)
+    }
+
+    func testStaleContextCancelsExitWithUnconsumedCloseRequestWithoutChangingFocus() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = try await open(fixture)
+        palette.reducePresentationMotion = { false }
+        palette.dismiss()
+        let exit = try XCTUnwrap(palette.exitingOverlay)
+        XCTAssertNotEqual(fixture.anchor.applied, fixture.browser.commandPaletteRequest)
+        let responder = fixture.window.firstResponder
+        fixture.source.invalidateNavigation()
+        fixture.anchor.applyRequest()
+        XCTAssertNil(palette.exitingOverlay)
+        XCTAssertNil(exit.superview)
+        XCTAssertFalse(palette.isPresented)
+        XCTAssertTrue(fixture.window.firstResponder === responder, "Exit cleanup must not retarget destination focus")
+    }
+
+    func testAcceptanceHandsFocusToExactPageWithoutWaitingAndIMEKeepsOneEditor() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = try await open(fixture)
+        palette.reducePresentationMotion = { false }
+        let editor = try XCTUnwrap(palette.field.currentEditor() as? NSTextView)
+        let revision = fixture.source.navigationRevision
+        let page = fixture.source.webView
+        let ids = fixture.browser.allTabs.map(\.id)
+        editor.selectAll(nil)
+        editor.setMarkedText("入力", selectedRange: NSRange(location: 2, length: 0), replacementRange: editor.selectedRange())
+        palette.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: palette.field))
+        XCTAssertTrue(editor.hasMarkedText())
+        XCTAssertTrue(palette.results.isEmpty)
+        palette.acceptSelectedResult()
+        XCTAssertTrue(palette.isPresented)
+        XCTAssertEqual(fixture.source.navigationRevision, revision)
+        XCTAssertTrue(palette.field.currentEditor() === editor)
+        palette.dismiss()
+        XCTAssertFalse(editor.hasMarkedText())
+        _ = try await open(fixture)
+        try await type("Motion Source", in: palette)
+        let index = try XCTUnwrap(palette.results.firstIndex { if case .switchTab = $0.action { true } else { false } })
+        palette.table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        palette.acceptSelectedResult(acceptCompletion: false)
+        XCTAssertFalse(palette.isPresented)
+        XCTAssertNil(palette.exitingOverlay, "Destination changes remove old presentation immediately")
+        XCTAssertTrue(fixture.window.firstResponder === page)
+        fixture.anchor.applyRequest()
+        XCTAssertTrue(fixture.window.firstResponder === page, "Consuming the closed request must not cancel destination focus")
+        XCTAssertEqual(fixture.browser.allTabs.map(\.id), ids)
+        XCTAssertEqual(fixture.source.navigationRevision, revision)
     }
 
     private func fixture() async throws -> MotionFixture {

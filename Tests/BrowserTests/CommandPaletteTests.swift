@@ -750,6 +750,10 @@ final class CommandPaletteTests: XCTestCase {
     }
 
     private func open(_ fixture: PaletteFixture) async throws -> CommandPaletteController {
+        // These tests compare model/native text geometry after presentation,
+        // not transient screen-space caret coordinates during the entrance.
+        // Dedicated motion tests exercise the real transition separately.
+        fixture.browser.commandPalette?.reducePresentationMotion = { true }
         fixture.browser.showCommandPalette()
         try await waitFor("Command-T presentation request") {
             fixture.browser.commandPalette?.isPresented == true && fixture.browser.commandPalette?.field.currentEditor() != nil
