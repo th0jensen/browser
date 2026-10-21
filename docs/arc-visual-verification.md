@@ -13,8 +13,8 @@ The user requires reference-based verification of both the plan and the implemen
 
 ## Spaces acceptance
 
-- Keep a visible icon strip at the bottom of the vertical sidebar, outside the tab scroller. Do not use a top dropdown as the primary switcher.
-- Include a visible plus control, a distinct selected state, hover names, keyboard focus, and VoiceOver names and selection state. Many Spaces and narrow sidebars must remain usable.
+- Keep a minimal selector at the bottom of the vertical sidebar, outside the tab scroller. Per the user's explicit design correction, inactive Spaces are dots; only the selected Space shows its configured icon. Center the selector group in the sidebar, independent of trailing utility controls. Do not use a full-width glass capsule, boxed icon tiles, or a top dropdown as the primary switcher.
+- Keep a separate discreet plus control, a distinct selected state, hover names, keyboard focus, and VoiceOver names and selection state. Many Spaces and narrow sidebars must remain usable; overflow must preserve centering, the selected icon, and access to every Space.
 - Keep the active Space title and its saved/temporary content hierarchy clear. Store a stable icon and theme per Space, with backward-compatible decoding and existing IDs/order intact. Use restrained tint and semantic foreground colors; do not copy the old opaque Arc screenshot literally.
 - Support Control-number selection on macOS. Audit sidebar swipe behavior against the reference; do not substitute a mouse drag and claim trackpad verification.
 - Preserve tab objects, page state, selected tabs, split focus, lazy inactive views, and profile identity while switching.
