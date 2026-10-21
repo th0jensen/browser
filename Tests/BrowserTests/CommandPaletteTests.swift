@@ -28,6 +28,7 @@ final class CommandPaletteTests: XCTestCase {
 
         let glass = try XCTUnwrap(palette.glass)
         let anchor = try XCTUnwrap(palette.anchor)
+        XCTAssertTrue(glass.superview?.superview === anchor, "Only the representable may own the presentation subtree")
         let area = try XCTUnwrap(glass.superview).convert(anchor.bounds, from: anchor)
         XCTAssertEqual(glass.frame.midX, area.midX, accuracy: 1)
         XCTAssertLessThanOrEqual(glass.frame.width, area.width - 31)
@@ -39,6 +40,25 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertTrue(fixture.browser.focusedPage === source)
         XCTAssertEqual(fixture.browser.allTabs.count, 1)
         XCTAssertEqual(source.navigationRevision, revision)
+    }
+
+    func testRepresentableHostDetachmentDismissesAndReleasesTheNativeOverlay() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let palette = try await open(fixture)
+        let anchor = try XCTUnwrap(palette.anchor as? CommandPaletteAnchor)
+        XCTAssertTrue(palette.glass?.superview?.superview === anchor)
+        XCTAssertFalse(anchor.subviews.isEmpty)
+        weak var glass: NSGlassEffectView?
+        glass = palette.glass
+        fixture.window.contentViewController = nil
+        fixture.window.contentView = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 500))
+        try await waitFor("detached representable cleanup") {
+            anchor.window == nil && !palette.isPresented && glass == nil
+        }
+        XCTAssertTrue(anchor.subviews.isEmpty)
+        XCTAssertFalse(palette.present(), "A detached host must not present in its old window")
+        XCTAssertEqual(fixture.browser.allTabs.count, 1)
     }
 
     func testCancellingOverPeekRestoresThatSamePeekAndNativeFocus() async throws {
@@ -258,6 +278,36 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertEqual(source.navigationRevision, revision)
     }
 
+    func testBlankLiveResultSelectsItsExactTabAndFocusesNativeAddressWithoutAWebView() async throws {
+        let fixture = try await fixture()
+        defer { fixture.close() }
+        let browser = fixture.browser
+        browser.addTab(focusAddress: false)
+        let blank = try XCTUnwrap(browser.activeTab)
+        browser.activeTabID = fixture.source.id
+        let count = browser.allTabs.count
+        let revision = fixture.source.navigationRevision
+        let palette = try await open(fixture)
+        try await type("New Tab", in: palette)
+        let row = try XCTUnwrap(palette.results.firstIndex {
+            if case .switchTab(let destination) = $0.action { return destination.id == blank.id }
+            return false
+        })
+        palette.table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        palette.perform(.submit)
+        try await waitFor("blank live-tab address focus") {
+            let editor = fixture.window.firstResponder as? NSTextView
+            let field = (editor?.delegate as AnyObject?) as? AddressField
+            return !palette.isPresented && browser.activeTab === blank && field != nil && field !== palette.field
+                && browser.consumedAddressFocusRequest == browser.addressFocusRequest
+        }
+        XCTAssertNil(blank.webView)
+        XCTAssertNil(AddressResults.focusDestination(in: browser), "Blank pages must not poll for a web view")
+        XCTAssertEqual(browser.allTabs.count, count)
+        XCTAssertTrue(browser.focusedPage === blank)
+        XCTAssertEqual(fixture.source.navigationRevision, revision)
+    }
+
     func testSavedAcceptanceDismissesPeekAndKeepsTheExactLivePage() async throws {
         let fixture = try await fixture()
         defer { fixture.close() }
@@ -328,6 +378,63 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertEqual(fixture.browser.allTabs.count, 1)
     }
 
+    func testCompletionAcceptanceSurvivesTableFocusButExplicitRowsKeepTheFullURL() async throws {
+        let full = URL(string: "http://www.example.invalid:8765/Docs/?token=AbC#Part")!
+        let origin = URL(string: "http://www.example.invalid:8765")!
+        for mode in ["editor", "table", "unchangedUp", "explicitRow"] {
+            let fixture = try await fixture()
+            defer { fixture.close() }
+            fixture.browser.history?.recordVisit(to: full, title: "Example")
+            let revision = fixture.source.navigationRevision
+            let palette = try await open(fixture)
+            try await type("exa", in: palette)
+            let editor = try XCTUnwrap(palette.field.currentEditor() as? NSTextView)
+            XCTAssertEqual(editor.string, "example.invalid:8765")
+            XCTAssertEqual(palette.table.selectedRow, 0)
+            let resultID = palette.results.first?.id
+            if mode != "editor" {
+                XCTAssertTrue(palette.control(palette.field, textView: editor, doCommandBy: #selector(NSResponder.insertTab(_:))))
+                XCTAssertTrue(fixture.window.firstResponder === palette.table)
+                XCTAssertNil(palette.field.currentEditor())
+                XCTAssertEqual(palette.field.stringValue, "example.invalid:8765")
+                XCTAssertEqual(palette.results.first?.id, resultID)
+                if mode == "unchangedUp" {
+                    palette.perform(.moveUp)
+                    XCTAssertEqual(palette.table.selectedRow, 0)
+                }
+            }
+            if mode == "explicitRow" {
+                // This is the same explicit-row acceptance path as the native click action.
+                palette.acceptSelectedResult(acceptCompletion: false)
+            } else if mode == "editor" {
+                XCTAssertTrue(palette.control(palette.field, textView: editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+            } else {
+                let enter = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                    timestamp: 0, windowNumber: fixture.window.windowNumber, context: nil,
+                    characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+                palette.table.keyDown(with: enter)
+            }
+            let expected = mode == "explicitRow" ? full : origin
+            do {
+                try await waitFor("completion acceptance from \(mode)") {
+                    guard let url = fixture.browser.activeTab?.url, fixture.browser.activeTab !== fixture.source else { return false }
+                    if mode == "explicitRow" { return url == full }
+                    // WebKit can canonicalize an origin's empty path to '/'.
+                    return url.scheme == origin.scheme && url.host() == origin.host() && url.port == origin.port
+                        && ["", "/"].contains(url.path) && url.query == nil && url.fragment == nil
+                }
+            } catch {
+                XCTFail("Accepted URL from \(mode): \(fixture.browser.activeTab?.url?.absoluteString ?? "nil"), expected \(expected.absoluteString)")
+                throw error
+            }
+            XCTAssertFalse(palette.isPresented)
+            XCTAssertEqual(fixture.browser.allTabs.count, 2)
+            XCTAssertEqual(fixture.source.navigationRevision, revision)
+            XCTAssertEqual(fixture.browser.activeTab?.url?.scheme, "http")
+            XCTAssertEqual(fixture.browser.activeTab?.url?.port, 8765)
+        }
+    }
+
     func testNativeCompletionDeletionPasteIMEAndResultKeys() async throws {
         let fixture = try await fixture()
         defer { fixture.close() }
@@ -394,6 +501,7 @@ final class CommandPaletteTests: XCTestCase {
         palette.layoutPresentation()
         let glass = try XCTUnwrap(palette.glass)
         let anchor = try XCTUnwrap(palette.anchor)
+        XCTAssertTrue(glass.superview?.superview === anchor)
         let area = try XCTUnwrap(glass.superview).convert(anchor.bounds, from: anchor)
         XCTAssertEqual(glass.frame.midX, area.midX, accuracy: 1)
         XCTAssertLessThanOrEqual(glass.frame.width, area.width - 31)

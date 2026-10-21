@@ -197,7 +197,7 @@ enum AddressResults {
     /// A destination can attach after the edit ends (New Tab, splits, or a Space
     /// switch). Wait briefly without overriding a later selection or focus request.
     static func focusDestination(in browser: BrowserModel) -> Task<Void, Never>? {
-        guard let target = browser.focusedPage, let window = browser.window else { return nil }
+        guard let target = browser.focusedPage, !target.isNewTab, let window = browser.window else { return nil }
         if target.webView?.window === window {
             target.focusPage()
             return nil
@@ -244,6 +244,7 @@ enum AddressResults {
             // Dismiss Peek only after validation so this exact page becomes focused.
             browser.dismissPeek()
             browser.activeTabID = tab.id
+            if tab.isNewTab { browser.requestAddressFocus() }
         case .openURL(let page):
             guard !browser.isPrivate else { return false }
             browser.open(page.url, inNewTab: inNewTab)
@@ -255,12 +256,12 @@ enum AddressResults {
             switch kind {
             case .folderPage:
                 guard let page = browser.folders(forSpaceID: spaceID).item(id), page.kind == .page, page.url == url,
-                      browser.selectSpace(spaceID) else { return false }
+                      browser.selectSpace(spaceID, createsInitialTab: false) else { return false }
                 browser.dismissPeek()
                 browser.openFolderPage(page)
             case .essential:
                 guard let page = browser.pinnedPages(forSpaceID: spaceID).items.first(where: { $0.id == id && $0.url == url }),
-                      browser.selectSpace(spaceID) else { return false }
+                      browser.selectSpace(spaceID, createsInitialTab: false) else { return false }
                 browser.dismissPeek()
                 browser.openPinned(page)
             }

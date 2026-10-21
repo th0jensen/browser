@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// A page-area anchor, not a second window. The presentation is owned by this
-/// window's native view tree so Regular glass can sample the visible source page.
+/// A page-area native container, not a second window. SwiftUI owns its placement;
+/// this representable owns every overlay child so glass can sample the source page.
 struct CommandPaletteHost: NSViewRepresentable {
     let browser: BrowserModel
     let bookmarks: BookmarkStore
@@ -36,7 +36,9 @@ final class CommandPaletteAnchor: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        palette.isPresented ? super.hitTest(point) : nil
+    }
 
     func update(request: Int) {
         requested = request
@@ -159,7 +161,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     @discardableResult
     func present() -> Bool {
         guard let browser, !browser.isClosed, let anchor, let window = anchor.window,
-              let root = window.contentView, anchor.bounds.width > 0, anchor.bounds.height > 0,
+              anchor.bounds.width > 0, anchor.bounds.height > 0,
               window.attachedSheet == nil, NSApp.modalWindow == nil else { return false }
         focusTask?.cancel()
         if isPresented {
@@ -181,7 +183,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         field.updatePresentation(text: "", url: nil, title: "")
         table.reloadData()
         table.deselectAll(nil)
-        let overlay = CommandPaletteOverlay(frame: root.bounds)
+        let overlay = CommandPaletteOverlay(frame: anchor.bounds)
         overlay.autoresizingMask = [.width, .height]
         overlay.onLayout = { [weak self] in self?.layoutPresentation() }
         overlay.onDismiss = { [weak self] in self?.dismiss() }
@@ -195,7 +197,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         glass.contentView = content
         glass.identifier = .init("BrowserCommandPaletteGlass")
         overlay.addSubview(glass)
-        root.addSubview(overlay, positioned: .above, relativeTo: nil)
+        // Do not mutate NSHostingController.view's SwiftUI-managed subviews.
+        // The actual representable owns this native presentation subtree.
+        anchor.addSubview(overlay)
         self.overlay = overlay
         self.glass = glass
         layoutPresentation()
@@ -303,10 +307,10 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         case .cancel: dismiss()
         case .submit: acceptSelectedResult()
         case .moveDown, .moveUp:
-            completionStart = nil
             guard !results.isEmpty else { return true }
             let offset = command == .moveDown ? 1 : -1
             let row = min(max(0, table.selectedRow + offset), results.count - 1)
+            if row != table.selectedRow { completionStart = nil }
             table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             table.scrollRowToVisible(row)
         }
@@ -327,9 +331,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         // A completion's visible host may be shorter than its history resource.
         // Return accepts that exact completion; explicit row clicks accept the row.
         var accepted = result
+        let displayedText = field.currentEditor()?.string ?? field.stringValue
         if acceptCompletion, completionStart != nil, table.selectedRow == 0,
-           let text = field.currentEditor()?.string,
-           let url = AddressSuggestions.completedURL(for: text, with: result.completionSuggestion) {
+           let url = AddressSuggestions.completedURL(for: displayedText, with: result.completionSuggestion) {
             accepted = AddressResult(owner: result.owner, action: .navigate(url), title: result.title,
                                      detail: result.detail, destinationSpace: result.destinationSpace)
         }

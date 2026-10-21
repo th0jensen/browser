@@ -384,6 +384,55 @@ final class AddressResultsTests: XCTestCase {
         XCTAssertFalse(AddressResults.execute(result, in: browser))
     }
 
+    func testFolderSavedResultFromSecondWindowDoesNotCreateABlankTab() throws {
+        try assertSavedResultFromSecondWindow(kind: .folderPage)
+    }
+
+    func testEssentialResultFromSecondWindowDoesNotCreateABlankTab() throws {
+        try assertSavedResultFromSecondWindow(kind: .essential)
+    }
+
+    private func assertSavedResultFromSecondWindow(kind: AddressResult.SavedKind) throws {
+        let firstWindow = browser()
+        let destination = try firstWindow.createSpace(title: "Remote Space")
+        let url = URL(string: "http://127.0.0.1:9/Remote/Docs?token=AbC#Part")!
+        let savedID: UUID
+        switch kind {
+        case .folderPage: savedID = try firstWindow.folders.savePage(url: url, title: "Remote Guide", in: nil).id
+        case .essential: savedID = try firstWindow.pinnedPages.pin(url: url, title: "Remote Guide").id
+        }
+        let firstIDs = firstWindow.allTabs.map(\.id)
+        let secondWindow = BrowserModel(websiteDataStore: firstWindow.websiteDataStore, spaces: firstWindow.spaces)
+        let source = try XCTUnwrap(secondWindow.activeTab)
+        let peek = secondWindow.openPeek(from: source)
+        defer { secondWindow.dismissPeek(); secondWindow.allTabs.forEach { $0.stopLoading() } }
+        XCTAssertTrue(secondWindow.focusedPage === peek)
+        XCTAssertFalse(secondWindow.allTabs.contains { $0.spaceID == destination.id })
+        let count = secondWindow.allTabs.count
+        let result = try result("Remote Guide", in: secondWindow) {
+            if case .openSavedPage(let id, _, let savedKind, _) = $0 { return id == savedID && savedKind == kind }
+            return false
+        }
+
+        XCTAssertTrue(AddressResults.execute(result, in: secondWindow, inNewTab: true))
+
+        let target = try XCTUnwrap(secondWindow.activeTab)
+        XCTAssertEqual(secondWindow.activeSpaceID, destination.id)
+        XCTAssertEqual(secondWindow.tabs.count, 1)
+        XCTAssertTrue(secondWindow.tabs.allSatisfy { !$0.isNewTab })
+        XCTAssertEqual(secondWindow.allTabs.count, count + 1)
+        XCTAssertEqual(target.url, url)
+        XCTAssertEqual(target.spaceID, destination.id)
+        XCTAssertEqual(target.profileID, destination.profileID)
+        XCTAssertTrue(target.browser === secondWindow)
+        XCTAssertTrue(target.webView?.configuration.websiteDataStore === secondWindow.websiteDataStore)
+        XCTAssertEqual(kind == .folderPage ? target.folderPageID : target.pinnedPageID, savedID)
+        XCTAssertNil(secondWindow.peek)
+        XCTAssertTrue(secondWindow.tabAcrossSpaces(withID: source.id) === source)
+        XCTAssertEqual(firstWindow.allTabs.map(\.id), firstIDs)
+        XCTAssertTrue(firstWindow.allTabs.allSatisfy { $0.webView == nil })
+    }
+
     func testOnlyURLResultsSupplyCompletionAndKeepOriginalURL() throws {
         let browser = browser()
         let url = URL(string: "http://www.example.com:8765/Docs/Guide?token=AbC#Part")!

@@ -530,9 +530,9 @@ struct BrowserWindow: View {
             .padding([.trailing, .bottom], BrowserChrome.edgeInset)
         }
         .padding(.top, BrowserChrome.edgeInset)
-        .background(CommandPaletteHost(browser: browser, bookmarks: bookmarks,
-                                       request: browser.commandPaletteRequest,
-                                       spaceID: browser.activeSpaceID, tabID: browser.activeTabID))
+        .overlay(CommandPaletteHost(browser: browser, bookmarks: bookmarks,
+                                    request: browser.commandPaletteRequest,
+                                    spaceID: browser.activeSpaceID, tabID: browser.activeTabID))
     }
 
     private func hoverCard(tabFrames: [UUID: Anchor<CGRect>]) -> some View {
