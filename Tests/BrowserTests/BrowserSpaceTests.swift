@@ -488,21 +488,27 @@ final class BrowserSpaceTests: XCTestCase {
 
     func testInactiveSpacePersistsRealWebKitBackForwardState() async throws {
         let root = directory()
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let firstURL = root.appending(path: "first.html")
-        let secondURL = root.appending(path: "second.html")
-        try Data("<title>First Space Page</title><p>First</p>".utf8).write(to: firstURL)
-        try Data("<title>Second Space Page</title><p>Second</p>".utf8).write(to: secondURL)
+        let firstURL = URL(string: "http://127.0.0.1:9/space-first")!
+        let secondURL = URL(string: "http://127.0.0.1:9/space-second")!
         let browser = BrowserModel()
         let source = try XCTUnwrap(browser.activeTab)
-        source.load(firstURL)
+        source.isNewTab = false
+        source.restore()
+        let view = try XCTUnwrap(source.webView)
+        // Simulated HTTP responses create real WebKit history without a server,
+        // external requests, or file sandbox grants that cannot survive a new view.
+        view.loadSimulatedRequest(URLRequest(url: firstURL), responseHTML: "<title>First Space Page</title><p>First</p>")
         try await waitUntil { !source.isLoading && source.pageTitle == "First Space Page" }
-        source.load(secondURL)
+        view.loadSimulatedRequest(URLRequest(url: secondURL), responseHTML: "<title>Second Space Page</title><p>Second</p>")
         try await waitUntil { !source.isLoading && source.pageTitle == "Second Space Page" && source.canGoBack }
         let other = try browser.createSpace(title: "Other")
-        let saved = try PropertyListDecoder().decode(WindowSession.self,
-            from: PropertyListEncoder.binary.encode(browser.windowSession()))
+        let file = StoreFile(url: root.appending(path: "Session.plist"))
+        let store = SessionStore(file: file)
+        _ = store.attach(browser)
+        store.saveBeforeQuitting()
+        let disk = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
+        let saved = try XCTUnwrap(disk.windows.first)
         let savedDefault = try XCTUnwrap(saved.spaceSessions?.first { $0.spaceID == defaultID })
         let interaction = try XCTUnwrap(savedDefault.tabs.first?.interactionState)
         XCTAssertFalse(interaction.isEmpty)
@@ -515,12 +521,11 @@ final class BrowserSpaceTests: XCTestCase {
         XCTAssertEqual(restoredSource.interactionState as? Data, interaction)
 
         XCTAssertTrue(restored.selectSpace(defaultID))
-        try await waitUntil { restoredSource.canGoBack && restoredSource.pageTitle == "Second Space Page" }
-        XCTAssertEqual(restoredSource.backList.map(\.url), [firstURL])
-        restored.goBack()
-        try await waitUntil { !restoredSource.isLoading && restoredSource.pageTitle == "First Space Page" && restoredSource.canGoForward }
-        XCTAssertEqual(restoredSource.url, firstURL)
-        XCTAssertEqual(restoredSource.forwardList.map(\.url), [secondURL])
+        try await waitUntil { restoredSource.canGoBack }
+        let restoredView = try XCTUnwrap(restoredSource.webView)
+        XCTAssertEqual(restoredView.backForwardList.backList.map(\.url), [firstURL])
+        XCTAssertEqual(restoredView.backForwardList.currentItem?.url, secondURL)
+        XCTAssertTrue(restoredView.configuration.websiteDataStore === restored.websiteDataStore)
     }
 
     func testCorruptAndUnreadableSessionFilesStayUntouchedByLaterSaves() throws {
