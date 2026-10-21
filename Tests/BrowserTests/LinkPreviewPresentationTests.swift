@@ -23,6 +23,7 @@ final class LinkPreviewPresentationTests: XCTestCase {
         defer { controller.setEnabled(false); fixture.window.close() }
         try await waitUntil { !fixture.view.isLoading && fixture.view.title != nil }
 
+        let sourceResponder = fixture.window.firstResponder
         await postPreviewMessage(path: "ready", to: fixture.view)
         try await waitUntil { controller.current != nil }
         let preparation = try XCTUnwrap(controller.current)
@@ -30,6 +31,10 @@ final class LinkPreviewPresentationTests: XCTestCase {
         XCTAssertNotNil(controller.presentedPreview)
         XCTAssertTrue(preparation.state.isLoading)
         XCTAssertNil(preparation.state.result)
+        XCTAssertEqual(glass.style, .regular)
+        XCTAssertNil(preparation.panel)
+        XCTAssertFalse(preparation.state.isKept)
+        XCTAssertTrue(fixture.window.firstResponder === sourceResponder)
 
         await partialGate.open()
         try await waitUntil { controller.presentedPreview?.result?.title == "Loading" }
@@ -42,6 +47,7 @@ final class LinkPreviewPresentationTests: XCTestCase {
         XCTAssertTrue(preparation.glass === glass)
         XCTAssertFalse(preparation.state.isLoading)
         XCTAssertEqual(controller.presentedPreview?.result?.summary, final.summary)
+        XCTAssertTrue(fixture.window.firstResponder === sourceResponder)
     }
 
     func testLeavingLinkCancelsLoadingPreviewBeforeResultCompletes() async throws {
@@ -91,7 +97,8 @@ final class LinkPreviewPresentationTests: XCTestCase {
         XCTAssertTrue(controller.current === preparation)
         XCTAssertFalse(preparation.isClosed)
         XCTAssertNil(preparation.state.result)
-        XCTAssertEqual(preparation.state.error, "Preview unavailable. Open the page to read it.")
+        XCTAssertEqual(preparation.state.failure, .summaryFailed)
+        XCTAssertEqual(preparation.state.error, LinkPreviewFailure.summaryFailed.message)
         XCTAssertNotNil(preparation.glass)
     }
 
@@ -147,8 +154,99 @@ final class LinkPreviewPresentationTests: XCTestCase {
         try await waitUntil { !preparation.state.isLoading }
         XCTAssertTrue(controller.current === preparation)
         XCTAssertFalse(preparation.isClosed)
-        XCTAssertEqual(preparation.state.error, "Preview unavailable. Open the page to read it.")
+        XCTAssertEqual(preparation.state.failure, .timedOut)
+        XCTAssertEqual(preparation.state.error, LinkPreviewFailure.timedOut.message)
         XCTAssertNotNil(preparation.glass)
+    }
+
+    func testStaticFailuresKeepSameRichCardAndSourceLink() async throws {
+        for failure in [LinkPreviewFailure.blocked, .loginRequired, .insufficientText, .unsupportedContent, .fetchFailed] {
+            let gate = PreviewTestGate()
+            let controller = LinkPreviewController(
+                observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
+                    await gate.wait()
+                    throw failure
+                })
+            controller.setEnabled(true)
+            let fixture = makeFixture(controller: controller, title: "Static outcome fixture")
+            defer { controller.setEnabled(false); fixture.window.close() }
+            try await waitUntil { !fixture.view.isLoading && fixture.view.title != nil }
+            await postPreviewMessage(path: "source", to: fixture.view)
+            try await waitUntil { controller.current != nil }
+            let preview = try XCTUnwrap(controller.current)
+            let glass = try XCTUnwrap(preview.glass)
+            XCTAssertTrue(preview.state.isLoading)
+            await gate.open()
+            try await waitUntil { !preview.state.isLoading }
+            XCTAssertEqual(preview.state.failure, failure)
+            XCTAssertNil(preview.state.result)
+            XCTAssertTrue(preview.glass === glass)
+            XCTAssertNil(preview.panel)
+            XCTAssertEqual(preview.state.contextText, failure.message + "\n\nhttps://example.com/source")
+        }
+    }
+
+    func testTimeoutRejectsLateUpdateFromUncancelledCallback() async throws {
+        let deadline = PreviewTestGate()
+        let resultGate = PreviewTestGate()
+        let returned = PreviewTestGate()
+        let controller = LinkPreviewController(
+            observesSettings: false, modifierFlags: { .shift }, streamingSummaryProvider: { _, update in
+                await resultGate.wait()
+                let late = LinkSummary(title: "Late", summary: "Late callback must not replace the timeout.")
+                await Task.detached { await update(late) }.value
+                await returned.open()
+                return late
+            }, waitForPreparationDeadline: { await deadline.wait() })
+        controller.setEnabled(true)
+        let fixture = makeFixture(controller: controller, title: "Late callback fixture")
+        defer { controller.setEnabled(false); fixture.window.close() }
+        try await waitUntil { !fixture.view.isLoading && fixture.view.title != nil }
+        await postPreviewMessage(path: "late", to: fixture.view)
+        try await waitUntil { controller.current != nil }
+        let preview = try XCTUnwrap(controller.current)
+        await deadline.open()
+        try await waitUntil { !preview.state.isLoading }
+        await resultGate.open()
+        await returned.wait()
+        XCTAssertNil(preview.state.result)
+        XCTAssertEqual(preview.state.failure, .timedOut)
+        XCTAssertNotNil(preview.glass)
+    }
+
+    func testDetachedLoadingNoteReceivesFailureAfterSourceNavigation() async throws {
+        let failureGate = PreviewTestGate()
+        let controller = LinkPreviewController(
+            observesSettings: false, modifierFlags: { .shift }, summaryProvider: { _ in
+                await failureGate.wait()
+                throw LinkPreviewFailure.blocked
+            })
+        controller.setEnabled(true)
+        let fixture = makeFixture(controller: controller, title: "Detached failure fixture")
+        defer { controller.setEnabled(false); fixture.window.close() }
+        try await waitUntil { !fixture.view.isLoading && fixture.view.title != nil }
+        await postPreviewMessage(path: "detached-source", to: fixture.view)
+        try await waitUntil { controller.current != nil }
+        let note = try XCTUnwrap(controller.current)
+        let glass = try XCTUnwrap(note.glass)
+        controller.keepPreview()
+        let panel = try XCTUnwrap(note.panel)
+        XCTAssertTrue(note.state.isLoading)
+        XCTAssertTrue(note.state.isKept)
+        XCTAssertNil(controller.current)
+
+        controller.dismiss(for: fixture.view)
+        fixture.view.loadHTMLString("<title>Source navigated</title>", baseURL: URL(string: "https://example.com/new"))
+        try await waitUntil { !fixture.view.isLoading && fixture.view.title == "Source navigated" }
+        await failureGate.open()
+        try await waitUntil { !note.state.isLoading }
+        XCTAssertFalse(note.isClosed)
+        XCTAssertTrue(note.glass === glass)
+        XCTAssertTrue(note.panel === panel)
+        XCTAssertTrue(controller.keptNotes.contains { $0 === note.state })
+        XCTAssertEqual(note.state.failure, .blocked)
+        XCTAssertNil(note.state.result)
+        XCTAssertEqual(note.state.contextText, LinkPreviewFailure.blocked.message + "\n\nhttps://example.com/detached-source")
     }
 
     private func makeFixture(
