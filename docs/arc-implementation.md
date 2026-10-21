@@ -13,18 +13,18 @@ The shared workflow PR allows the existing Debug test job to run on stacked PRs.
 | Section | Branch | Dependency | State / PR |
 | --- | --- | --- | --- |
 | PR template and stacked validation | `pi-agent/arc-pr-workflow` | main | [PR #22](https://github.com/th0jensen/browser/pull/22) |
-| Research and review baseline | `pi-agent/arc-research-report` | PR workflow | Preparing |
-| Local naming prompts and validation | `pi-agent/arc-ai-naming` | PR workflow | Active |
-| Reversible Tidy Tabs | `pi-agent/arc-tidy-undo` | PR workflow | Active |
-| Preview extraction and failure states | `pi-agent/arc-preview-safety` | PR workflow | Active |
-| Tab suspension eligibility | `pi-agent/arc-tab-lifecycle` | PR workflow | Active |
-| Explicit Shift-click Peek | `pi-agent/arc-peek-gesture` | PR workflow | Active |
-| Spaces and ownership foundation | `pi-agent/arc-spaces` | PR workflow | Active |
-| Unified local command results | `pi-agent/arc-command-bar` | Spaces | Waiting for the Space contract implementation |
-| Reversible temporary-tab archive | `pi-agent/arc-tab-archive` | Spaces | Waiting for the Space contract implementation |
-| Local page questions and citations | `pi-agent/arc-page-answers` | Naming | Waiting for the shared inference contract |
-| Deterministic link routing | `pi-agent/arc-link-routing` | Spaces | Waiting for the Space contract implementation |
-| Separate persistent profiles | `pi-agent/arc-profiles` | Spaces | Waiting for the ownership foundation |
+| Research and review baseline | `pi-agent/arc-research-report` | PR workflow | [PR #23](https://github.com/th0jensen/browser/pull/23); CI passed |
+| Local naming prompts and validation | `pi-agent/arc-ai-naming` | PR workflow | [Draft PR #24](https://github.com/th0jensen/browser/pull/24); Debug tests passed |
+| Reversible Tidy Tabs | `pi-agent/arc-tidy-undo` | PR workflow | [Draft PR #27](https://github.com/th0jensen/browser/pull/27); Debug tests passed |
+| Preview extraction and failure states | `pi-agent/arc-preview-safety` | PR workflow | Review fixes and Debug validation in progress |
+| Tab suspension eligibility | `pi-agent/arc-tab-lifecycle` | PR workflow | [PR #25](https://github.com/th0jensen/browser/pull/25); reviewed and Debug tests passed |
+| Explicit Shift-click Peek | `pi-agent/arc-peek-gesture` | PR workflow | Debug tests passed; extension-path review fix in progress |
+| Spaces and ownership foundation | `pi-agent/arc-spaces` | PR workflow | [Draft PR #26](https://github.com/th0jensen/browser/pull/26); full Debug validation in progress |
+| Unified local command results | `pi-agent/arc-command-bar` | Spaces | Active |
+| Reversible temporary-tab archive | `pi-agent/arc-tab-archive` | Spaces | Active |
+| Local page questions and citations | `pi-agent/arc-page-answers` | Naming | Active |
+| Deterministic link routing | `pi-agent/arc-link-routing` | Spaces | Active |
+| Separate persistent profiles | `pi-agent/arc-profiles` | Spaces | Active |
 
 ## 3. Prompt rules
 
