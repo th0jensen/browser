@@ -560,11 +560,18 @@ final class BrowserModel: NSObject {
     func tabAcrossSpaces(withID id: UUID) -> BrowserTab? { allTabs.first { $0.id == id } }
 
     @discardableResult
-    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID) throws -> BrowserSpace {
+    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID,
+                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system) throws -> BrowserSpace {
         guard !isPrivate, !isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
-        let space = try spaces.createSpace(title: title, profileID: profileID)
+        let space = try spaces.createSpace(title: title, profileID: profileID, icon: icon, theme: theme)
         selectSpace(space.id)
         return space
+    }
+
+    @discardableResult
+    func selectSpace(at index: Int) -> Bool {
+        guard spaces.spaces.indices.contains(index) else { return false }
+        return selectSpace(spaces.spaces[index].id)
     }
 
     @discardableResult

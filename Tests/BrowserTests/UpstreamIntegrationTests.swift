@@ -17,22 +17,31 @@ final class UpstreamIntegrationTests: XCTestCase {
         XCTAssertNil(configuration.webExtensionController, file: file, line: line)
     }
 
-    private func assertDefaultOwnershipMigration(_ migrated: WindowSession, from legacy: WindowSession,
-                                                 file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertEqual(migrated.activeSpaceID, BrowserSpaceStore.defaultSpaceID, file: file, line: line)
-        XCTAssertEqual(migrated.spaceSessions?.count, 1, file: file, line: line)
-        XCTAssertEqual(migrated.spaceSessions?.first?.tabs, migrated.tabs, file: file, line: line)
-        XCTAssertTrue(migrated.tabs.allSatisfy { $0.id != nil && $0.spaceID == BrowserSpaceStore.defaultSpaceID
+    /// Legacy fields survive migration; added ownership must exactly match the live Default Space.
+    private func assertDefaultOwnershipMigration(_ legacy: WindowSession, in browser: BrowserModel,
+                                                 file: StaticString = #filePath, line: UInt = #line) -> WindowSession {
+        let migrated = browser.windowSession()
+        let spaceID = BrowserSpaceStore.defaultSpaceID
+        XCTAssertEqual(migrated.activeSpaceID, spaceID, file: file, line: line)
+        XCTAssertEqual(migrated.spaceSessions, [SpaceSession(spaceID: spaceID, profileID: BrowserProfile.defaultID,
+            tabs: migrated.tabs, selectedIndex: legacy.selectedIndex, splits: legacy.splits)], file: file, line: line)
+        XCTAssertNil(migrated.unavailableSpaceSessions, file: file, line: line)
+        XCTAssertEqual(migrated.tabs.map(\.id), browser.tabs.map { Optional($0.id) }, file: file, line: line)
+        XCTAssertEqual(Set(migrated.tabs.compactMap(\.id)).count, migrated.tabs.count, file: file, line: line)
+        XCTAssertTrue(migrated.tabs.allSatisfy { $0.id != nil && $0.spaceID == spaceID
             && $0.profileID == BrowserProfile.defaultID }, file: file, line: line)
         var normalized = migrated
         normalized.activeSpaceID = nil
         normalized.spaceSessions = nil
         normalized.tabs = migrated.tabs.map { tab in
             var tab = tab
-            tab.id = nil; tab.spaceID = nil; tab.profileID = nil
+            tab.id = nil
+            tab.spaceID = nil
+            tab.profileID = nil
             return tab
         }
         XCTAssertEqual(normalized, legacy, file: file, line: line)
+        return migrated
     }
 
     func testAnIsolatedNormalProfileStillRecordsItsSessionAndHistory() throws {
@@ -113,8 +122,7 @@ final class UpstreamIntegrationTests: XCTestCase {
 
         let normal = BrowserModel()
         XCTAssertEqual(sessions.attach(normal), 0)
-        let migrated = normal.windowSession()
-        assertDefaultOwnershipMigration(migrated, from: expected)
+        let migrated = assertDefaultOwnershipMigration(expected, in: normal)
         sessions.saveBeforeQuitting()
         let disk = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
         XCTAssertEqual(disk.windows, [migrated])
@@ -188,8 +196,7 @@ final class UpstreamIntegrationTests: XCTestCase {
         XCTAssertEqual(browser.tabs[2].temporarySection, section)
         XCTAssertEqual(browser.splits.first?.tabIDs, [browser.tabs[1].id, browser.tabs[0].id])
         XCTAssertEqual(browser.splits.first?.focusedID, browser.tabs[1].id)
-        let migrated = browser.windowSession()
-        assertDefaultOwnershipMigration(migrated, from: expected)
+        let migrated = assertDefaultOwnershipMigration(expected, in: browser)
 
         let file = StoreFile(url: directory.appending(path: "Session.plist"))
         let sessions = SessionStore(file: file)

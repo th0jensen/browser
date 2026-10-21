@@ -1,11 +1,53 @@
 import Foundation
 import Observation
 
+enum BrowserSpaceIcon: String, Codable, CaseIterable, Identifiable, Sendable {
+    case circle, home, work, book, code, leaf, heart, lightbulb, travel, music
+    var id: String { rawValue }
+    var symbol: String {
+        switch self {
+        case .circle: "circle.grid.2x2.fill"
+        case .home: "house.fill"
+        case .work: "briefcase.fill"
+        case .book: "book.fill"
+        case .code: "chevron.left.forwardslash.chevron.right"
+        case .leaf: "leaf.fill"
+        case .heart: "heart.fill"
+        case .lightbulb: "lightbulb.fill"
+        case .travel: "airplane"
+        case .music: "music.note"
+        }
+    }
+    var title: String { rawValue.capitalized }
+}
+
+enum BrowserSpaceTheme: String, Codable, CaseIterable, Identifiable, Sendable {
+    case system, blue, purple, pink, orange, green, gray
+    var id: String { rawValue }
+    var title: String { self == .system ? "System Accent" : rawValue.capitalized }
+}
+
 /// A visual navigation context. Spaces with the same profile share website data.
 struct BrowserSpace: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     var title: String
     let profileID: UUID
+    var icon: BrowserSpaceIcon = .circle
+    var theme: BrowserSpaceTheme = .system
+}
+
+extension BrowserSpace {
+    private enum CodingKeys: String, CodingKey { case id, title, profileID, icon, theme }
+
+    init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        profileID = try values.decode(UUID.self, forKey: .profileID)
+        // Appearance is optional metadata. Unknown future palette values must not hide saved tabs.
+        icon = (try? values.decode(String.self, forKey: .icon)).flatMap(BrowserSpaceIcon.init(rawValue:)) ?? .circle
+        theme = (try? values.decode(String.self, forKey: .theme)).flatMap(BrowserSpaceTheme.init(rawValue:)) ?? .system
+    }
 }
 
 @MainActor @Observable
@@ -17,6 +59,7 @@ final class BrowserSpaceStore {
     private let directory: URL
     private let enabled: Bool
     private var loadFailed = false
+    private var needsAppearanceBackup = false
     @ObservationIgnored private var folderStores: [UUID: TabFolderStore] = [:]
     @ObservationIgnored private var pinnedStores: [UUID: PinnedPageStore] = [:]
 
@@ -40,7 +83,11 @@ final class BrowserSpaceStore {
         let file = directory.appending(path: "Spaces.json")
         guard enabled, FileManager.default.fileExists(atPath: file.path) else { return }
         do {
-            let saved = try JSONDecoder().decode([BrowserSpace].self, from: Data(contentsOf: file))
+            let data = try Data(contentsOf: file)
+            let saved = try JSONDecoder().decode([BrowserSpace].self, from: data)
+            if let records = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                needsAppearanceBackup = records.contains { $0["icon"] == nil || $0["theme"] == nil }
+            }
             var ids = Set<UUID>()
             // Do not reinterpret a foreign profile as the existing profile.
             guard saved.allSatisfy({ ids.insert($0.id).inserted }),
@@ -61,21 +108,53 @@ final class BrowserSpaceStore {
     }
 
     @discardableResult
-    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID) throws -> BrowserSpace {
+    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID,
+                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system) throws -> BrowserSpace {
         guard !loadFailed else { throw Failure.unavailable }
         guard profiles.profile(profileID) != nil else { throw Failure.unsupportedProfile }
+        let space = BrowserSpace(id: UUID(), title: try cleanTitle(title), profileID: profileID, icon: icon, theme: theme)
+        try commit(spaces + [space])
+        return space
+    }
+
+    func updateSpace(_ id: UUID, title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws {
+        guard let index = spaces.firstIndex(where: { $0.id == id }) else { throw Failure.unavailable }
+        var next = spaces
+        next[index].title = try cleanTitle(title)
+        next[index].icon = icon
+        next[index].theme = theme
+        try commit(next)
+    }
+
+    private func cleanTitle(_ title: String) throws -> String {
         let title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
         guard !title.isEmpty else { throw Failure.invalidName }
-        let space = BrowserSpace(id: UUID(), title: title, profileID: profileID)
-        let next = spaces + [space]
+        return title
+    }
+
+    private func commit(_ next: [BrowserSpace]) throws {
+        guard !loadFailed else { throw Failure.unavailable }
         if enabled {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             let file = directory.appending(path: "Spaces.json")
+            if needsAppearanceBackup {
+                let backup = directory.appending(path: "Spaces.before-appearance.json")
+                if FileManager.default.fileExists(atPath: backup.path) {
+                    _ = try JSONDecoder().decode([BrowserSpace].self, from: Data(contentsOf: backup))
+                } else {
+                    // An atomic hard link retains the original bytes before replacing the live file.
+                    try FileManager.default.linkItem(at: file, to: backup)
+                }
+            }
+            if !FileManager.default.fileExists(atPath: file.path) {
+                guard FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            }
             try JSONEncoder().encode(next).write(to: file, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            needsAppearanceBackup = false
         }
         spaces = next
-        return space
     }
 
     /// Legacy descriptors stay in place. Their identifiers and order do not change.
