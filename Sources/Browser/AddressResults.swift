@@ -221,8 +221,20 @@ enum AddressResults {
     }
 
     @discardableResult
-    static func execute(_ result: AddressResult, in browser: BrowserModel, inNewTab: Bool = false) -> Bool {
+    static func execute(_ result: AddressResult, in browser: BrowserModel, inNewTab: Bool = false,
+                        navigationSource: BrowserTab? = nil) -> Bool {
         guard result.owner == ObjectIdentifier(browser), !browser.isClosed else { return false }
+        func navigate(_ url: URL) -> Bool {
+            if let source = navigationSource {
+                guard source.browser === browser, source.spaceID == browser.activeSpaceID,
+                      browser.focusedPage === source,
+                      (browser.tabAcrossSpaces(withID: source.id) === source || browser.peek?.tab === source),
+                      browser.websiteDataStore(forProfileID: source.profileID) != nil else { return false }
+                // Editing a Peek navigates that same live Peek, not its opener.
+                source.load(url)
+            } else { browser.open(url, inNewTab: inNewTab) }
+            return true
+        }
         switch result.action {
         case .switchSpace(let destination):
             guard !browser.isPrivate, !browser.isExtensionWindow,
@@ -247,10 +259,10 @@ enum AddressResults {
             if tab.isNewTab { browser.requestAddressFocus() }
         case .openURL(let page):
             guard !browser.isPrivate else { return false }
-            browser.open(page.url, inNewTab: inNewTab)
+            return navigate(page.url)
         case .navigate(let url):
             guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host() != nil else { return false }
-            browser.open(url, inNewTab: inNewTab)
+            return navigate(url)
         case .openSavedPage(let id, let spaceID, let kind, let url):
             guard !browser.isPrivate, !browser.isExtensionWindow, browser.spaces.space(spaceID) != nil else { return false }
             switch kind {
@@ -268,7 +280,7 @@ enum AddressResults {
         case .command(let command): return command.execute(in: browser)
         case .search(let query):
             guard let url = SearchEngine.current.searchURL(for: query) else { return false }
-            browser.open(url, inNewTab: inNewTab)
+            return navigate(url)
         }
         return true
     }

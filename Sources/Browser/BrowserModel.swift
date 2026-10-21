@@ -102,6 +102,7 @@ final class BrowserModel: NSObject {
     }
     var addressFocusRequest = 0
     var commandPaletteRequest = 0
+    private(set) var commandPaletteMode: CommandPaletteMode = .newDestination
     @ObservationIgnored weak var commandPalette: CommandPaletteController?
     @ObservationIgnored var consumedAddressFocusRequest = 0
     @ObservationIgnored private var suspender: TabSuspender?
@@ -1019,9 +1020,15 @@ final class BrowserModel: NSObject {
         activeTab?.webView?.go(to: item)
     }
 
-    /// Command-T requests a destination without creating a blank tab or web view.
-    func showCommandPalette() {
+    /// Both modes only request presentation. Cancel older toolbar focus work;
+    /// opening the palette must not load a page, create a tab, or dismiss Peek.
+    func showCommandPalette(mode: CommandPaletteMode = .newDestination) {
         guard !isClosed, !isExtensionWindow else { return }
+        consumedAddressFocusRequest = addressFocusRequest
+        let field = (window?.firstResponder as? AddressField)
+            ?? ((window?.firstResponder as? NSTextView)?.delegate as? AddressField)
+        field?.requestFocus(0)
+        commandPaletteMode = mode
         commandPaletteRequest += 1
     }
 

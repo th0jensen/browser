@@ -50,8 +50,13 @@ final class BrowserShortcutView: NSView {
                modifiers == .command || modifiers == [.command, .control] { return nil }
             // Keep menu validation, alternate shortcuts and their existing actions.
             // Returning nil prevents a successful command reaching a second responder.
-            return NSApp.mainMenu?.performKeyEquivalent(with: event) == true ? nil : event
+            return Self.performMenuCommand(event, menu: NSApp.mainMenu) ? nil : event
         }
+    }
+
+    static func performMenuCommand(_ event: NSEvent, menu: NSMenu?) -> Bool {
+        guard isBrowserCommand(event) else { return false }
+        return menu?.performKeyEquivalent(with: event) == true
     }
 
     static func isBrowserCommand(_ event: NSEvent) -> Bool {

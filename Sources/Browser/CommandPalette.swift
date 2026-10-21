@@ -1,6 +1,18 @@
 import AppKit
 import SwiftUI
 
+enum CommandPaletteMode: Equatable, Sendable {
+    case newDestination
+    case editCurrentDestination
+
+    var menuTitle: String {
+        switch self {
+        case .newDestination: "New Tab"
+        case .editCurrentDestination: "Open Command Bar"
+        }
+    }
+}
+
 /// A page-area native container, not a second window. SwiftUI owns its placement;
 /// this representable owns every overlay child so glass can sample the source page.
 struct CommandPaletteHost: NSViewRepresentable {
@@ -15,7 +27,7 @@ struct CommandPaletteHost: NSViewRepresentable {
     }
 
     func updateNSView(_ view: CommandPaletteAnchor, context: Context) {
-        view.update(request: request)
+        view.update(request: request, mode: browser.commandPaletteMode)
     }
 
     static func dismantleNSView(_ view: CommandPaletteAnchor, coordinator: ()) {
@@ -26,7 +38,8 @@ struct CommandPaletteHost: NSViewRepresentable {
 final class CommandPaletteAnchor: NSView {
     let palette: CommandPaletteController
     private var requested = 0
-    private var applied = 0
+    private(set) var applied = 0
+    private var requestedMode: CommandPaletteMode = .newDestination
 
     init(browser: BrowserModel, bookmarks: BookmarkStore) {
         palette = CommandPaletteController(browser: browser, bookmarks: bookmarks)
@@ -40,14 +53,15 @@ final class CommandPaletteAnchor: NSView {
         palette.isPresented ? super.hitTest(point) : nil
     }
 
-    func update(request: Int) {
+    func update(request: Int, mode: CommandPaletteMode) {
         requested = request
+        requestedMode = mode
         if palette.isPresented, !palette.contextIsValid { palette.dismiss(restoreFocus: false) }
         DispatchQueue.main.async { [weak self] in self?.applyRequest() }
     }
 
     private func applyRequest() {
-        if requested != applied, palette.present() { applied = requested }
+        if requested != applied, palette.present(mode: requestedMode) { applied = requested }
     }
 
     override func viewDidMoveToWindow() {
@@ -74,7 +88,6 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     let table = CommandPaletteTable()
     private let scroll = CommandPaletteResultsScrollView()
     private let content = CommandPaletteContent()
-    private let hint = NSTextField(labelWithString: "Search tabs, Spaces, saved pages, or commands")
     private let separator = NSBox()
     private let symbol = NSImageView()
     private(set) var glass: NSGlassEffectView?
@@ -86,7 +99,10 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     private weak var sourceTab: BrowserTab?
     private var sourceSpaceID: UUID?
     private var sourceRevision = 0
+    private weak var sourceFocusedPage: BrowserTab?
+    private var focusedPageRevision = 0
     private var sourcePeekID: UUID?
+    private(set) var mode: CommandPaletteMode = .newDestination
     private var eventMonitor: Any?
     private var observers: [NSObjectProtocol] = []
     private var pendingMouseUp: NSEvent.EventType?
@@ -97,6 +113,8 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         guard let browser, !browser.isClosed else { return false }
         return browser.activeTab === sourceTab && browser.activeSpaceID == sourceSpaceID
             && (sourceTab?.navigationRevision ?? 0) == sourceRevision && browser.peek?.id == sourcePeekID
+            && browser.focusedPage === sourceFocusedPage
+            && (sourceFocusedPage?.navigationRevision ?? 0) == focusedPageRevision
     }
 
     init(browser: BrowserModel, bookmarks: BookmarkStore) {
@@ -108,6 +126,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         field.drawsBackground = false
         field.focusRingType = .none
         field.font = .systemFont(ofSize: 22)
+        field.alignment = .left
         field.textColor = .labelColor
         field.placeholderString = "Search or enter address"
         field.usesSingleLineMode = true
@@ -118,13 +137,12 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         field.setAccessibilityLabel("Command Bar, search or enter address")
         field.target = self
         field.action = #selector(submit)
-        symbol.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
+        symbol.image = CommandPaletteLayout.image("magnifyingglass")
+        symbol.identifier = .init("CommandPalette.icon")
+        symbol.imageScaling = .scaleNone
         symbol.contentTintColor = .secondaryLabelColor
         symbol.setAccessibilityElement(false)
         separator.boxType = .separator
-        hint.font = .systemFont(ofSize: 12)
-        hint.textColor = .secondaryLabelColor
-        hint.lineBreakMode = .byTruncatingTail
         let column = NSTableColumn(identifier: .init("result"))
         table.addTableColumn(column)
         table.headerView = nil
@@ -156,7 +174,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         scroll.borderType = .noBorder
         scroll.automaticallyAdjustsContentInsets = false
         scroll.contentInsets = NSEdgeInsetsZero
-        for view in [symbol, field, separator, scroll, hint] { content.addSubview(view) }
+        for view in [symbol, field, separator, scroll] { content.addSubview(view) }
     }
 
     isolated deinit {
@@ -166,30 +184,34 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     }
 
     @discardableResult
-    func present() -> Bool {
+    func present(mode: CommandPaletteMode = .newDestination) -> Bool {
         guard let browser, !browser.isClosed, let anchor, let window = anchor.window,
               anchor.bounds.width > 0, anchor.bounds.height > 0,
               window.attachedSheet == nil, NSApp.modalWindow == nil else { return false }
         focusTask?.cancel()
-        if isPresented {
-            window.makeFirstResponder(field)
-            field.selectText(nil)
+        if isPresented, contextIsValid {
+            if mode == .newDestination, self.mode == .newDestination {
+                window.makeFirstResponder(field)
+                field.selectText(nil)
+                layoutPresentation()
+            } else {
+                resetInput(mode: mode)
+                focusInput(in: window)
+            }
             return true
         }
+        if isPresented { dismiss(restoreFocus: false) }
         removeEventMonitor()
         if let peek = browser.peek { previousResponder = peek.tab.webView }
         else { previousResponder = ((window.firstResponder as? NSTextView)?.delegate as? NSResponder) ?? window.firstResponder }
         sourceTab = browser.activeTab
         sourceSpaceID = browser.activeSpaceID
         sourceRevision = sourceTab?.navigationRevision ?? 0
+        sourceFocusedPage = browser.focusedPage
+        focusedPageRevision = sourceFocusedPage?.navigationRevision ?? 0
         sourcePeekID = browser.peek?.id
-        typedText = ""
-        completionStart = nil
-        results = []
         field.browserWindow = window
-        field.updatePresentation(text: "", url: nil, title: "")
-        table.reloadData()
-        table.deselectAll(nil)
+        resetInput(mode: mode)
         let overlay = CommandPaletteOverlay(frame: anchor.bounds)
         overlay.autoresizingMask = [.width, .height]
         overlay.onLayout = { [weak self] in self?.layoutPresentation() }
@@ -211,10 +233,29 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         self.glass = glass
         layoutPresentation()
         installEvents(in: window)
-        window.makeFirstResponder(field)
-        field.selectText(nil)
+        focusInput(in: window)
         NSAccessibility.post(element: field, notification: .focusedUIElementChanged)
         return true
+    }
+
+    private func focusInput(in window: NSWindow) {
+        window.makeFirstResponder(field)
+        field.selectText(nil)
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.string = typedText
+            editor.setSelectedRange(NSRange(location: 0, length: typedText.utf16.count))
+            editor.scrollRangeToVisible(NSRange(location: 0, length: 0))
+        }
+        layoutPresentation()
+    }
+
+    private func resetInput(mode: CommandPaletteMode) {
+        (field.currentEditor() as? NSTextView)?.unmarkText()
+        self.mode = mode
+        typedText = mode == .editCurrentDestination ? sourceFocusedPage?.url?.absoluteString ?? "" : ""
+        completionStart = nil
+        field.updatePresentation(text: typedText, url: nil, title: "")
+        refreshResults()
     }
 
     func dismiss(restoreFocus: Bool = true) {
@@ -226,6 +267,8 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         self.overlay = nil
         glass = nil
         results = []
+        table.deselectAll(nil)
+        table.reloadData()
         typedText = ""
         completionStart = nil
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
@@ -247,21 +290,24 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         guard area.width > 0, area.height > 0 else { return }
         let width = min(720, min(max(280, area.width * 0.78), max(0, area.width - 32)))
         let rowsHeight = table.rowsHeight
-        let resultHeight = results.isEmpty ? 36 : min(rowsHeight, min(336, max(table.rowHeight, area.height - 160)))
-        let height = 80 + resultHeight
+        let resultHeight = results.isEmpty ? 0 : min(rowsHeight, min(336, max(table.rowHeight, area.height - 160)))
+        let height = results.isEmpty ? 64 : 80 + resultHeight
         let centerY = area.midY + min(60, area.height * 0.08)
         let y = max(area.minY + 16, min(centerY - height / 2, area.maxY - height - 16))
         glass.frame = NSRect(x: area.midX - width / 2, y: y, width: width, height: height)
         content.frame = NSRect(origin: .zero, size: glass.bounds.size)
-        symbol.frame = NSRect(x: 18, y: 24, width: 18, height: 18)
-        field.frame = NSRect(x: 48, y: 14, width: max(0, width - 66), height: 36)
         separator.frame = NSRect(x: 12, y: 64, width: max(0, width - 24), height: 1)
         scroll.frame = NSRect(x: 8, y: 72, width: max(0, width - 16), height: resultHeight)
         table.setFrameSize(NSSize(width: table.frame.width, height: rowsHeight))
         scroll.tile()
         scroll.layoutSubtreeIfNeeded()
-        hint.frame = NSRect(x: 18, y: 80, width: max(0, width - 36), height: 20)
-        hint.isHidden = !results.isEmpty
+        content.leadingAdjustment = max(0, scroll.readableContentBounds.minX - scroll.contentView.bounds.minX)
+        CommandPaletteLayout.place(symbol, center: NSPoint(x: CommandPaletteLayout.iconCenterX + content.leadingAdjustment, y: 32))
+        let textX = CommandPaletteLayout.textX + content.leadingAdjustment
+        CommandPaletteLayout.place(field, textX: textX,
+                                   baselineY: 32 + (field.font?.capHeight ?? 0) / 2,
+                                   width: max(0, width - textX - CommandPaletteLayout.inset))
+        separator.isHidden = results.isEmpty
         scroll.isHidden = results.isEmpty
     }
 
@@ -346,7 +392,8 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
             accepted = AddressResult(owner: result.owner, action: .navigate(url), title: result.title,
                                      detail: result.detail, destinationSpace: result.destinationSpace)
         }
-        guard AddressResults.execute(accepted, in: browser, inNewTab: true) else {
+        guard AddressResults.execute(accepted, in: browser, inNewTab: mode == .newDestination,
+                                     navigationSource: mode == .editCurrentDestination ? sourceFocusedPage : nil) else {
             completionStart = nil
             refreshResults()
             return
@@ -360,8 +407,14 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         guard results.indices.contains(row) else { return nil }
         let cell = (tableView.makeView(withIdentifier: .init("CommandResult"), owner: nil) as? CommandPaletteResultCell)
             ?? CommandPaletteResultCell()
-        cell.update(results[row])
+        cell.update(results[row], selected: tableView.isRowSelected(row), reference: content)
         return cell
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let view = CommandPaletteResultRow()
+        view.isSelected = tableView.isRowSelected(row)
+        return view
     }
 
     private func installEvents(in window: NSWindow) {
@@ -419,7 +472,69 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     }
 }
 
+/// Palette-only guides. Native cell insets and the live field-editor baseline
+/// are measured rather than treating different controls' outer frames as text.
+@MainActor
+enum CommandPaletteLayout {
+    static let inset: CGFloat = 18
+    static let iconCenterX: CGFloat = 26
+    static let textX: CGFloat = 44
+
+    static func image(_ name: String) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+    }
+
+    static func leadingPoint(_ field: NSTextField) -> NSPoint {
+        if let editor = field.currentEditor() as? NSTextView {
+            let x = editor.bounds.minX + editor.textContainerOrigin.x + (editor.textContainer?.lineFragmentPadding ?? 0)
+            return field.convert(NSPoint(x: x, y: editor.bounds.minY), from: editor)
+        }
+        let rect = field.cell?.titleRect(forBounds: field.bounds) ?? field.bounds
+        return NSPoint(x: rect.minX, y: rect.minY)
+    }
+
+    static func baselinePoint(_ field: NSTextField) -> NSPoint {
+        if let editor = field.currentEditor() as? NSTextView,
+           let layout = editor.layoutManager, let container = editor.textContainer {
+            layout.ensureLayout(for: container)
+            let range = layout.glyphRange(for: container)
+            if range.length > 0 {
+                let fragment = layout.lineFragmentRect(forGlyphAt: range.location, effectiveRange: nil)
+                let location = layout.location(forGlyphAt: range.location)
+                return field.convert(NSPoint(x: editor.textContainerOrigin.x + fragment.minX + location.x,
+                                             y: editor.textContainerOrigin.y + fragment.minY + location.y), from: editor)
+            }
+        }
+        let y = field.isFlipped ? field.bounds.minY + field.firstBaselineOffsetFromTop
+            : field.bounds.maxY - field.firstBaselineOffsetFromTop
+        return NSPoint(x: field.bounds.minX, y: y)
+    }
+
+    static func place(_ field: NSTextField, textX: CGFloat, baselineY: CGFloat, width: CGFloat) {
+        let height = ceil(max(field.intrinsicContentSize.height, field.cell?.cellSize.height ?? 0))
+        field.setFrameSize(NSSize(width: max(0, width), height: max(1, height)))
+        let cellRect = field.cell?.titleRect(forBounds: field.bounds) ?? field.bounds
+        let extraWidth = cellRect.minX - field.bounds.minX + field.bounds.maxX - cellRect.maxX
+        field.setFrameSize(NSSize(width: max(0, width + extraWidth), height: field.frame.height))
+        guard let parent = field.superview else { return }
+        let leading = parent.convert(leadingPoint(field), from: field)
+        let baseline = parent.convert(baselinePoint(field), from: field)
+        field.setFrameOrigin(NSPoint(x: field.frame.minX + textX - leading.x,
+                                     y: field.frame.minY + baselineY - baseline.y))
+    }
+
+    static func place(_ view: NSImageView, center: NSPoint) {
+        guard let image = view.image else { view.frame = .zero; return }
+        let alignment = image.alignmentRect
+        let y = view.superview?.isFlipped == true ? image.size.height - alignment.midY : alignment.midY
+        view.frame = NSRect(x: center.x - alignment.midX, y: center.y - y,
+                            width: image.size.width, height: image.size.height)
+    }
+}
+
 private final class CommandPaletteContent: NSView {
+    var leadingAdjustment: CGFloat = 0
     override var isFlipped: Bool { true }
 }
 
@@ -428,8 +543,6 @@ private final class CommandPaletteOverlay: NSView {
     var onLayout: (() -> Void)?
     override init(frame: NSRect) {
         super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override func layout() { super.layout(); onLayout?() }
@@ -457,15 +570,27 @@ final class CommandPaletteResultsScrollView: NSScrollView {
         fitResultColumn()
     }
 
+    var readableContentBounds: NSRect {
+        var rect = contentView.bounds
+        if let table = documentView as? CommandPaletteTable, table.rowsHeight > rect.height,
+           let scroller = verticalScroller, !scroller.isHidden {
+            let overlap = contentView.convert(scroller.bounds, from: scroller).intersection(rect)
+            if !overlap.isNull, overlap.width > 0 {
+                if overlap.midX > rect.midX { rect.size.width = max(0, overlap.minX - rect.minX) }
+                else {
+                    let end = rect.maxX
+                    rect.origin.x = overlap.maxX
+                    rect.size.width = max(0, end - rect.minX)
+                }
+            }
+        }
+        return rect
+    }
+
     private func fitResultColumn() {
         guard let table = documentView as? CommandPaletteTable else { return }
         let canvasWidth = contentView.bounds.width
-        var columnWidth = canvasWidth
-        if table.rowsHeight > contentView.bounds.height,
-           let scroller = verticalScroller, !scroller.isHidden {
-            let overlap = contentView.convert(scroller.bounds, from: scroller).intersection(contentView.bounds)
-            if !overlap.isNull { columnWidth -= overlap.width }
-        }
+        let columnWidth = readableContentBounds.width
         // NSTableView's document canvas fills the clip even when its single
         // column is narrower. Keep the measured overlay-scroller gutter in the
         // column, rather than fighting AppKit's minimum document width.
@@ -496,60 +621,112 @@ final class CommandPaletteTable: NSTableView {
     }
 }
 
-private final class CommandPaletteResultCell: NSTableCellView {
-    private let symbol = NSImageView()
-    private let title = NSTextField(labelWithString: "")
-    private let detail = NSTextField(labelWithString: "")
-    private let action = NSTextField(labelWithString: "")
-    private let space = NSTextField(labelWithString: "")
+private final class CommandPaletteResultRow: NSTableRowView {
+    override var isSelected: Bool { didSet { updateCells() } }
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        updateCells()
+    }
+    private func updateCells() {
+        for cell in subviews.compactMap({ $0 as? CommandPaletteResultCell }) {
+            cell.setSelected(superview != nil && isSelected)
+        }
+    }
+}
+
+final class CommandPaletteResultCell: NSTableCellView {
+    let symbol = NSImageView()
+    let title = NSTextField(labelWithString: "")
+    let detail = NSTextField(labelWithString: "")
+    let returnSymbol = NSImageView()
+    private weak var reference: NSView?
+    private(set) var isResultSelected = false
     override var isFlipped: Bool { true }
     override var backgroundStyle: NSView.BackgroundStyle { didSet { updateColors() } }
 
     init() {
         super.init(frame: .zero)
         identifier = .init("CommandResult")
-        for (label, name) in [(title, "title"), (detail, "detail"), (action, "action"), (space, "space")] {
+        for (label, name) in [(title, "title"), (detail, "detail")] {
             label.identifier = .init("CommandResult.\(name)")
+            label.alignment = .left
             label.lineBreakMode = .byTruncatingTail
+            label.usesSingleLineMode = true
             label.font = .systemFont(ofSize: label === title ? 13 : 11)
             addSubview(label)
         }
-        action.alignment = .right
-        space.alignment = .right
-        addSubview(symbol)
+        symbol.identifier = .init("CommandResult.icon")
+        returnSymbol.identifier = .init("CommandResult.return")
+        returnSymbol.image = CommandPaletteLayout.image("return")
+        for image in [symbol, returnSymbol] {
+            image.imageScaling = .scaleNone
+            image.setAccessibilityElement(false)
+            addSubview(image)
+        }
+        returnSymbol.isHidden = true
         updateColors()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func update(_ result: AddressResult) {
+    func update(_ result: AddressResult, selected: Bool, reference: NSView) {
+        self.reference = reference
+        userInterfaceLayoutDirection = reference.userInterfaceLayoutDirection
+        for view in [title, detail, symbol, returnSymbol] { view.userInterfaceLayoutDirection = userInterfaceLayoutDirection }
         title.stringValue = result.title
-        detail.stringValue = result.detail
-        action.stringValue = result.actionLabel
-        space.stringValue = result.destinationSpace.map { "In \($0)" } ?? ""
-        symbol.image = NSImage(systemSymbolName: result.symbol, accessibilityDescription: nil)
-        for label in [title, detail, action, space] { label.toolTip = label.stringValue }
-        setAccessibilityLabel([result.title, result.detail, result.actionLabel, result.destinationSpace].compactMap { $0 }.joined(separator: ", "))
+        switch result.action {
+        case .search, .command, .switchSpace: detail.stringValue = ""
+        default: detail.stringValue = result.detail == result.title ? "" : result.detail
+        }
+        detail.isHidden = detail.stringValue.isEmpty
+        symbol.image = CommandPaletteLayout.image(result.symbol)
+        for label in [title, detail] { label.toolTip = label.stringValue }
+        var context = [result.title, detail.stringValue, result.actionLabel]
+        if let space = result.destinationSpace, space != result.title { context.append(space) }
+        let accessible = context.filter { !$0.isEmpty }.joined(separator: ", ")
+        setAccessibilityLabel(accessible)
+        toolTip = accessible
+        setSelected(selected)
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        setSelected((superview as? NSTableRowView)?.isSelected == true)
+    }
+
+    func setSelected(_ selected: Bool) {
+        isResultSelected = selected
+        returnSymbol.isHidden = !selected
+        needsLayout = true
     }
 
     private func updateColors() {
         let selected = backgroundStyle == .emphasized
         title.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
-        for label in [detail, action, space] { label.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor }
+        detail.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
         symbol.contentTintColor = title.textColor
+        returnSymbol.contentTintColor = title.textColor
     }
 
     override func layout() {
         super.layout()
-        let contextWidth = min(170, bounds.width * 0.35)
-        let textWidth = max(0, bounds.width - contextWidth - 56)
-        let firstHeight = ceil(max(title.intrinsicContentSize.height, action.intrinsicContentSize.height))
-        let secondHeight = ceil(max(detail.intrinsicContentSize.height, space.intrinsicContentSize.height))
-        let firstY = max(0, (bounds.height - firstHeight - secondHeight - 2) / 2)
-        let secondY = firstY + firstHeight + 2
-        symbol.frame = NSRect(x: 10, y: (bounds.height - 16) / 2, width: 16, height: 16)
-        title.frame = NSRect(x: 36, y: firstY, width: textWidth, height: firstHeight)
-        detail.frame = NSRect(x: 36, y: secondY, width: textWidth, height: secondHeight)
-        action.frame = NSRect(x: bounds.width - contextWidth - 10, y: firstY, width: contextWidth, height: firstHeight)
-        space.frame = NSRect(x: action.frame.minX, y: secondY, width: contextWidth, height: secondHeight)
+        guard let reference, let titleFont = title.font, let detailFont = detail.font else { return }
+        let adjustment = (reference as? CommandPaletteContent)?.leadingAdjustment ?? 0
+        let textX = convert(NSPoint(x: CommandPaletteLayout.textX + adjustment, y: 0), from: reference).x
+        let iconX = convert(NSPoint(x: CommandPaletteLayout.iconCenterX + adjustment, y: 0), from: reference).x
+        let readable = enclosingScrollView.flatMap { $0 as? CommandPaletteResultsScrollView }
+            .map { convert($0.readableContentBounds, from: $0.contentView).intersection(bounds) } ?? bounds
+        let trailing = readable.maxX - 10
+        let textWidth = max(0, trailing - textX - (isResultSelected ? 26 : 0))
+        let firstInkHeight = titleFont.capHeight - titleFont.descender
+        let secondInkHeight = detail.isHidden ? 0 : detailFont.capHeight - detailFont.descender
+        let groupHeight = firstInkHeight + (detail.isHidden ? 0 : 2 + secondInkHeight)
+        let firstBaseline = bounds.midY - groupHeight / 2 + titleFont.capHeight
+        CommandPaletteLayout.place(title, textX: textX, baselineY: firstBaseline, width: textWidth)
+        if !detail.isHidden {
+            let secondBaseline = firstBaseline - titleFont.descender + 2 + detailFont.capHeight
+            CommandPaletteLayout.place(detail, textX: textX, baselineY: secondBaseline, width: textWidth)
+        }
+        CommandPaletteLayout.place(symbol, center: NSPoint(x: iconX, y: bounds.midY))
+        CommandPaletteLayout.place(returnSymbol, center: NSPoint(x: trailing - 7, y: bounds.midY))
     }
 }

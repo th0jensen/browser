@@ -137,7 +137,7 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("n", modifiers: .command)
             Button("New Private Window") { openWindow(id: BrowserApp.privateWindowID) }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
-            Button("New Tab") { browser?.showCommandPalette() }
+            Button(CommandPaletteMode.newDestination.menuTitle) { browser?.showCommandPalette() }
                 .keyboardShortcut("t", modifiers: .command)
             Button("Reopen Closed Tab") { browser?.reopenClosedTab() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
@@ -269,7 +269,9 @@ private struct BrowserCommands: Commands {
         CommandGroup(after: .toolbar) {
             Button("Open Location") { browser?.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
-            Button("Toggle Address Bar") { browser?.toggleAddressFocus() }
+            Button(CommandPaletteMode.editCurrentDestination.menuTitle) {
+                browser?.showCommandPalette(mode: .editCurrentDestination)
+            }
                 .keyboardShortcut("g", modifiers: .command)
             Button("Reload Page") { browser?.reload() }
                 .keyboardShortcut("r", modifiers: .command)

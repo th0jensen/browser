@@ -525,8 +525,13 @@ final class CommandPaletteTests: XCTestCase {
         let scroll = try XCTUnwrap(palette.table.enclosingScrollView as? CommandPaletteResultsScrollView)
         let webView = try XCTUnwrap(fixture.source.webView)
         let sourceRevision = fixture.source.navigationRevision
-        for style in [NSScroller.Style.legacy, .overlay] {
-            scroll.scrollerStyle = style // Local test view only; no user preference override.
+        for (style, direction) in [(NSScroller.Style.legacy, NSUserInterfaceLayoutDirection.leftToRight),
+                                   (.overlay, .leftToRight), (.legacy, .rightToLeft), (.overlay, .rightToLeft)] {
+            palette.glass?.contentView?.userInterfaceLayoutDirection = direction
+            palette.field.userInterfaceLayoutDirection = direction
+            palette.table.userInterfaceLayoutDirection = direction
+            scroll.userInterfaceLayoutDirection = direction
+            scroll.scrollerStyle = style // Local test views only; no user preference override.
             for size in [NSSize(width: 1440, height: 852), NSSize(width: 700, height: 480), NSSize(width: 1440, height: 852)] {
                 fixture.window.setFrame(NSRect(origin: fixture.window.frame.origin, size: size), display: false)
                 fixture.window.layoutIfNeeded()
@@ -590,11 +595,20 @@ final class CommandPaletteTests: XCTestCase {
         }
         let rows = fitting ? Array(0..<table.numberOfRows) : [table.numberOfRows - 1]
         for row in rows {
-            let cell = try XCTUnwrap(table.view(atColumn: 0, row: row, makeIfNecessary: true), file: file, line: line)
+            let cell = try XCTUnwrap(table.view(atColumn: 0, row: row, makeIfNecessary: true) as? CommandPaletteResultCell,
+                                     file: file, line: line)
             cell.layoutSubtreeIfNeeded()
             let labels = cell.subviews.compactMap { $0 as? NSTextField }
-            XCTAssertEqual(labels.count, 4, file: file, line: line)
-            for label in labels {
+            XCTAssertEqual(labels.count, 2, file: file, line: line)
+            XCTAssertEqual(cell.returnSymbol.isHidden, !table.isRowSelected(row), file: file, line: line)
+            XCTAssertTrue(cell.accessibilityLabel()?.contains(palette.results[row].actionLabel) == true, file: file, line: line)
+            if let space = palette.results[row].destinationSpace {
+                XCTAssertEqual(space, longSpace, file: file, line: line)
+                XCTAssertTrue(cell.accessibilityLabel()?.contains(space) == true, file: file, line: line)
+                XCTAssertTrue(cell.toolTip?.contains(space) == true, file: file, line: line)
+            }
+            try assertNativeAlignment(palette, cell: cell, file: file, line: line)
+            for label in labels where !label.isHidden {
                 let frame = label.convert(label.bounds, to: table)
                 XCTAssertTrue(cell.bounds.contains(label.frame), "\(label.identifier?.rawValue ?? "label") outside cell: \(diagnostic)", file: file, line: line)
                 XCTAssertGreaterThanOrEqual(label.frame.height + 0.5, label.intrinsicContentSize.height, diagnostic, file: file, line: line)
@@ -603,17 +617,79 @@ final class CommandPaletteTests: XCTestCase {
                     let obstruction = table.convert(scroller.bounds, from: scroller)
                     XCTAssertFalse(frame.intersects(obstruction), "Label under scroller: \(diagnostic)", file: file, line: line)
                 }
-                if label.identifier?.rawValue == "CommandResult.action" {
-                    XCTAssertGreaterThanOrEqual(label.frame.width + 0.5, label.intrinsicContentSize.width,
-                                               "Action text must fit at these supported window widths", file: file, line: line)
-                }
-                if label.identifier?.rawValue == "CommandResult.space", !label.stringValue.isEmpty {
-                    XCTAssertEqual(label.stringValue, "In \(longSpace)", file: file, line: line)
-                    XCTAssertEqual(label.toolTip, label.stringValue, file: file, line: line)
-                    XCTAssertTrue(cell.accessibilityLabel()?.contains(longSpace) == true, file: file, line: line)
-                }
+                XCTAssertEqual(label.alignment, .left, file: file, line: line)
+                XCTAssertEqual(label.toolTip, label.stringValue, file: file, line: line)
             }
         }
+    }
+
+    private func assertNativeAlignment(_ palette: CommandPaletteController, cell: CommandPaletteResultCell,
+                                       file: StaticString, line: UInt) throws {
+        let content = try XCTUnwrap(palette.glass?.contentView, file: file, line: line)
+        let editor = try XCTUnwrap(palette.field.currentEditor() as? NSTextView, file: file, line: line)
+        let window = try XCTUnwrap(editor.window, file: file, line: line)
+        let caret = content.convert(window.convertFromScreen(editor.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)), from: nil)
+        let headerIcon = try XCTUnwrap(content.subviews.first { $0.identifier?.rawValue == "CommandPalette.icon" } as? NSImageView,
+                                      file: file, line: line)
+        func imageAlignment(_ view: NSImageView) throws -> NSRect {
+            let image = try XCTUnwrap(view.image, file: file, line: line)
+            let drawn = view.cell?.imageRect(forBounds: view.bounds) ?? view.bounds
+            let alignment = image.alignmentRect
+            let x = drawn.width / image.size.width
+            let y = drawn.height / image.size.height
+            let imageY = view.isFlipped ? image.size.height - alignment.maxY : alignment.minY
+            return content.convert(NSRect(x: drawn.minX + alignment.minX * x, y: drawn.minY + imageY * y,
+                                           width: alignment.width * x, height: alignment.height * y), from: view)
+        }
+        func baseline(_ field: NSTextField) -> CGFloat {
+            let y = field.isFlipped ? field.bounds.minY + field.firstBaselineOffsetFromTop
+                : field.bounds.maxY - field.firstBaselineOffsetFromTop
+            return content.convert(NSPoint(x: 0, y: y), from: field).y
+        }
+        let titleRect = content.convert(try XCTUnwrap(cell.title.cell, file: file, line: line).titleRect(forBounds: cell.title.bounds), from: cell.title)
+        XCTAssertEqual(titleRect.minX, caret.minX, accuracy: 0.5, "Native text/caret guides, not outer frames", file: file, line: line)
+        let scroll = try XCTUnwrap(palette.table.enclosingScrollView, file: file, line: line)
+        var leadingObstruction: CGFloat = 0
+        if palette.table.rowsHeight > scroll.contentView.bounds.height, let scroller = scroll.verticalScroller, !scroller.isHidden {
+            let overlap = scroll.contentView.convert(scroller.bounds, from: scroller).intersection(scroll.contentView.bounds)
+            if !overlap.isNull, overlap.width > 0, overlap.midX <= scroll.contentView.bounds.midX {
+                leadingObstruction = overlap.maxX - scroll.contentView.bounds.minX
+            }
+        }
+        XCTAssertEqual(titleRect.minX, CommandPaletteLayout.textX + leadingObstruction, accuracy: 0.5, file: file, line: line)
+        let rowIcon = try imageAlignment(cell.symbol)
+        let inputIcon = try imageAlignment(headerIcon)
+        XCTAssertEqual(rowIcon.midX, inputIcon.midX, accuracy: 0.5, file: file, line: line)
+        XCTAssertLessThanOrEqual(rowIcon.maxX, titleRect.minX, file: file, line: line)
+        if let scroller = scroll.verticalScroller, !scroller.isHidden {
+            XCTAssertFalse(rowIcon.intersects(content.convert(scroller.bounds, from: scroller)), file: file, line: line)
+        }
+        let titleFont = try XCTUnwrap(cell.title.font, file: file, line: line)
+        let top = baseline(cell.title) - titleFont.capHeight
+        var bottom = baseline(cell.title) - titleFont.descender
+        if !cell.detail.isHidden {
+            let rect = content.convert(try XCTUnwrap(cell.detail.cell, file: file, line: line).titleRect(forBounds: cell.detail.bounds), from: cell.detail)
+            XCTAssertEqual(rect.minX, titleRect.minX, accuracy: 0.5, file: file, line: line)
+            bottom = baseline(cell.detail) - (cell.detail.font?.descender ?? 0)
+        }
+        XCTAssertEqual((top + bottom) / 2, rowIcon.midY, accuracy: 0.5, "Typographic row group and icon must share a centre", file: file, line: line)
+        XCTAssertEqual(rowIcon.midY, content.convert(cell.bounds, from: cell).midY, accuracy: 0.5, file: file, line: line)
+        if !cell.returnSymbol.isHidden {
+            let glyph = try imageAlignment(cell.returnSymbol)
+            XCTAssertEqual(glyph.midY, rowIcon.midY, accuracy: 0.5, file: file, line: line)
+            let titleEnd = content.convert(cell.title.frame, from: cell).maxX
+            XCTAssertLessThanOrEqual(titleEnd, glyph.minX, file: file, line: line)
+        }
+        let layout = try XCTUnwrap(editor.layoutManager, file: file, line: line)
+        let container = try XCTUnwrap(editor.textContainer, file: file, line: line)
+        layout.ensureLayout(for: container)
+        let range = layout.glyphRange(for: container)
+        let fragment = layout.lineFragmentRect(forGlyphAt: range.location, effectiveRange: nil)
+        let location = layout.location(forGlyphAt: range.location)
+        let nativeBaseline = content.convert(NSPoint(x: 0, y: editor.textContainerOrigin.y + fragment.minY + location.y), from: editor).y
+        XCTAssertEqual(nativeBaseline - (editor.font?.capHeight ?? 0) / 2, inputIcon.midY, accuracy: 0.5,
+                       "Live native editor baseline, not its outer frame", file: file, line: line)
+        XCTAssertEqual(inputIcon.midY, 32, accuracy: 0.5, file: file, line: line)
     }
 
     func testLocationRequestDismissesPaletteAndKeepsTheNativeAddressPath() async throws {
@@ -684,7 +760,7 @@ final class CommandPaletteTests: XCTestCase {
 private enum PaletteFailure: Error { case timeout }
 
 @MainActor
-private final class PaletteFixture {
+final class PaletteFixture {
     let suite = "CommandPalette-\(UUID())"
     let defaults: UserDefaults
     let browser: BrowserModel
