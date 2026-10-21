@@ -549,7 +549,7 @@ final class BrowserModel: NSObject {
         tab.openerID = opener.id
         tab.isPopUp = configuration != nil
         tab.isNewTab = false
-        peek = PeekPage(openerID: opener.id, tab: tab)
+        peek = PeekPage(openerID: opener.id, tab: tab, source: opener)
         BrowserExtensions.shared.didOpen(tab)
         BrowserExtensions.shared.didActivate(tab, previous: opener)
         if let request { tab.webView?.load(request) }
@@ -575,6 +575,36 @@ final class BrowserModel: NSObject {
         activeTabID = previous.tab.id
         previous.tab.didBecomeSelected()
         requestSessionSave()
+    }
+
+    func peekSplitUnavailableReason(for id: UUID? = nil) -> String? {
+        guard let peek, id == nil || peek.id == id else { return "This Peek is no longer available." }
+        guard let source = peek.sourceForSplit(in: self) else {
+            return "The source page is no longer available in this browsing context."
+        }
+        guard split(containing: source.id) == nil, split(containing: peek.tab.id) == nil else {
+            return "Split View supports only two panes. Separate the source Split View first."
+        }
+        return nil
+    }
+
+    /// Validate everything before adopting either live page. This is synchronous:
+    /// no reload, replacement view, context switch, or existing split replacement.
+    @discardableResult
+    func splitPeek(id: UUID? = nil) -> Bool {
+        guard peekSplitUnavailableReason(for: id) == nil, let previous = peek,
+              let insertion = tabs.firstIndex(where: { $0.id == previous.openerID }) else { return false }
+        let group = SplitTabGroup(id: UUID(), tabIDs: [previous.openerID, previous.tab.id],
+                                  anchorID: previous.openerID, focusedID: previous.tab.id,
+                                  orientation: .horizontal, weights: [0.5, 0.5])
+        // Clear only the transient wrapper, not dismissPeek (which stops its page).
+        peek = nil
+        tabs.insert(previous.tab, at: insertion + 1)
+        splits.append(group)
+        activeTabID = previous.tab.id
+        previous.tab.focusPage()
+        requestSessionSave()
+        return true
     }
 
     private func makeTab(configuration: WKWebViewConfiguration? = nil) -> BrowserTab {

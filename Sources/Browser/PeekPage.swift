@@ -2,10 +2,53 @@ import AppKit
 import SwiftUI
 import WebKit
 
+@MainActor
 struct PeekPage: Identifiable {
     let id = UUID()
     let openerID: UUID
     let tab: BrowserTab
+    private weak var source: BrowserTab?
+    private weak var sourceView: WKWebView?
+    private weak var peekView: WKWebView?
+    private weak var owner: BrowserModel?
+    private weak var sourceWindow: NSWindow?
+    private let sourceRevision: Int?
+    private let websiteDataStore: WKWebsiteDataStore?
+
+    // Defaulted for existing callers; a Peek without captured ownership cannot split.
+    init(openerID: UUID, tab: BrowserTab, source: BrowserTab? = nil) {
+        self.openerID = openerID
+        self.tab = tab
+        self.source = source
+        sourceView = source?.webView
+        peekView = tab.webView
+        owner = source?.browser
+        sourceWindow = source?.browser?.window
+        sourceRevision = source?.navigationRevision
+        websiteDataStore = source?.webView?.configuration.websiteDataStore
+    }
+
+    /// Use captured page/store identity, never the browser's current profile defaults.
+    func sourceForSplit(in browser: BrowserModel) -> BrowserTab? {
+        guard owner === browser, !browser.isClosed, !browser.isExtensionWindow,
+              let source, source.id == openerID, source !== tab,
+              source.browser === browser, tab.browser === browser,
+              browser.activeTab === source, browser.tabs.contains(where: { $0 === source }),
+              !browser.tabs.contains(where: { $0 === tab }), tab.openerID == source.id,
+              source.navigationRevision == sourceRevision,
+              let sourceView, source.webView === sourceView,
+              let peekView, tab.webView === peekView,
+              let websiteDataStore,
+              sourceView.configuration.websiteDataStore === websiteDataStore,
+              peekView.configuration.websiteDataStore === websiteDataStore,
+              browser.window === sourceWindow,
+              sourceView.window == nil || sourceView.window === sourceWindow,
+              peekView.window == nil || peekView.window === sourceWindow,
+              source.extensionOrigin == nil, tab.extensionOrigin == nil,
+              sourceView.url?.scheme != "webkit-extension", peekView.url?.scheme != "webkit-extension"
+        else { return nil }
+        return source
+    }
 }
 
 enum PinnedNavigation {
@@ -94,9 +137,16 @@ struct PeekOverlay<Page: View>: View {
                         .clipShape(RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius))
                         .overlay { RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius).strokeBorder(.primary.opacity(0.12), lineWidth: 1).allowsHitTesting(false) }
                         .shadow(color: .black.opacity(0.4), radius: 26, y: 10)
-                    VStack(spacing: 10) {
-                        control("Close Peek", symbol: "xmark", action: browser.dismissPeek)
-                        control("Open Peek in New Tab", symbol: "arrow.up.left.and.arrow.down.right", action: browser.expandPeek)
+                    GlassEffectContainer(spacing: 0) {
+                        VStack(spacing: 10) {
+                            control("Close Peek", symbol: "xmark", action: browser.dismissPeek)
+                            control("Open Peek in New Tab", symbol: "arrow.up.left.and.arrow.down.right", action: browser.expandPeek)
+                            let splitReason = browser.peekSplitUnavailableReason(for: peek.id)
+                            control("Open Peek in Split View", symbol: SplitOrientation.horizontal.symbol,
+                                    help: splitReason, enabled: splitReason == nil) {
+                                browser.splitPeek(id: peek.id)
+                            }
+                        }
                     }.padding(.top, 8)
                 }
                 .accessibilityElement(children: .contain).accessibilityLabel("Peek")
@@ -107,10 +157,12 @@ struct PeekOverlay<Page: View>: View {
         .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.98)))
     }
 
-    private func control(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
+    private func control(_ title: String, symbol: String, help: String? = nil, enabled: Bool = true,
+                         action: @escaping () -> Void) -> some View {
         Button(action: action) { Image(systemName: symbol).font(.system(size: 13, weight: .semibold)).frame(width: 32, height: 32) }
             .buttonStyle(.plain).glassEffect(.regular.interactive(), in: Circle())
-            .help(title).accessibilityLabel(title)
+            .disabled(!enabled)
+            .help(help ?? title).accessibilityLabel(title).accessibilityHint(help ?? title)
     }
 }
 
