@@ -14,10 +14,10 @@ struct ExtensionButton: View {
             let context = extensions.context(for: item)
             let action = context?.action(for: browser.focusedPage)
             Button {
-                guard let tab = browser.focusedPage else { return }
+                guard browser.supportsExtensions, let tab = browser.focusedPage else { return }
                 Task { @MainActor in
                     await extensions.restore()
-                    guard browser.tab(withID: tab.id) != nil, let readyContext = extensions.context(for: item),
+                    guard browser.supportsExtensions, tab.supportsExtensions, browser.tab(withID: tab.id) != nil, let readyContext = extensions.context(for: item),
                           readyContext.action(for: tab)?.isEnabled == true else { return }
                     extensions.focus(browser)
                     readyContext.userGesturePerformed(in: tab)
@@ -45,7 +45,7 @@ struct ExtensionButton: View {
             .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
         .chromeToolbarButtonStyle()
         .controlSize(.regular)
-            .disabled(!item.isEnabled || action?.isEnabled == false || extensions.errors[item.id] != nil || browser.focusedPage == nil)
+            .disabled(!browser.supportsExtensions || !item.isEnabled || action?.isEnabled == false || extensions.errors[item.id] != nil || browser.focusedPage == nil)
             .help(action?.label.isEmpty == false ? action!.label : item.toolbarActionLabel ?? item.name)
             .accessibilityLabel(item.name)
         }

@@ -289,7 +289,7 @@ extension BrowserExtensions {
         guard !browser.isPrivate, !windows.contains(browser) else { return }
         windows.add(browser)
         controller.didOpenWindow(browser)
-        browser.allTabs.forEach {
+        browser.extensionTabs.forEach {
             controller.didOpenTab($0)
             if let webView = $0.webView {
                 updateRules(in: webView)
@@ -302,7 +302,7 @@ extension BrowserExtensions {
     func unregister(_ browser: BrowserModel) {
         if popupBrowser === browser { closePopup() }
         guard windows.contains(browser) else { return }
-        for tab in browser.allTabs { controller.didCloseTab(tab, windowIsClosing: true) }
+        for tab in browser.extensionTabs { controller.didCloseTab(tab, windowIsClosing: true) }
         controller.didCloseWindow(browser)
         windows.remove(browser)
         if focusedBrowser === browser { focusedBrowser = nil; controller.didFocusWindow(nil) }
@@ -315,22 +315,22 @@ extension BrowserExtensions {
     }
 
     func didOpen(_ tab: BrowserTab) {
-        guard let browser = tab.browser, windows.contains(browser) else { return }
+        guard tab.supportsExtensions, let browser = tab.browser, windows.contains(browser) else { return }
         controller.didOpenTab(tab)
     }
 
     func didClose(_ tab: BrowserTab) {
-        guard let browser = tab.browser, windows.contains(browser) else { return }
+        guard tab.supportsExtensions, let browser = tab.browser, windows.contains(browser) else { return }
         controller.didCloseTab(tab)
     }
 
     func didActivate(_ tab: BrowserTab, previous: BrowserTab?) {
-        guard let browser = tab.browser, windows.contains(browser) else { return }
-        controller.didActivateTab(tab, previousActiveTab: previous)
+        guard tab.supportsExtensions, let browser = tab.browser, windows.contains(browser) else { return }
+        controller.didActivateTab(tab, previousActiveTab: previous?.supportsExtensions == true ? previous : nil)
     }
 
     func didChange(_ properties: WKWebExtension.TabChangedProperties, for tab: BrowserTab) {
-        guard let browser = tab.browser, windows.contains(browser) else { return }
+        guard tab.supportsExtensions, let browser = tab.browser, windows.contains(browser) else { return }
         controller.didChangeTabProperties(properties, for: tab)
     }
 
@@ -360,7 +360,7 @@ extension BrowserExtensions {
             appearanceDefaults?.set(hex, forKey: Self.forcedDarkBackgroundKey)
         } else { appearanceDefaults?.removeObject(forKey: Self.forcedDarkBackgroundKey) }
         for browser in windows.allObjects {
-            for tab in browser.allTabs { if let webView = tab.webView { applyPageBackground(to: webView) } }
+            for tab in browser.extensionTabs { if let webView = tab.webView { applyPageBackground(to: webView) } }
         }
     }
 
@@ -403,7 +403,7 @@ extension BrowserExtensions {
             applyRules(to: controller)
         }
         for browser in windows.allObjects {
-            for tab in browser.allTabs { if let webView = tab.webView { updateRules(in: webView) } }
+            for tab in browser.extensionTabs { if let webView = tab.webView { updateRules(in: webView) } }
         }
     }
 
@@ -712,6 +712,7 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
         guard let browser = configuration.window as? BrowserModel ?? focusedBrowser ?? windows.allObjects.first else {
             throw ExtensionFailure("Open a browser window first.")
         }
+        guard browser.supportsExtensions else { throw ExtensionFailure("Extensions are available only in the Existing Profile. Select one of its Spaces first.") }
         let previous = browser.activeTabID
         let isExtensionPage = configuration.url?.scheme == context.baseURL.scheme
             && configuration.url?.host == context.baseURL.host
@@ -722,7 +723,7 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
         if let url = configuration.url { tab.load(url) }
         // Extension indices span the window; creation still belongs to its active Space.
         if configuration.index >= 0 {
-            let offset = browser.allTabs.firstIndex { $0.spaceID == browser.activeSpaceID } ?? 0
+            let offset = browser.extensionTabs.firstIndex { $0.spaceID == browser.activeSpaceID } ?? 0
             let localIndex = max(0, configuration.index - offset)
             if localIndex < browser.tabs.count { browser.moveTab(tab.id, to: localIndex) }
         }
@@ -743,6 +744,7 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
 
     func webExtensionController(_ controller: WKWebExtensionController, openOptionsPageFor context: WKWebExtensionContext) async throws {
         guard let url = context.optionsPageURL, let browser = focusedBrowser ?? windows.allObjects.first else { return }
+        guard browser.supportsExtensions else { throw ExtensionFailure("Select a Space in the Existing Profile to open extension options.") }
         browser.addTab(configuration: context.webViewConfiguration ?? BrowserTab.makeConfiguration(), focusAddress: false)
         browser.activeTab?.extensionOrigin = context.baseURL
         browser.activeTab?.load(url)
@@ -775,7 +777,7 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
     func webExtensionController(_ controller: WKWebExtensionController, presentActionPopup action: WKWebExtension.Action,
                                 for context: WKWebExtensionContext) async throws {
         guard let tab = action.associatedTab as? BrowserTab ?? focusedBrowser?.activeTab,
-              let browser = tab.browser, let view = tab.contentView.superview,
+              tab.supportsExtensions, let browser = tab.browser, let view = tab.contentView.superview,
               let window = view.window, let popover = action.popupPopover else {
             throw ExtensionFailure("The extension popup needs a visible browser tab.")
         }

@@ -39,10 +39,13 @@ final class BrowsingData {
     let history: HistoryStore
     let session: SessionStore
     @ObservationIgnored let dataStore: WKWebsiteDataStore
+    let includesSharedState: Bool
+    let profileID: UUID
     /// Sites with cookies, storage, or cache, sorted by name. Empty until `loadSiteRecords()`.
     private(set) var siteRecords: [WKWebsiteDataRecord] = []
     private(set) var hasLoadedSiteRecords = false
     @ObservationIgnored private let websiteDataOperations: WebsiteDataOperations
+    @ObservationIgnored private let ownershipResolver: SpaceSessionOwnershipResolver
     @ObservationIgnored private var hasRequestedSiteRecords = false
     @ObservationIgnored private var siteDataGeneration: UInt = 0
     @ObservationIgnored private var nextLoadSequence: UInt = 0
@@ -69,7 +72,12 @@ final class BrowsingData {
     }
 
     init(history: HistoryStore, session: SessionStore, dataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore,
-         websiteDataOperations: WebsiteDataOperations? = nil) {
+         websiteDataOperations: WebsiteDataOperations? = nil, includesSharedState: Bool = true,
+         profileID: UUID = BrowserProfile.defaultID,
+         ownershipResolver: @escaping SpaceSessionOwnershipResolver = BrowserSpaceStore.shared.owns) {
+        self.ownershipResolver = ownershipResolver
+        self.includesSharedState = includesSharedState
+        self.profileID = profileID
         self.history = history
         self.session = session
         self.dataStore = dataStore
@@ -83,13 +91,15 @@ final class BrowsingData {
             let start = range.start(now: now)
             if options.contains(.history) {
                 self.history.clear(range, now: now)
-                if range == .all { self.session.forgetClosedWindows() }
+                if range == .all {
+                    self.session.forgetClosedWindows(forProfileID: self.profileID, ownershipResolver: self.ownershipResolver)
+                }
             }
             let types = options.websiteDataTypes()
             if !types.isEmpty {
                 await self.websiteDataOperations.removeModifiedSince(types, start)
             }
-            if options.contains(.favicons) {
+            if options.contains(.favicons) && self.includesSharedState {
                 await FaviconStore.clear(since: start)
             }
         }

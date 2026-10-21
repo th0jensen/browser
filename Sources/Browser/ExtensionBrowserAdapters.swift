@@ -2,8 +2,9 @@ import AppKit
 import WebKit
 
 extension BrowserModel: WKWebExtensionWindow {
-    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { allTabs + (peek.map { [$0.tab] } ?? []) }
-    func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { peek?.tab ?? activeTab }
+    var extensionTabs: [BrowserTab] { (allTabs + (peek.map { [$0.tab] } ?? [])).filter(\.supportsExtensions) }
+    func tabs(for context: WKWebExtensionContext) -> [any WKWebExtensionTab] { extensionTabs }
+    func activeTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { supportsExtensions ? focusedPage : nil }
     func windowType(for context: WKWebExtensionContext) -> WKWebExtension.WindowType { .normal }
     func isPrivate(for context: WKWebExtensionContext) -> Bool { isPrivate }
     func focus(for context: WKWebExtensionContext) async throws {
@@ -14,7 +15,7 @@ extension BrowserModel: WKWebExtensionWindow {
 
 extension BrowserTab: WKWebExtensionTab {
     func window(for context: WKWebExtensionContext) -> (any WKWebExtensionWindow)? { browser }
-    func indexInWindow(for context: WKWebExtensionContext) -> Int { browser?.allTabs.firstIndex(where: { $0.id == id }) ?? browser?.allTabs.count ?? 0 }
+    func indexInWindow(for context: WKWebExtensionContext) -> Int { browser?.extensionTabs.firstIndex(where: { $0.id == id }) ?? browser?.extensionTabs.count ?? 0 }
     func parentTab(for context: WKWebExtensionContext) -> (any WKWebExtensionTab)? { openerID.flatMap { browser?.tabAcrossSpaces(withID: $0) } }
     func webView(for context: WKWebExtensionContext) -> WKWebView? { webView }
     func title(for context: WKWebExtensionContext) -> String? { title }

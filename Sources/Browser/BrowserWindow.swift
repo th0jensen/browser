@@ -10,7 +10,10 @@ private struct AddressBarFrameKey: PreferenceKey {
 }
 
 struct BrowserWindow: View {
-    let bookmarks: BookmarkStore
+    private let defaultBookmarks: BookmarkStore
+    private var bookmarks: BookmarkStore {
+        browser.spaces.profiles.resources(for: browser.profileID)?.bookmarks ?? defaultBookmarks
+    }
     let session: SessionStore?
     @Environment(BrowsingData.self) private var browsingData: BrowsingData?
     @Environment(\.openWindow) private var openWindow
@@ -76,7 +79,7 @@ struct BrowserWindow: View {
 
     init(bookmarks: BookmarkStore, downloads: DownloadManager, history: HistoryStore? = nil,
          session: SessionStore? = nil, isPrivate: Bool = false) {
-        self.bookmarks = bookmarks
+        self.defaultBookmarks = bookmarks
         self.session = session
         // StateObject constructs this once, before evaluating the window's first body.
         _windowState = StateObject(wrappedValue: BrowserWindowState(
@@ -87,7 +90,7 @@ struct BrowserWindow: View {
     }
 
     init(bookmarks: BookmarkStore, browser: BrowserModel, chromeHover: ChromeHoverController = ChromeHoverController(), persistsToolbarLayout: Bool = !BrowserProfile.isTesting) {
-        self.bookmarks = bookmarks
+        self.defaultBookmarks = bookmarks
         self.session = nil
         _windowState = StateObject(wrappedValue: BrowserWindowState(browser: browser))
         _chromeHover = State(initialValue: chromeHover)
@@ -156,7 +159,14 @@ struct BrowserWindow: View {
                 .privateChrome(browser.isPrivate)
         }
         .sheet(isPresented: $browser.isShowingClearData) {
-            if let browsingData { ClearDataView(data: browsingData) }
+            if browser.profileID != BrowserProfile.defaultID {
+                if let history = browser.history, let service = browser.sessionStore ?? session {
+                    ProfileClearDataView(history: history, dataStore: browser.websiteDataStore,
+                                         session: service, profileID: browser.profileID, spaces: browser.spaces)
+                } else {
+                    Text("Profile data clearing is not available in this window.").padding()
+                }
+            } else if !browser.isPrivate, let browsingData { ClearDataView(data: browsingData) }
         }
         .sheet(isPresented: $browser.isShowingHistory) {
             if let history = browser.history {
@@ -216,6 +226,7 @@ struct BrowserWindow: View {
         .navigationTitle(browser.isPrivate ? "Private — \(browser.activeTab?.title ?? "Browser")" : browser.activeTab?.title ?? "Browser")
         .frame(minWidth: 680, minHeight: 440)
         .toolbar(id: nativeToolbarIdentifier) { browserToolbar }
+        .environment(\.faviconContext, browser.faviconContext)
         .environment(\.chromeHoverController, chromeHover)
         .environment(\.windowChromePreferences, browser.chromePreferences)
         .toolbarBackgroundVisibility(.visible, for: .windowToolbar)
@@ -370,7 +381,7 @@ struct BrowserWindow: View {
         case "settings": toolbarComponent(.settings)
         case "newTab": toolbarComponent(.newTab)
         default:
-            if !browser.isPrivate, let item = BrowserExtensions.shared.toolbarExtensions.first(where: { "extension.\($0.id.uuidString)" == identifier }) {
+            if browser.supportsExtensions, let item = BrowserExtensions.shared.toolbarExtensions.first(where: { "extension.\($0.id.uuidString)" == identifier }) {
                 ExtensionButton(item: item, browser: browser)
             }
         }
@@ -605,7 +616,7 @@ struct BrowserWindow: View {
         ToolbarItem(id: "downloads", placement: .automatic) { toolbarComponent(.downloads) }
             .sharedBackgroundVisibility(.automatic)
         ToolbarSpacer(.fixed, placement: .automatic)
-        ForEach(browser.isPrivate ? [] : BrowserExtensions.shared.toolbarExtensions) { item in
+        ForEach(browser.supportsExtensions ? BrowserExtensions.shared.toolbarExtensions : []) { item in
             ToolbarItem(id: "extension.\(item.id.uuidString)", placement: .automatic) { ExtensionButton(item: item, browser: browser) }
                 .defaultCustomization(.hidden)
                 .sharedBackgroundVisibility(.automatic)

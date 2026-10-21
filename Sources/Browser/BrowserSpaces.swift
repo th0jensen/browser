@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// A navigation context, not a separate login. This release uses one existing profile.
+/// A visual navigation context. Spaces with the same profile share website data.
 struct BrowserSpace: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     var title: String
@@ -13,6 +13,7 @@ final class BrowserSpaceStore {
     static let defaultSpaceID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     static let shared = BrowserSpaceStore(directory: BrowserProfile.directory, enabled: !BrowserProfile.isTesting)
     private(set) var spaces: [BrowserSpace]
+    let profiles: BrowserProfileStore
     private let directory: URL
     private let enabled: Bool
     private var loadFailed = false
@@ -25,12 +26,13 @@ final class BrowserSpaceStore {
             switch self {
             case .unavailable: "The Spaces file could not be read. Keep the file for recovery before creating a Space."
             case .invalidName: "Enter a Space name."
-            case .unsupportedProfile: "This browser supports only the Existing Profile. Spaces share its login state."
+            case .unsupportedProfile: "The profile for this Space is not available. Its pages were not opened."
             }
         }
     }
 
-    init(directory: URL, enabled: Bool = true) {
+    init(directory: URL, enabled: Bool = true, profiles: BrowserProfileStore? = nil) {
+        self.profiles = profiles ?? BrowserProfileStore(directory: directory, enabled: enabled)
         self.directory = directory
         self.enabled = enabled
         let initial = BrowserSpace(id: Self.defaultSpaceID, title: "Default", profileID: BrowserProfile.defaultID)
@@ -41,20 +43,30 @@ final class BrowserSpaceStore {
             let saved = try JSONDecoder().decode([BrowserSpace].self, from: Data(contentsOf: file))
             var ids = Set<UUID>()
             // Do not reinterpret a foreign profile as the existing profile.
-            guard saved.allSatisfy({ $0.profileID == BrowserProfile.defaultID && ids.insert($0.id).inserted }),
-                  saved.contains(where: { $0.id == Self.defaultSpaceID }) else { throw Failure.unsupportedProfile }
+            guard saved.allSatisfy({ ids.insert($0.id).inserted }),
+                  saved.contains(where: { $0.id == Self.defaultSpaceID && $0.profileID == BrowserProfile.defaultID }) else { throw Failure.unsupportedProfile }
             spaces = saved
         } catch { loadFailed = true }
     }
 
     func space(_ id: UUID) -> BrowserSpace? { spaces.first { $0.id == id } }
 
+    /// Shared by restore and recovery deletion. A record cannot prove its own ownership.
+    func owns(_ session: SpaceSession) -> Bool {
+        profiles.profile(session.profileID) != nil && space(session.spaceID)?.profileID == session.profileID
+            && session.tabs.allSatisfy {
+                ($0.profileID == nil || $0.profileID == session.profileID)
+                    && ($0.spaceID == nil || $0.spaceID == session.spaceID)
+            }
+    }
+
     @discardableResult
-    func createSpace(title: String) throws -> BrowserSpace {
+    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID) throws -> BrowserSpace {
         guard !loadFailed else { throw Failure.unavailable }
+        guard profiles.profile(profileID) != nil else { throw Failure.unsupportedProfile }
         let title = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
         guard !title.isEmpty else { throw Failure.invalidName }
-        let space = BrowserSpace(id: UUID(), title: title, profileID: BrowserProfile.defaultID)
+        let space = BrowserSpace(id: UUID(), title: title, profileID: profileID)
         let next = spaces + [space]
         if enabled {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

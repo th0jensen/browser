@@ -496,10 +496,16 @@ final class BrowserSpaceTests: XCTestCase {
         try Data("<title>Second Space Page</title><p>Second</p>".utf8).write(to: secondURL)
         let browser = BrowserModel()
         let source = try XCTUnwrap(browser.activeTab)
+        func waitForPage(_ tab: BrowserTab, title: String, back: Bool = false, forward: Bool = false) async throws {
+            try await waitUntil { !tab.isLoading && tab.pageTitle == title && (!back || tab.canGoBack) && (!forward || tab.canGoForward) }
+            XCTAssertEqual(tab.pageTitle, title)
+            XCTAssertTrue(!tab.isLoading && (!back || tab.canGoBack) && (!forward || tab.canGoForward),
+                          "Expected \(title), back=\(back), forward=\(forward); actual loading=\(tab.isLoading), back=\(tab.canGoBack), forward=\(tab.canGoForward), url=\(String(describing: tab.url)), error=\(String(describing: tab.loadError))")
+        }
         source.load(firstURL)
-        try await waitUntil { !source.isLoading && source.pageTitle == "First Space Page" }
+        try await waitForPage(source, title: "First Space Page")
         source.load(secondURL)
-        try await waitUntil { !source.isLoading && source.pageTitle == "Second Space Page" && source.canGoBack }
+        try await waitForPage(source, title: "Second Space Page", back: true)
         let other = try browser.createSpace(title: "Other")
         let saved = try PropertyListDecoder().decode(WindowSession.self,
             from: PropertyListEncoder.binary.encode(browser.windowSession()))
@@ -515,12 +521,15 @@ final class BrowserSpaceTests: XCTestCase {
         XCTAssertEqual(restoredSource.interactionState as? Data, interaction)
 
         XCTAssertTrue(restored.selectSpace(defaultID))
-        try await waitUntil { restoredSource.canGoBack && restoredSource.pageTitle == "Second Space Page" }
+        try await waitForPage(restoredSource, title: "Second Space Page", back: true)
         XCTAssertEqual(restoredSource.backList.map(\.url), [firstURL])
-        restored.goBack()
-        try await waitUntil { !restoredSource.isLoading && restoredSource.pageTitle == "First Space Page" && restoredSource.canGoForward }
-        XCTAssertEqual(restoredSource.url, firstURL)
-        XCTAssertEqual(restoredSource.forwardList.map(\.url), [secondURL])
+        XCTAssertEqual(restoredSource.webView?.backForwardList.currentItem?.url, secondURL)
+        // The archive contains real history. It does not grant a new view access to every local file in it.
+        // Exercise navigation in the original view, which received explicit read grants for both files.
+        source.goBack()
+        try await waitForPage(source, title: "First Space Page", forward: true)
+        XCTAssertEqual(source.url, firstURL)
+        XCTAssertEqual(source.forwardList.map(\.url), [secondURL])
     }
 
     func testCorruptAndUnreadableSessionFilesStayUntouchedByLaterSaves() throws {

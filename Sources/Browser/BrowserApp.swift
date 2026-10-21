@@ -310,7 +310,7 @@ private struct BrowserCommands: Commands {
             }
             .disabled(session.reopenableWindows.isEmpty)
 
-            let recentVisits = history.recentVisits(limit: 15)
+            let recentVisits = browser?.history?.recentVisits(limit: 15) ?? []
             if !recentVisits.isEmpty {
                 Divider()
                 ForEach(recentVisits) { visit in
@@ -326,6 +326,7 @@ private struct BrowserCommands: Commands {
                 .disabled(browser == nil)
         }
         CommandMenu("Bookmarks") {
+            let bookmarks = browser?.spaces.profiles.resources(for: browser?.profileID ?? BrowserProfile.defaultID)?.bookmarks ?? bookmarks
             Button(bookmarks.isBookmarked(bookmarkableTab?.url) ? "Remove Bookmark" : "Bookmark This Page") {
                 guard let tab = bookmarkableTab, let url = tab.url else { return }
                 bookmarks.toggle(title: tab.pageTitle, url: url)

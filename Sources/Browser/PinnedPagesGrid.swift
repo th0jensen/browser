@@ -121,11 +121,13 @@ private struct PinnedPageTile: View {
             Button("Pin tab") { browser.finishDraggedTab(SidebarDragItem.essential(page.id).payload, over: SidebarDragItem.pinnedRoot.payload) }
             Button("Remove from Essential Tabs") { browser.unpin(page) }
         }
-        .task(id: page.url) {
+        .task(id: FaviconRequest(url: page.url, context: browser.faviconContext)) {
+            tint = .accentColor
             if let brand = WebsiteTint.brand(for: page.url) {
                 tint = brand
-            } else {
-                _ = await FaviconStore.icon(for: page.url)
+            } else if browser.faviconContext.remembersIcons {
+                _ = await FaviconStore.icon(for: page.url, context: browser.faviconContext)
+                guard !Task.isCancelled else { return }
                 if let host = page.url.host(), let entry = FaviconStore.cache.entry(forHost: host),
                    let image = FaviconData.image(from: entry.data), let color = WebsiteTint.dominant(in: image) {
                     tint = color

@@ -17,6 +17,24 @@ final class UpstreamIntegrationTests: XCTestCase {
         XCTAssertNil(configuration.webExtensionController, file: file, line: line)
     }
 
+    private func assertDefaultOwnershipMigration(_ migrated: WindowSession, from legacy: WindowSession,
+                                                 file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(migrated.activeSpaceID, BrowserSpaceStore.defaultSpaceID, file: file, line: line)
+        XCTAssertEqual(migrated.spaceSessions?.count, 1, file: file, line: line)
+        XCTAssertEqual(migrated.spaceSessions?.first?.tabs, migrated.tabs, file: file, line: line)
+        XCTAssertTrue(migrated.tabs.allSatisfy { $0.id != nil && $0.spaceID == BrowserSpaceStore.defaultSpaceID
+            && $0.profileID == BrowserProfile.defaultID }, file: file, line: line)
+        var normalized = migrated
+        normalized.activeSpaceID = nil
+        normalized.spaceSessions = nil
+        normalized.tabs = migrated.tabs.map { tab in
+            var tab = tab
+            tab.id = nil; tab.spaceID = nil; tab.profileID = nil
+            return tab
+        }
+        XCTAssertEqual(normalized, legacy, file: file, line: line)
+    }
+
     func testAnIsolatedNormalProfileStillRecordsItsSessionAndHistory() throws {
         let history = HistoryStore(file: nil)
         let normal = BrowserModel(history: history, websiteDataStore: .nonPersistent())
@@ -95,10 +113,11 @@ final class UpstreamIntegrationTests: XCTestCase {
 
         let normal = BrowserModel()
         XCTAssertEqual(sessions.attach(normal), 0)
-        XCTAssertEqual(normal.windowSession(), expected)
+        let migrated = normal.windowSession()
+        assertDefaultOwnershipMigration(migrated, from: expected)
         sessions.saveBeforeQuitting()
         let disk = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
-        XCTAssertEqual(disk.windows, [expected])
+        XCTAssertEqual(disk.windows, [migrated])
     }
 
     func testPrivateSavedPagesAndIntelligenceRemainWithinTheWindow() throws {
@@ -169,13 +188,14 @@ final class UpstreamIntegrationTests: XCTestCase {
         XCTAssertEqual(browser.tabs[2].temporarySection, section)
         XCTAssertEqual(browser.splits.first?.tabIDs, [browser.tabs[1].id, browser.tabs[0].id])
         XCTAssertEqual(browser.splits.first?.focusedID, browser.tabs[1].id)
-        XCTAssertEqual(browser.windowSession(), expected)
+        let migrated = browser.windowSession()
+        assertDefaultOwnershipMigration(migrated, from: expected)
 
         let file = StoreFile(url: directory.appending(path: "Session.plist"))
         let sessions = SessionStore(file: file)
         _ = sessions.attach(browser)
         sessions.saveBeforeQuitting()
         let onDisk = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
-        XCTAssertEqual(onDisk.windows, [expected])
+        XCTAssertEqual(onDisk.windows, [migrated])
     }
 }
