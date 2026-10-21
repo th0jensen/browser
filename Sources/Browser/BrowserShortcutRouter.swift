@@ -54,9 +54,10 @@ final class BrowserShortcutView: NSView {
         }
     }
 
-    private static func isBrowserCommand(_ event: NSEvent) -> Bool {
+    static func isBrowserCommand(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         switch event.charactersIgnoringModifiers?.lowercased() {
+        case "1", "2", "3", "4", "5", "6", "7", "8", "9": return modifiers == .control
         case "g": return modifiers == .command || modifiers == [.command, .option]
                 || modifiers == [.command, .option, .shift]
         case "l": return modifiers == .command || modifiers == [.command, .option]
