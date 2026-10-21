@@ -81,6 +81,55 @@ final class NativeAddressCompletionTests: XCTestCase {
         XCTAssertTrue(field.currentEditor() === editor)
     }
 
+    func testNativeEditorForwardsResultKeysButDoesNotInterceptMarkedText() async throws {
+        let fixture = NativeAddressFixture(completion: nil)
+        defer { fixture.close() }
+        try await waitFor("native address focus") { fixture.field?.currentEditor() != nil }
+        let field = try XCTUnwrap(fixture.field)
+        let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+        let coordinator = try XCTUnwrap(field.delegate as? AddressTextField.Coordinator)
+        let selectors: [Selector] = [#selector(NSResponder.moveDown(_:)), #selector(NSResponder.moveUp(_:)),
+                                     #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.cancelOperation(_:))]
+        for selector in selectors {
+            XCTAssertTrue(coordinator.control(field, textView: editor, doCommandBy: selector))
+        }
+        XCTAssertEqual(fixture.state.commands, [.moveDown, .moveUp, .submit, .cancel])
+        fixture.state.commands = []
+        editor.selectAll(nil)
+        editor.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: editor.selectedRange())
+        XCTAssertTrue(editor.hasMarkedText())
+        coordinator.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        XCTAssertTrue(fixture.state.edits.isEmpty, "Marked text must not generate completion or command results")
+        for selector in selectors {
+            XCTAssertFalse(coordinator.control(field, textView: editor, doCommandBy: selector))
+        }
+        XCTAssertTrue(fixture.state.commands.isEmpty)
+        field.updatePresentation(text: "Must not replace composition", url: nil, title: "", completionStart: 0)
+        XCTAssertEqual(editor.string, "に")
+        XCTAssertTrue(editor.hasMarkedText())
+        editor.insertText("日本語", replacementRange: editor.markedRange())
+        coordinator.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: field))
+        XCTAssertFalse(editor.hasMarkedText())
+        XCTAssertEqual(fixture.state.edits.last, "日本語")
+    }
+
+    func testNativeDeleteAndPasteKeepTheirExactText() async throws {
+        let fixture = NativeAddressFixture(completion: nil)
+        defer { fixture.close() }
+        try await waitFor("native address focus") { fixture.field?.currentEditor() != nil }
+        let editor = try XCTUnwrap(fixture.field?.currentEditor() as? NSTextView)
+        await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+        editor.selectAll(nil)
+        let pasted = "http://www.example.com:8765/Docs/?token=AbC#Part"
+        // insertText is the field editor's native insertion path for pasted plain text.
+        editor.insertText(pasted, replacementRange: editor.selectedRange())
+        try await waitFor("inserted address") { fixture.state.edits.last == pasted }
+        editor.deleteBackward(nil)
+        try await waitFor("deleted character") { fixture.state.edits.last == String(pasted.dropLast()) }
+        XCTAssertEqual(editor.string, String(pasted.dropLast()))
+        XCTAssertNil(fixture.state.completionStart)
+    }
+
     private func waitFor(_ description: String, timeout: Duration = .seconds(3),
                          file: StaticString = #filePath, line: UInt = #line,
                          _ condition: @MainActor () -> Bool) async throws {
@@ -107,6 +156,7 @@ private final class NativeAddressState {
     var appliedFocus = 0
     var bindingWrites: [String] = []
     var edits: [String] = []
+    var commands: [SuggestionAddressField.Command] = []
     let completion: String?
 
     init(completion: String?) { self.completion = completion }
@@ -132,6 +182,7 @@ private struct NativeAddressHost: View {
             state.text = $0
         }), requiresVisibleToolbar: false, pageURL: state.pageURL, pageTitle: state.pageTitle,
            completionStart: state.completionStart, onEdit: state.edit,
+           onCommand: { state.commands.append($0); return true },
            focusRequest: 1, onFocusApplied: { state.appliedFocus = $0 },
            onFocusChange: { _ in }, onSubmit: {})
             .frame(width: 540, height: 32)

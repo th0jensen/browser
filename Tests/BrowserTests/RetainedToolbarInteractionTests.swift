@@ -130,10 +130,12 @@ final class RetainedToolbarInteractionTests: XCTestCase {
         try await waitFor("updated native commands to become available again") { self.toolbarIsVisible(in: window) }
         let count = fixture.browser.tabs.count
         try nativeButton("newTab", in: window).performClick(nil)
-        try await waitFor("latest native new-tab action to add a tab and focus the editor") {
-            fixture.browser.tabs.count == count + 1 && self.addressField(in: window)?.currentEditor() != nil
+        try await waitFor("latest native new-tab action to open the centered palette") {
+            fixture.browser.commandPalette?.isPresented == true
+                && fixture.browser.commandPalette?.field.currentEditor() != nil
         }
-        XCTAssertTrue(fixture.browser.activeTab?.isNewTab == true)
+        XCTAssertEqual(fixture.browser.tabs.count, count, "Opening the palette must not create a phantom tab")
+        XCTAssertTrue(fixture.browser.activeTab === fixture.tab)
     }
 
     func testDetachingNativeCommandsRestoresCanonicalPaletteMetadataAndHosts() throws {
@@ -211,6 +213,113 @@ final class RetainedToolbarInteractionTests: XCTestCase {
         XCTAssertNil(fixture.tab.loadError)
         XCTAssertTrue(window.firstResponder === fixture.webView || (window.firstResponder as? NSView)?.isDescendant(of: fixture.webView) == true)
         assertFramesEqual(try frame(fixture.webView, in: window), pageFrame)
+    }
+
+    func testHostedCommandResultsKeepNativeKeysFocusAndExactTabSelection() async throws {
+        let fixture = try await fixture(layout: .vertical, compact: false)
+        defer { fixture.close() }
+        let browser = fixture.browser
+        let source = fixture.tab
+        let revision = source.navigationRevision
+        let sourceURL = source.url
+        let defaultSpace = browser.activeSpaceID
+
+        func edit(_ query: String) async throws -> (AddressField, NSTextView, AddressTextField.Coordinator) {
+            browser.requestAddressFocus()
+            try await waitFor("applied native address focus request") {
+                browser.consumedAddressFocusRequest == browser.addressFocusRequest
+                    && self.addressField(in: fixture.window)?.currentEditor() != nil
+            }
+            // Let AppKit complete its queued initial select-all before inserting text.
+            await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+            let field = try XCTUnwrap(addressField(in: fixture.window))
+            let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+            let coordinator = try XCTUnwrap(field.delegate as? AddressTextField.Coordinator)
+            editor.selectAll(nil)
+            editor.insertText(query, replacementRange: editor.selectedRange())
+            try await waitFor("typed local results") { coordinator.parent.suggestions.last?.action == .search(query) }
+            return (field, editor, coordinator)
+        }
+        func key(_ selector: Selector, _ field: AddressField, _ editor: NSTextView,
+                 _ coordinator: AddressTextField.Coordinator) {
+            XCTAssertTrue(coordinator.control(field, textView: editor, doCommandBy: selector),
+                          "Unhandled \(selector): results=\(coordinator.parent.suggestions.count), text=\(editor.string), marked=\(editor.hasMarkedText()), ownsEditor=\(field.currentEditor() === editor)")
+        }
+        let down = #selector(NSResponder.moveDown(_:))
+        let up = #selector(NSResponder.moveUp(_:))
+        let submit = #selector(NSResponder.insertNewline(_:))
+        let escape = #selector(NSResponder.cancelOperation(_:))
+
+        var (field, editor, coordinator) = try await edit("New Tab")
+        XCTAssertEqual(coordinator.parent.suggestions.first?.action, .command(.newTab))
+        XCTAssertNil(coordinator.parent.selectedSuggestion)
+        key(down, field, editor, coordinator)
+        try await waitFor("Down to select a typed command") { coordinator.parent.selectedSuggestion == 0 }
+        key(up, field, editor, coordinator)
+        try await waitFor("Up to restore unselected input") { coordinator.parent.selectedSuggestion == nil }
+        XCTAssertEqual(editor.string, "New Tab")
+        key(escape, field, editor, coordinator)
+        try await waitFor("first Escape to close results only") { coordinator.parent.suggestions.isEmpty }
+        XCTAssertTrue(fixture.window.firstResponder === editor)
+        key(escape, field, editor, coordinator)
+        try await waitFor("second Escape to restore page focus") { fixture.window.firstResponder === fixture.webView }
+        XCTAssertEqual(source.navigationRevision, revision)
+
+        (field, editor, coordinator) = try await edit("New Tab")
+        let initialCount = browser.allTabs.count
+        key(down, field, editor, coordinator)
+        try await waitFor("command highlight") { coordinator.parent.selectedSuggestion == 0 }
+        key(submit, field, editor, coordinator)
+        try await waitFor("New Tab command to request the native editor") {
+            browser.allTabs.count == initialCount + 1 && browser.activeTab?.isNewTab == true
+                && self.addressField(in: fixture.window)?.currentEditor() != nil
+                && fixture.window.firstResponder === self.addressField(in: fixture.window)?.currentEditor()
+        }
+        let blank = try XCTUnwrap(browser.activeTab)
+
+        // Select from New Tab, from another Space, and into a split. All three
+        // actions must focus the attached exact page without a duplicate or load.
+        for destination in 0..<3 {
+            if destination == 1 { _ = try browser.createSpace(title: "Command Work") }
+            if destination == 2 {
+                XCTAssertTrue(browser.makeSplit(source.id, with: blank.id))
+                browser.activeTabID = blank.id
+            }
+            let count = browser.allTabs.count
+            (field, editor, coordinator) = try await edit("Initial Toolbar Page")
+            guard case .switchTab(let target) = coordinator.parent.suggestions.first?.action else {
+                return XCTFail("Expected the source live tab")
+            }
+            XCTAssertEqual(target.id, source.id)
+            key(down, field, editor, coordinator)
+            try await waitFor("live tab highlight for destination \(destination)") { coordinator.parent.selectedSuggestion == 0 }
+            key(submit, field, editor, coordinator)
+            try await waitFor("exact page attachment and native focus") {
+                browser.activeTab === source && browser.focusedPage === source
+                    && fixture.webView.window === fixture.window && fixture.window.firstResponder === fixture.webView
+            }
+            XCTAssertEqual(browser.activeSpaceID, defaultSpace)
+            XCTAssertEqual(browser.allTabs.count, count)
+            XCTAssertEqual(source.url, sourceURL)
+            XCTAssertEqual(source.navigationRevision, revision)
+            if destination == 2 { XCTAssertEqual(browser.activeSplit?.focusedID, source.id) }
+        }
+
+        // Ordinary Return searches even when a command is the first result.
+        // Cancel transport so this keyboard regression test never contacts a search engine.
+        (field, editor, coordinator) = try await edit("New Tab")
+        XCTAssertEqual(coordinator.parent.suggestions.first?.action, .command(.newTab))
+        XCTAssertNil(coordinator.parent.selectedSuggestion)
+        let count = browser.allTabs.count
+        let searchURL = try XCTUnwrap(SearchEngine.current.searchURL(for: "New Tab"))
+        let original = try XCTUnwrap(fixture.webView.navigationDelegate)
+        let transport = SubmittedPageFixture(url: searchURL, original: original)
+        fixture.webView.navigationDelegate = transport
+        defer { fixture.webView.navigationDelegate = original }
+        key(submit, field, editor, coordinator)
+        try await waitFor("ordinary Return search") { transport.intercepted }
+        XCTAssertEqual(browser.allTabs.count, count)
+        XCTAssertTrue(browser.activeTab === source)
     }
 
     func testCombinedOverlaysReduceSidebarHeightAndKeepClicksInsideItsMeasuredWidth() async throws {

@@ -1,0 +1,1159 @@
+import AppKit
+import QuartzCore
+import SwiftUI
+
+enum CommandPaletteMode: Equatable, Sendable {
+    case newDestination
+    case editCurrentDestination
+
+    var menuTitle: String {
+        switch self {
+        case .newDestination: "New Tab"
+        case .editCurrentDestination: "Toggle Command Bar"
+        }
+    }
+}
+
+/// A page-area native container, not a second window. SwiftUI owns its placement;
+/// this representable owns every overlay child so glass can sample the source page.
+struct CommandPaletteHost: NSViewRepresentable {
+    let browser: BrowserModel
+    let bookmarks: BookmarkStore
+    let request: Int
+    let spaceID: UUID
+    let tabID: UUID?
+
+    func makeNSView(context: Context) -> CommandPaletteAnchor {
+        CommandPaletteAnchor(browser: browser, bookmarks: bookmarks)
+    }
+
+    func updateNSView(_ view: CommandPaletteAnchor, context: Context) {
+        view.update()
+    }
+
+    static func dismantleNSView(_ view: CommandPaletteAnchor, coordinator: ()) {
+        view.palette.dismiss(restoreFocus: false)
+    }
+}
+
+final class CommandPaletteAnchor: NSView {
+    let palette: CommandPaletteController
+    private weak var browser: BrowserModel?
+    private(set) var applied = 0
+
+    init(browser: BrowserModel, bookmarks: BookmarkStore) {
+        self.browser = browser
+        palette = CommandPaletteController(browser: browser, bookmarks: bookmarks)
+        super.init(frame: .zero)
+        palette.anchor = self
+        browser.commandPalette = palette
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        palette.isPresented ? super.hitTest(point) : nil
+    }
+
+    func update() {
+        DispatchQueue.main.async { [weak self] in self?.applyRequest() }
+    }
+
+    func applyRequest() {
+        // Read the live window intent. An earlier queued SwiftUI update must not
+        // reopen a bar that a second Cmd-G has already cancelled.
+        guard let browser else { return }
+        // Exit visuals do not own destination focus. Remove stale exit state
+        // even with an unconsumed close request, without cancelling that handoff.
+        if palette.exitingOverlay != nil, !palette.contextIsValid {
+            palette.finishExit(generation: palette.presentationGeneration)
+        }
+        if palette.isPresented, !palette.contextIsValid, browser.commandPaletteRequest == applied {
+            palette.dismiss(restoreFocus: false)
+        }
+        guard browser.commandPaletteRequest != applied else { return }
+        let request = browser.commandPaletteRequest
+        if !browser.commandPaletteWantsPresentation {
+            // A completed acceptance may already own a destination focus task.
+            // Consuming its closed request must not cancel that handoff.
+            if palette.isPresented { palette.dismiss() }
+            applied = request
+        } else if palette.present(mode: browser.commandPaletteMode) { applied = request }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { palette.dismiss(restoreFocus: false) }
+        else { DispatchQueue.main.async { [weak self] in self?.applyRequest() } }
+    }
+
+    override func layout() {
+        super.layout()
+        if browser?.commandPaletteRequest != applied { DispatchQueue.main.async { [weak self] in self?.applyRequest() } }
+        palette.layoutPresentation()
+    }
+}
+
+/// Local, synchronous results and a native field editor. Opening is side-effect
+/// free: a new tab is created only when a navigation/search action is accepted.
+@MainActor
+final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    weak var anchor: NSView?
+    private weak var browser: BrowserModel?
+    private let bookmarks: BookmarkStore
+    let field = AddressField()
+    let table = CommandPaletteTable()
+    private let scroll = CommandPaletteResultsScrollView()
+    private let content = CommandPaletteContent()
+    private let separator = NSBox()
+    private let symbol = NSImageView()
+    private(set) var glass: NSGlassEffectView?
+    private var overlay: CommandPaletteOverlay?
+    private(set) var results: [AddressResult] = []
+    private(set) var typedText = ""
+    private var prefilledSourceURL: URL?
+    private var currentSourceResultID: AddressResult.Action?
+    private var inputWasEdited = false
+    private var inputLeadingInset: CGFloat?
+    private(set) var completionStart: Int?
+    private weak var previousResponder: NSResponder?
+    private weak var sourceTab: BrowserTab?
+    private var sourceSpaceID: UUID?
+    private var sourceRevision = 0
+    private weak var sourceFocusedPage: BrowserTab?
+    private var focusedPageRevision = 0
+    private var sourcePeekID: UUID?
+    private(set) var mode: CommandPaletteMode = .newDestination
+    private var eventMonitor: Any?
+    private var observers: [NSObjectProtocol] = []
+    private var pendingMouseUp: NSEvent.EventType?
+    private var focusTask: Task<Void, Never>?
+    private(set) var exitingOverlay: NSView?
+    private var exitTask: Task<Void, Never>?
+    private(set) var presentationGeneration = 0
+    private var accessibilityObserver: NSObjectProtocol?
+    var reducePresentationMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    var isPresented: Bool { overlay != nil }
+    var contextIsValid: Bool {
+        guard let browser, !browser.isClosed else { return false }
+        return browser.activeTab === sourceTab && browser.activeSpaceID == sourceSpaceID
+            && (sourceTab?.navigationRevision ?? 0) == sourceRevision && browser.peek?.id == sourcePeekID
+            && browser.focusedPage === sourceFocusedPage
+            && (sourceFocusedPage?.navigationRevision ?? 0) == focusedPageRevision
+    }
+
+    init(browser: BrowserModel, bookmarks: BookmarkStore) {
+        self.browser = browser
+        self.bookmarks = bookmarks
+        super.init()
+        field.requiresVisibleToolbar = false
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = .systemFont(ofSize: 22)
+        field.alignment = .left
+        field.textColor = .labelColor
+        field.placeholderString = "Search or enter address"
+        field.usesSingleLineMode = true
+        field.cell?.isScrollable = true
+        field.cell?.wraps = false
+        field.delegate = self
+        field.identifier = .init("BrowserCommandPaletteInput")
+        field.setAccessibilityLabel("Command Bar, search or enter address")
+        field.target = self
+        field.action = #selector(submit)
+        symbol.image = CommandPaletteLayout.image("magnifyingglass")
+        symbol.identifier = .init("CommandPalette.icon")
+        symbol.imageScaling = .scaleNone
+        symbol.contentTintColor = .secondaryLabelColor
+        symbol.setAccessibilityElement(false)
+        separator.boxType = .separator
+        let column = NSTableColumn(identifier: .init("result"))
+        table.addTableColumn(column)
+        table.headerView = nil
+        // The palette supplies its own margins and fixed two-line rows. Inferred
+        // inset styles can add padding outside the manually sized viewport.
+        table.style = .plain
+        table.rowSizeStyle = .custom
+        table.rowHeight = CommandPaletteLayout.rowHeight
+        table.intercellSpacing = NSSize(width: 0, height: 1)
+        table.backgroundColor = .clear
+        table.selectionHighlightStyle = .none // The selected row owns its native glass pill.
+        table.allowsEmptySelection = true
+        table.allowsMultipleSelection = false
+        table.columnAutoresizingStyle = .noColumnAutoresizing
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.action = #selector(chooseClickedRow)
+        table.performCommand = { [weak self] in self?.perform($0) ?? false }
+        field.nextKeyView = table
+        table.nextKeyView = field
+        table.inputField = field
+        table.setAccessibilityLabel("Command Bar results")
+        scroll.documentView = table
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsetsZero
+        for view in [symbol, field, separator, scroll] { content.addSubview(view) }
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.reducePresentationMotion() else { return }
+                self.glass?.layer?.removeAnimation(forKey: CommandPaletteTransition.key)
+                self.finishExit(generation: self.presentationGeneration)
+            }
+        }
+    }
+
+    isolated deinit {
+        focusTask?.cancel()
+        exitTask?.cancel()
+        exitingOverlay?.removeFromSuperview()
+        overlay?.removeFromSuperview()
+        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    @discardableResult
+    func present(mode: CommandPaletteMode = .newDestination) -> Bool {
+        guard let browser, !browser.isClosed, let anchor, let window = anchor.window,
+              anchor.bounds.width > 0, anchor.bounds.height > 0,
+              window.attachedSheet == nil, NSApp.modalWindow == nil else { return false }
+        focusTask?.cancel()
+        if isPresented, contextIsValid {
+            if mode == .newDestination, self.mode == .newDestination {
+                window.makeFirstResponder(field)
+                field.selectText(nil)
+                layoutPresentation()
+            } else {
+                resetInput(mode: mode)
+                focusInput(in: window)
+            }
+            return true
+        }
+        if isPresented { dismiss(restoreFocus: false, updatesRequest: false) }
+        // Shared content must leave an old exit before a new glass adopts it.
+        finishExit(generation: presentationGeneration)
+        presentationGeneration += 1
+        removeEventMonitor()
+        if let peek = browser.peek { previousResponder = peek.tab.webView }
+        else { previousResponder = ((window.firstResponder as? NSTextView)?.delegate as? NSResponder) ?? window.firstResponder }
+        sourceTab = browser.activeTab
+        sourceSpaceID = browser.activeSpaceID
+        sourceRevision = sourceTab?.navigationRevision ?? 0
+        sourceFocusedPage = browser.focusedPage
+        focusedPageRevision = sourceFocusedPage?.navigationRevision ?? 0
+        sourcePeekID = browser.peek?.id
+        field.browserWindow = window
+        resetInput(mode: mode)
+        let overlay = CommandPaletteOverlay(frame: anchor.bounds)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.onLayout = { [weak self] in self?.layoutPresentation() }
+        overlay.onDismiss = { [weak self] in self?.dismiss() }
+        overlay.setAccessibilityRole(.group)
+        overlay.setAccessibilitySubrole(.dialog)
+        overlay.setAccessibilityLabel("Command Bar")
+        overlay.setAccessibilityModal(true)
+        let glass = NSGlassEffectView()
+        glass.style = .regular
+        glass.cornerRadius = 14
+        glass.contentView = content
+        glass.identifier = .init("BrowserCommandPaletteGlass")
+        overlay.addSubview(glass)
+        // Do not mutate NSHostingController.view's SwiftUI-managed subviews.
+        // The actual representable owns this native presentation subtree.
+        anchor.addSubview(overlay)
+        self.overlay = overlay
+        self.glass = glass
+        layoutPresentation()
+        installEvents(in: window)
+        focusInput(in: window)
+        if !reducePresentationMotion(), window.isVisible {
+            CommandPaletteTransition.animate(glass, appearing: true)
+        }
+        NSAccessibility.post(element: field, notification: .focusedUIElementChanged)
+        return true
+    }
+
+    private func focusInput(in window: NSWindow) {
+        window.makeFirstResponder(field)
+        field.selectText(nil)
+        if let editor = field.currentEditor() as? NSTextView {
+            editor.string = typedText
+            editor.setSelectedRange(NSRange(location: 0, length: typedText.utf16.count))
+            editor.scrollRangeToVisible(NSRange(location: 0, length: 0))
+            // Keep the native unscrolled drawing inset, not the document's
+            // changing position while the user scrolls a long URL horizontally.
+            inputLeadingInset = CommandPaletteLayout.leadingPoint(field).x
+        }
+        layoutPresentation()
+    }
+
+    private func resetInput(mode: CommandPaletteMode) {
+        (field.currentEditor() as? NSTextView)?.unmarkText()
+        self.mode = mode
+        prefilledSourceURL = mode == .editCurrentDestination ? sourceFocusedPage?.url : nil
+        typedText = prefilledSourceURL?.absoluteString ?? ""
+        inputWasEdited = false
+        completionStart = nil
+        field.updatePresentation(text: typedText, url: nil, title: "")
+        refreshResults()
+    }
+
+    func dismiss(restoreFocus: Bool = true, updatesRequest: Bool = true) {
+        focusTask?.cancel()
+        if updatesRequest { browser?.commandPaletteDidDismiss(self) }
+        guard let overlay else {
+            if !restoreFocus { finishExit(generation: presentationGeneration) }
+            return
+        }
+        let window = overlay.window
+        if let editor = field.currentEditor() as? NSTextView { editor.unmarkText() }
+        if field.currentEditor() != nil || window?.firstResponder === table { window?.makeFirstResponder(nil) }
+        let closingGlass = glass
+        self.overlay = nil // Logical close, hit testing, and actions end now, not after animation.
+        glass = nil
+        overlay.onDismiss = nil
+        overlay.onLayout = nil
+        overlay.isInteractive = false
+        overlay.setAccessibilityModal(false)
+        overlay.setAccessibilityHidden(true)
+        results = []
+        table.deselectAll(nil)
+        exitingOverlay = overlay
+        presentationGeneration += 1
+        let generation = presentationGeneration
+        if restoreFocus, contextIsValid, !reducePresentationMotion(), window?.isVisible == true, let closingGlass {
+            CommandPaletteTransition.animate(closingGlass, appearing: false)
+            exitTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(CommandPaletteTransition.closeDuration))
+                guard !Task.isCancelled else { return }
+                self?.finishExit(generation: generation)
+            }
+        } else { finishExit(generation: generation) }
+        typedText = ""
+        prefilledSourceURL = nil
+        currentSourceResultID = nil
+        inputLeadingInset = nil
+        completionStart = nil
+        if pendingMouseUp == nil { removeEventMonitor() }
+        guard restoreFocus, contextIsValid, let window else { return }
+        if let view = previousResponder as? NSView, view.window === window {
+            window.makeFirstResponder(view)
+        } else if let browser { focusTask = AddressResults.focusDestination(in: browser) }
+        previousResponder = nil
+    }
+
+    /// Generation-bound cleanup is also used by reopen, teardown, and Reduce Motion.
+    /// It never changes focus or the current logical presentation.
+    func finishExit(generation: Int) {
+        guard generation == presentationGeneration, let exitingOverlay else { return }
+        exitTask?.cancel()
+        exitTask = nil
+        for child in exitingOverlay.subviews {
+            child.layer?.removeAnimation(forKey: CommandPaletteTransition.key)
+            (child as? NSGlassEffectView)?.contentView = nil
+        }
+        exitingOverlay.removeFromSuperview()
+        self.exitingOverlay = nil
+        table.reloadData()
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+        observers = []
+    }
+
+    /// The reference centers the palette horizontally, slightly above the page's
+    /// midpoint. Its input dominates; results scroll rather than growing offscreen.
+    func layoutPresentation() {
+        guard let anchor, let overlay, let glass, let root = overlay.superview else { return }
+        if overlay.frame != root.bounds { overlay.frame = root.bounds }
+        let area = overlay.convert(anchor.bounds, from: anchor).intersection(overlay.bounds)
+        guard area.width > 0, area.height > 0 else { return }
+        let width = min(720, min(max(280, area.width * 0.78), max(0, area.width - 32)))
+        let rowsHeight = table.rowsHeight
+        let resultHeight = results.isEmpty ? 0 : min(rowsHeight, min(336, max(table.rowHeight, area.height - 160)))
+        let height = results.isEmpty ? 64 : 80 + resultHeight
+        let centerY = area.midY + min(60, area.height * 0.08)
+        let y = max(area.minY + 16, min(centerY - height / 2, area.maxY - height - 16))
+        let frame = NSRect(x: area.midX - width / 2, y: y, width: width, height: height)
+        if glass.frame != frame {
+            // A resize or changed result count must not keep a transform about
+            // the old card centre. Routine layout does not restart the entrance.
+            glass.layer?.removeAnimation(forKey: CommandPaletteTransition.key)
+            glass.frame = frame
+        }
+        content.frame = NSRect(origin: .zero, size: glass.bounds.size)
+        separator.frame = NSRect(x: 12, y: 64, width: max(0, width - 24), height: 1)
+        scroll.frame = NSRect(x: CommandPaletteLayout.resultsInset, y: 72,
+                              width: max(0, width - 2 * CommandPaletteLayout.resultsInset), height: resultHeight)
+        table.setFrameSize(NSSize(width: table.frame.width, height: rowsHeight))
+        scroll.tile()
+        scroll.layoutSubtreeIfNeeded()
+        content.leadingAdjustment = max(0, scroll.readableContentBounds.minX - scroll.contentView.bounds.minX)
+        CommandPaletteLayout.place(symbol, center: NSPoint(x: CommandPaletteLayout.iconCenterX + content.leadingAdjustment, y: 32))
+        let textX = CommandPaletteLayout.textX + content.leadingAdjustment
+        CommandPaletteLayout.place(field, textX: textX,
+                                   baselineY: 32 + (field.font?.capHeight ?? 0) / 2,
+                                   width: max(0, width - textX - CommandPaletteLayout.inset), leadingInset: inputLeadingInset)
+        separator.isHidden = results.isEmpty
+        scroll.isHidden = results.isEmpty
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard isPresented, notification.object as? NSTextField === field else { return }
+        guard let editor = field.currentEditor() as? NSTextView else { return }
+        if editor.hasMarkedText() {
+            results = []
+            table.reloadData()
+            layoutPresentation()
+            return
+        }
+        let text = editor.string
+        let appending = text.count > typedText.count && text.hasPrefix(typedText)
+        if text != typedText { inputWasEdited = true }
+        typedText = text
+        refreshResults()
+        if appending, let completion = AddressSuggestions.inlineCompletion(of: text, with: results.first?.completionSuggestion) {
+            completionStart = text.utf16.count
+            field.updatePresentation(text: completion, url: nil, title: "", completionStart: completionStart)
+        } else {
+            completionStart = nil
+            field.updatePresentation(text: text, url: nil, title: "")
+        }
+    }
+
+    private func refreshResults() {
+        guard let browser else { return }
+        results = AddressResults.results(for: typedText, browser: browser, bookmarks: bookmarks.bookmarks, includesTypedAddress: true)
+        currentSourceResultID = nil
+        if !inputWasEdited, let url = prefilledSourceURL, typedText == url.absoluteString, let source = sourceFocusedPage {
+            // This is a checked current-source intent, not permission to parse
+            // arbitrary typed schemes. It also outranks matching *other* tabs.
+            let current = AddressResult(owner: ObjectIdentifier(browser), action: .navigate(url), title: source.title,
+                                        detail: url.absoluteString,
+                                        destinationSpace: browser.isPrivate ? "Private Window" : browser.spaces.space(browser.activeSpaceID)?.title)
+            currentSourceResultID = current.id
+            results.removeAll { $0.id == current.id }
+            results.insert(current, at: 0)
+            if results.count > 8, let index = results.lastIndex(where: {
+                if case .search = $0.action { return false }
+                return true
+            }) {
+                // The shared builder reserves explicit Search. Keep that slot
+                // when current-source intent displaces a lower-ranked match.
+                results.remove(at: index)
+            }
+        }
+        table.reloadData()
+        if !results.isEmpty { table.selectInitialResult() }
+        else { table.deselectAll(nil) }
+        layoutPresentation()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        guard !textView.hasMarkedText() else { return false }
+        switch selector {
+        case #selector(NSResponder.insertTab(_:)), #selector(NSResponder.insertBacktab(_:)):
+            return field.window?.makeFirstResponder(table) ?? false
+        case #selector(NSResponder.moveDown(_:)): return perform(.moveDown)
+        case #selector(NSResponder.moveUp(_:)): return perform(.moveUp)
+        case #selector(NSResponder.insertNewline(_:)): return perform(.submit)
+        case #selector(NSResponder.cancelOperation(_:)): return perform(.cancel)
+        default: return false
+        }
+    }
+
+    @discardableResult
+    func perform(_ command: SuggestionAddressField.Command) -> Bool {
+        guard isPresented else { return false }
+        switch command {
+        case .cancel: dismiss()
+        case .submit: acceptSelectedResult()
+        case .moveDown, .moveUp:
+            guard !results.isEmpty else { return true }
+            let offset = command == .moveDown ? 1 : -1
+            let row = min(max(0, table.selectedRow + offset), results.count - 1)
+            if row != table.selectedRow { completionStart = nil }
+            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            table.scrollRowToVisible(row)
+        }
+        return true
+    }
+
+    @objc private func submit() { acceptSelectedResult() }
+    @objc private func chooseClickedRow() {
+        guard table.clickedRow >= 0 else { return }
+        acceptSelectedResult(acceptCompletion: false)
+    }
+
+    func acceptSelectedResult(acceptCompletion: Bool = true) {
+        guard isPresented, (field.currentEditor() as? NSTextView)?.hasMarkedText() != true else { return }
+        guard contextIsValid, let browser else { dismiss(restoreFocus: false); return }
+        guard results.indices.contains(table.selectedRow) else { return }
+        let result = results[table.selectedRow]
+        let displayedText = field.currentEditor()?.string ?? field.stringValue
+        if !inputWasEdited, result.id == currentSourceResultID, let url = prefilledSourceURL,
+           displayedText == url.absoluteString, let source = sourceFocusedPage, source.url == url {
+            guard source.browser === browser, source.spaceID == sourceSpaceID,
+                  browser.spaces.space(source.spaceID)?.profileID == source.profileID,
+                  (browser.tabAcrossSpaces(withID: source.id) === source || browser.peek?.tab === source),
+                  browser.websiteDataStore(forProfileID: source.profileID) != nil else {
+                dismiss(restoreFocus: false)
+                return
+            }
+            // The unchanged current URL means return to this exact live page.
+            // Retain its document/form state, for HTTP and unsupported schemes
+            // alike. No reload, search, tab switch, or broad scheme allowance.
+            dismiss()
+            return
+        }
+        // Other selected rows are explicit actions, even without a text edit.
+        // A completion's visible host may be shorter than its history resource.
+        // Return accepts that exact completion; explicit row clicks accept the row.
+        var accepted = result
+        if acceptCompletion, completionStart != nil, table.selectedRow == 0,
+           let url = AddressSuggestions.completedURL(for: displayedText, with: result.completionSuggestion) {
+            accepted = AddressResult(owner: result.owner, action: .navigate(url), title: result.title,
+                                     detail: result.detail, destinationSpace: result.destinationSpace)
+        }
+        guard AddressResults.execute(accepted, in: browser, inNewTab: mode == .newDestination,
+                                     navigationSource: mode == .editCurrentDestination ? sourceFocusedPage : nil) else {
+            completionStart = nil
+            refreshResults()
+            return
+        }
+        dismiss(restoreFocus: false)
+        focusTask = AddressResults.focusDestination(in: browser)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { results.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard results.indices.contains(row) else { return nil }
+        let cell = (tableView.makeView(withIdentifier: .init("CommandResult"), owner: nil) as? CommandPaletteResultCell)
+            ?? CommandPaletteResultCell()
+        let favicon = contextIsValid ? browser.flatMap {
+            CommandPaletteFavicon.image(for: results[row], in: $0, source: sourceFocusedPage)
+        } : nil
+        cell.update(results[row], selected: tableView.isRowSelected(row), reference: content, favicon: favicon)
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        table.updateSelection(animated: true)
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        let view = CommandPaletteResultRow()
+        view.isSelected = tableView.isRowSelected(row)
+        return view
+    }
+
+    private func installEvents(in window: NSWindow) {
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+                                                                  .otherMouseDown, .otherMouseUp, .scrollWheel, .keyDown]) { [weak self] event in
+            let consumed = MainActor.assumeIsolated {
+                guard let self else { return false }
+                return self.handle(event) == nil
+            }
+            return consumed ? nil : event
+        }
+        for (name, object) in [(NSWindow.didResignKeyNotification, window as AnyObject),
+                               (NSWindow.willCloseNotification, window as AnyObject),
+                               (NSApplication.didResignActiveNotification, NSApp as AnyObject)] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dismiss(restoreFocus: false) }
+            })
+        }
+    }
+
+    /// Consume both edges of an outside click. Removing the overlay on mouse-down
+    /// must not deliver the matching mouse-up to the source webpage or toolbar.
+    func handle(_ event: NSEvent) -> NSEvent? {
+        if event.type == pendingMouseUp {
+            pendingMouseUp = nil
+            if !isPresented { removeEventMonitor() }
+            return nil
+        }
+        guard isPresented, let window = overlay?.window else { return event }
+        let isToolbar = window.toolbar?.items.contains { $0.view?.window === event.window } == true
+        guard event.window === window || isToolbar else { return event }
+        if event.type == .keyDown {
+            let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            if event.charactersIgnoringModifiers == "w", modifiers == .command { dismiss(); return nil }
+            return event // Native marked-text and result-key handling stays with the field editor.
+        }
+        guard let glass, let sourceWindow = event.window else { return event }
+        let point = window.convertPoint(fromScreen: sourceWindow.convertPoint(toScreen: event.locationInWindow))
+        guard !glass.bounds.contains(glass.convert(point, from: nil)) else { return event }
+        switch event.type {
+        case .leftMouseDown: pendingMouseUp = .leftMouseUp
+        case .rightMouseDown: pendingMouseUp = .rightMouseUp
+        case .otherMouseDown: pendingMouseUp = .otherMouseUp
+        case .scrollWheel: return nil
+        default: return event
+        }
+        dismiss()
+        return nil
+    }
+
+    private func removeEventMonitor() {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
+        eventMonitor = nil
+        pendingMouseUp = nil
+    }
+}
+
+/// Palette-local snapshots only: no disk reads, requests, WebKit allocation, or
+/// asynchronous cell mutation. Newly loaded icons appear on the next result
+/// refresh or reopen. The shared favicon store retains its existing clear/bounds.
+@MainActor
+enum CommandPaletteFavicon {
+    static func snapshot(for result: AddressResult, in browser: BrowserModel, source: BrowserTab? = nil,
+                         cachedIcon: (URL?) -> Image? = { FaviconStore.cachedIcon(for: $0) }) -> Image? {
+        guard result.owner == ObjectIdentifier(browser), !browser.isClosed,
+              browser.profileID == BrowserProfile.defaultID else { return nil }
+        let tabs = browser.isPrivate || browser.isExtensionWindow ? browser.tabs : browser.allTabs
+        func owned(_ tab: BrowserTab) -> Bool {
+            tab.browser === browser && tab.profileID == browser.profileID
+                && browser.spaces.space(tab.spaceID)?.profileID == tab.profileID
+                && (tabs.contains(where: { $0 === tab }) || browser.peek?.tab === tab)
+        }
+        func webURL(_ url: URL?) -> Bool {
+            guard let url else { return false }
+            return ["http", "https"].contains(url.scheme?.lowercased() ?? "") && url.host() != nil
+        }
+        let url: URL
+        switch result.action {
+        case .switchTab(let destination):
+            guard let tab = tabs.first(where: { $0.id == destination.id }), owned(tab),
+                  ObjectIdentifier(tab) == destination.instance, tab.spaceID == destination.spaceID,
+                  tab.profileID == destination.profileID, let pageURL = tab.url, webURL(pageURL) else { return nil }
+            if let favicon = tab.favicon { return favicon }
+            url = pageURL
+        case .navigate(let pageURL): url = pageURL
+        case .openURL(let page):
+            guard !browser.isPrivate, !browser.isExtensionWindow else { return nil }
+            url = page.url
+        case .openSavedPage(let id, let spaceID, let kind, let pageURL):
+            guard !browser.isPrivate, !browser.isExtensionWindow,
+                  browser.spaces.space(spaceID)?.profileID == browser.profileID else { return nil }
+            switch kind {
+            case .folderPage:
+                guard let page = browser.folders(forSpaceID: spaceID).item(id), page.kind == .page,
+                      page.url == pageURL else { return nil }
+            case .essential:
+                guard browser.pinnedPages(forSpaceID: spaceID).items.contains(where: { $0.id == id && $0.url == pageURL }) else { return nil }
+            }
+            url = pageURL
+        case .command, .switchSpace, .search: return nil
+        }
+        guard webURL(url) else { return nil }
+        if let source, source.url == url, owned(source), let favicon = source.favicon { return favicon }
+        if let tab = tabs.first(where: { $0.url == url && owned($0) && $0.favicon != nil }) { return tab.favicon }
+        // Existing Profile is the only normal profile on this branch. Future
+        // Profiles integration must replace this gate with a profile-owned store;
+        // never retarget this global cache to a foreign/private/extension owner.
+        guard !browser.isPrivate, !browser.isExtensionWindow else { return nil }
+        return cachedIcon(url)
+    }
+
+    static func image(for result: AddressResult, in browser: BrowserModel, source: BrowserTab?) -> NSImage? {
+        guard let snapshot = snapshot(for: result, in: browser, source: source) else { return nil }
+        let renderer = ImageRenderer(content: snapshot.resizable().aspectRatio(contentMode: .fit).frame(width: 16, height: 16))
+        renderer.scale = 2
+        guard let image = renderer.nsImage else { return nil }
+        image.isTemplate = false
+        return image
+    }
+}
+
+/// Only the outer card appears/disappears. Row selection has a separate lifetime.
+/// Explicit layer transforms preserve the native view frame, anchor, and editor.
+@MainActor
+enum CommandPaletteTransition {
+    static let key = "CommandPalette.presentation"
+    static let openDuration = 0.12
+    static let closeDuration = 0.08
+    static let scale: CGFloat = 0.985
+
+    static func centeredTransform(in layer: CALayer) -> CATransform3D {
+        var transform = CATransform3DMakeScale(scale, scale, 1)
+        transform.m41 = (1 - scale) * layer.bounds.width * (0.5 - layer.anchorPoint.x)
+        transform.m42 = (1 - scale) * layer.bounds.height * (0.5 - layer.anchorPoint.y)
+        return transform
+    }
+
+    static func animate(_ glass: NSGlassEffectView, appearing: Bool) {
+        glass.wantsLayer = true
+        guard let layer = glass.layer else { return }
+        let displayed = layer.presentation()
+        let opacity = CABasicAnimation(keyPath: "opacity")
+        opacity.fromValue = appearing ? 0 : (displayed?.opacity ?? 1)
+        opacity.toValue = appearing ? 1 : 0
+        let transform = CABasicAnimation(keyPath: "transform")
+        transform.fromValue = NSValue(caTransform3D: appearing ? centeredTransform(in: layer) : (displayed?.transform ?? CATransform3DIdentity))
+        transform.toValue = NSValue(caTransform3D: appearing ? CATransform3DIdentity : centeredTransform(in: layer))
+        let group = CAAnimationGroup()
+        group.animations = [opacity, transform]
+        group.duration = appearing ? openDuration : closeDuration
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = appearing ? 1 : 0
+        layer.transform = CATransform3DIdentity
+        layer.add(group, forKey: key) // Replace; never queue or change the view's anchor.
+        CATransaction.commit()
+    }
+}
+
+/// Palette-only guides. Native cell insets and the live field-editor baseline
+/// are measured rather than treating different controls' outer frames as text.
+@MainActor
+enum CommandPaletteLayout {
+    static let inset: CGFloat = 18
+    static let rowHeight: CGFloat = 42
+    static let resultsInset: CGFloat = 8
+    static let selectionInset: CGFloat = 4
+    static let selectionVerticalInset: CGFloat = 1
+    static let iconToText: CGFloat = 20
+    // Icons sit at the leading cap's centre; Return sits at the trailing cap's
+    // centre. Header and row text share the same guide, not unrelated padding.
+    static let iconCenterX = resultsInset + selectionInset + (rowHeight - 2 * selectionVerticalInset) / 2
+    static let textX = iconCenterX + iconToText
+
+    static func image(_ name: String) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+    }
+
+    static func leadingPoint(_ field: NSTextField) -> NSPoint {
+        if let editor = field.currentEditor() as? NSTextView {
+            let x = editor.bounds.minX + editor.textContainerOrigin.x + (editor.textContainer?.lineFragmentPadding ?? 0)
+            return field.convert(NSPoint(x: x, y: editor.bounds.minY), from: editor)
+        }
+        let rect = field.cell?.titleRect(forBounds: field.bounds) ?? field.bounds
+        return NSPoint(x: rect.minX, y: rect.minY)
+    }
+
+    static func baselinePoint(_ field: NSTextField) -> NSPoint {
+        if let editor = field.currentEditor() as? NSTextView,
+           let layout = editor.layoutManager, let container = editor.textContainer {
+            layout.ensureLayout(for: container)
+            let range = layout.glyphRange(for: container)
+            if range.length > 0 {
+                let fragment = layout.lineFragmentRect(forGlyphAt: range.location, effectiveRange: nil)
+                let location = layout.location(forGlyphAt: range.location)
+                return field.convert(NSPoint(x: editor.textContainerOrigin.x + fragment.minX + location.x,
+                                             y: editor.textContainerOrigin.y + fragment.minY + location.y), from: editor)
+            }
+        }
+        let y = field.isFlipped ? field.bounds.minY + field.firstBaselineOffsetFromTop
+            : field.bounds.maxY - field.firstBaselineOffsetFromTop
+        return NSPoint(x: field.bounds.minX, y: y)
+    }
+
+    static func place(_ field: NSTextField, textX: CGFloat, baselineY: CGFloat, width: CGFloat, leadingInset: CGFloat? = nil) {
+        let height = ceil(max(field.intrinsicContentSize.height, field.cell?.cellSize.height ?? 0))
+        field.setFrameSize(NSSize(width: max(0, width), height: max(1, height)))
+        let cellRect = field.cell?.titleRect(forBounds: field.bounds) ?? field.bounds
+        let extraWidth = cellRect.minX - field.bounds.minX + field.bounds.maxX - cellRect.maxX
+        field.setFrameSize(NSSize(width: max(0, width + extraWidth), height: field.frame.height))
+        guard let parent = field.superview else { return }
+        let leading = parent.convert(leadingInset.map { NSPoint(x: $0, y: 0) } ?? leadingPoint(field), from: field)
+        let baseline = parent.convert(baselinePoint(field), from: field)
+        field.setFrameOrigin(NSPoint(x: field.frame.minX + textX - leading.x,
+                                     y: field.frame.minY + baselineY - baseline.y))
+    }
+
+    static func place(_ view: NSImageView, center: NSPoint) {
+        guard let image = view.image else { view.frame = .zero; return }
+        let alignment = image.alignmentRect
+        let y = view.superview?.isFlipped == true ? image.size.height - alignment.midY : alignment.midY
+        view.frame = NSRect(x: center.x - alignment.midX, y: center.y - y,
+                            width: image.size.width, height: image.size.height)
+    }
+}
+
+private final class CommandPaletteContent: NSView {
+    var leadingAdjustment: CGFloat = 0
+    override var isFlipped: Bool { true }
+}
+
+private final class CommandPaletteOverlay: NSView {
+    var onDismiss: (() -> Void)?
+    var onLayout: (() -> Void)?
+    var isInteractive = true
+    override func hitTest(_ point: NSPoint) -> NSView? { isInteractive ? super.hitTest(point) : nil }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func layout() { super.layout(); onLayout?() }
+    private func dismissOutside(_ event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if !subviews.contains(where: { $0.frame.contains(point) }) { onDismiss?() }
+    }
+    override func mouseDown(with event: NSEvent) { dismissOutside(event) }
+    override func rightMouseDown(with event: NSEvent) { dismissOutside(event) }
+    override func otherMouseDown(with event: NSEvent) { dismissOutside(event) }
+    override func scrollWheel(with event: NSEvent) {}
+}
+
+/// Size against the laid-out clip view, not the scroll view's nominal content
+/// size. Overlay scrollers occupy real pixels too; reserve their measured overlap
+/// only when the list actually overflows. Legacy scrollers already reduce the clip.
+final class CommandPaletteResultsScrollView: NSScrollView {
+    override func tile() {
+        super.tile()
+        fitResultColumn()
+    }
+
+    override func layout() {
+        super.layout()
+        fitResultColumn()
+    }
+
+    var readableContentBounds: NSRect {
+        var rect = contentView.bounds
+        if let table = documentView as? CommandPaletteTable, table.rowsHeight > rect.height,
+           let scroller = verticalScroller, !scroller.isHidden {
+            let overlap = contentView.convert(scroller.bounds, from: scroller).intersection(rect)
+            if !overlap.isNull, overlap.width > 0 {
+                if overlap.midX > rect.midX { rect.size.width = max(0, overlap.minX - rect.minX) }
+                else {
+                    let end = rect.maxX
+                    rect.origin.x = overlap.maxX
+                    rect.size.width = max(0, end - rect.minX)
+                }
+            }
+        }
+        return rect
+    }
+
+    private func fitResultColumn() {
+        guard let table = documentView as? CommandPaletteTable else { return }
+        let canvasWidth = contentView.bounds.width
+        let columnWidth = readableContentBounds.width
+        // NSTableView's document canvas fills the clip even when its single
+        // column is narrower. Keep the measured overlay-scroller gutter in the
+        // column, rather than fighting AppKit's minimum document width.
+        if table.frame.width != canvasWidth { table.setFrameSize(NSSize(width: canvasWidth, height: table.frame.height)) }
+        let width = max(0, columnWidth)
+        if table.tableColumns.first?.width != width { table.tableColumns.first?.width = width }
+        let readable = readableContentBounds
+        table.selectionViewportDidChange(NSRect(x: readable.minX, y: 0,
+                                                width: readable.width, height: contentView.bounds.height))
+    }
+}
+
+final class CommandPaletteTable: NSTableView {
+    /// One persistent material and Return affordance travel together, behind all
+    /// native rows. Reusing rows never creates another selection surface.
+    let selectionGlass = CommandPaletteSelectionGlass()
+    private(set) var selectionTargetFrame: NSRect?
+    private(set) var isSelectionAnimating = false
+    private var selectionRow = -1
+    private var selectionViewport: NSRect?
+    private var motionGeneration = 0
+    private var suppressSelectionMotion = false
+    private var accessibilityObserver: NSObjectProtocol?
+    var reduceSelectionMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    /// Includes native row origins and intercell spacing.
+    var rowsHeight: CGFloat { numberOfRows == 0 ? 0 : rect(ofRow: numberOfRows - 1).maxY }
+    var performCommand: ((SuggestionAddressField.Command) -> Bool)?
+    weak var inputField: NSTextField?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        addSubview(selectionGlass, positioned: .below, relativeTo: nil)
+        accessibilityObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateSelection(animated: false) }
+        }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    isolated deinit {
+        if let accessibilityObserver { NSWorkspace.shared.notificationCenter.removeObserver(accessibilityObserver) }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        updateSelection(animated: false)
+    }
+
+    override func layout() {
+        super.layout()
+        // A native selection change can lay out rows before its delegate fires.
+        // Do not snap to that new row ahead of the animated selection update.
+        if selectionRow == selectedRow || selectionGlass.isHidden { updateSelection(animated: false) }
+    }
+
+    override func reloadData() {
+        stopSelectionMotion()
+        suppressSelectionMotion = true
+        super.reloadData()
+        suppressSelectionMotion = false
+        updateSelection(animated: false)
+        // AppKit can restore cached native row selection after reloadData's
+        // immediate pass. Reconcile once it has attached the replacement rows.
+        let generation = motionGeneration
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.motionGeneration == generation else { return }
+            self.updateSelection(animated: false)
+        }
+    }
+
+    func selectInitialResult() {
+        suppressSelectionMotion = true
+        selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        suppressSelectionMotion = false
+        updateSelection(animated: false)
+    }
+
+    override func selectRowIndexes(_ indexes: IndexSet, byExtendingSelection extend: Bool) {
+        super.selectRowIndexes(indexes, byExtendingSelection: extend)
+        updateSelection(animated: !suppressSelectionMotion)
+    }
+
+    override func deselectAll(_ sender: Any?) {
+        super.deselectAll(sender)
+        updateSelection(animated: false)
+    }
+
+    func selectionViewportDidChange(_ viewport: NSRect) {
+        let changed = selectionViewport != nil && selectionViewport != viewport
+        selectionViewport = viewport
+        guard changed else { return }
+        stopSelectionMotion()
+        if let selectionTargetFrame { selectionGlass.frame = selectionTargetFrame }
+        updateSelection(animated: false)
+    }
+
+    func updateSelection(animated: Bool) {
+        guard window != nil, selectedRow >= 0, selectedRow < numberOfRows else {
+            stopSelectionMotion()
+            selectionTargetFrame = nil
+            selectionRow = -1
+            selectionGlass.isHidden = true
+            return
+        }
+        let row = rect(ofRow: selectedRow)
+        let readable = (enclosingScrollView as? CommandPaletteResultsScrollView)
+            .map { convert($0.readableContentBounds, from: $0.contentView) } ?? bounds
+        let x = max(row.minX, readable.minX) + CommandPaletteLayout.selectionInset
+        let right = min(row.maxX, readable.maxX) - CommandPaletteLayout.selectionInset
+        // rect(ofRow:) includes intercell spacing; the cap is based on native
+        // row content height, not that gap. Centre it in the complete row slot.
+        let contentHeight = min(row.height, rowHeight)
+        let target = NSRect(x: x, y: row.midY - contentHeight / 2 + CommandPaletteLayout.selectionVerticalInset,
+                            width: max(0, right - x), height: max(0, contentHeight - 2 * CommandPaletteLayout.selectionVerticalInset))
+        guard target.width > 0, target.height > 0 else { return }
+        if selectionTargetFrame == target, !selectionGlass.isHidden {
+            // A Reduce Motion change also settles an already-running transition.
+            if isSelectionAnimating, reduceSelectionMotion() {
+                stopSelectionMotion()
+                selectionGlass.frame = target
+            }
+            return
+        }
+        let canAnimate = animated && !suppressSelectionMotion && !selectionGlass.isHidden
+            && !reduceSelectionMotion() && window?.isVisible == true
+        let visibleFrame = selectionGlass.layer?.presentation()?.frame ?? selectionGlass.frame
+        stopSelectionMotion()
+        selectionTargetFrame = target
+        selectionRow = selectedRow
+        selectionGlass.isHidden = false
+        selectionGlass.cornerRadius = target.height / 2
+        guard canAnimate else {
+            selectionGlass.frame = target
+            return
+        }
+        // Retarget from the current presentation, not the previous destination.
+        // Fast repeated keys replace this transition rather than enqueueing it.
+        selectionGlass.frame = visibleFrame
+        isSelectionAnimating = true
+        let generation = motionGeneration
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
+            selectionGlass.animator().frame = target
+        } completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.motionGeneration == generation else { return }
+                self.selectionGlass.frame = target // Finish on the exact native geometry.
+                self.isSelectionAnimating = false
+            }
+        }
+    }
+
+    private func stopSelectionMotion() {
+        motionGeneration += 1
+        selectionGlass.layer?.removeAllAnimations()
+        isSelectionAnimating = false
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 48 { window?.makeFirstResponder(inputField); return }
+        let command: SuggestionAddressField.Command? = switch event.keyCode {
+        case 125: .moveDown
+        case 126: .moveUp
+        case 36, 76: .submit
+        case 53: .cancel
+        default: nil
+        }
+        if let command, performCommand?(command) == true { return }
+        super.keyDown(with: event)
+    }
+}
+
+final class CommandPaletteSelectionGlass: NSGlassEffectView {
+    let returnSymbol = NSImageView()
+    private let contents = CommandPaletteSelectionContent()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        style = .regular
+        identifier = .init("CommandResult.selectionGlass")
+        setAccessibilityElement(false)
+        isHidden = true
+        wantsLayer = true
+        returnSymbol.identifier = .init("CommandResult.return")
+        returnSymbol.image = CommandPaletteLayout.image("return")
+        returnSymbol.imageScaling = .scaleNone
+        returnSymbol.contentTintColor = .labelColor
+        returnSymbol.setAccessibilityElement(false)
+        contents.addSubview(returnSymbol)
+        contentView = contents
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func layout() {
+        super.layout()
+        contents.frame = bounds
+        CommandPaletteLayout.place(returnSymbol, center: NSPoint(x: bounds.maxX - bounds.height / 2, y: bounds.midY))
+    }
+}
+
+private final class CommandPaletteSelectionContent: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class CommandPaletteResultRow: NSTableRowView {
+    override var isSelected: Bool { didSet { updateCells() } }
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+    override func drawSelection(in dirtyRect: NSRect) {} // The shared glass is the only selection.
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        updateCells()
+    }
+    private func updateCells() {
+        for cell in subviews.compactMap({ $0 as? CommandPaletteResultCell }) {
+            cell.setSelected(superview != nil && isSelected)
+        }
+        (superview as? CommandPaletteTable)?.needsLayout = true
+    }
+}
+
+final class CommandPaletteResultCell: NSTableCellView {
+    let symbol = NSImageView()
+    let title = NSTextField(labelWithString: "")
+    let detail = NSTextField(labelWithString: "")
+    private weak var reference: NSView?
+    private(set) var isResultSelected = false
+    private(set) var showsFavicon = false
+    override var isFlipped: Bool { true }
+    override var backgroundStyle: NSView.BackgroundStyle { didSet { updateColors() } }
+
+    init() {
+        super.init(frame: .zero)
+        identifier = .init("CommandResult")
+        for (label, name) in [(title, "title"), (detail, "detail")] {
+            label.identifier = .init("CommandResult.\(name)")
+            label.alignment = .left
+            label.lineBreakMode = .byTruncatingTail
+            label.usesSingleLineMode = true
+            label.font = .systemFont(ofSize: label === title ? 13 : 11)
+            addSubview(label)
+        }
+        symbol.identifier = .init("CommandResult.icon")
+        symbol.imageScaling = .scaleNone
+        symbol.setAccessibilityElement(false)
+        addSubview(symbol)
+        updateColors()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(_ result: AddressResult, selected: Bool, reference: NSView, favicon: NSImage? = nil) {
+        self.reference = reference
+        userInterfaceLayoutDirection = reference.userInterfaceLayoutDirection
+        for view in [title, detail, symbol] { view.userInterfaceLayoutDirection = userInterfaceLayoutDirection }
+        title.stringValue = result.title
+        switch result.action {
+        case .search, .command, .switchSpace: detail.stringValue = ""
+        default: detail.stringValue = result.detail == result.title ? "" : result.detail
+        }
+        detail.isHidden = detail.stringValue.isEmpty
+        // Always replace both image and tint, including on reused native cells.
+        showsFavicon = favicon != nil
+        symbol.image = favicon ?? CommandPaletteLayout.image(result.symbol)
+        updateColors()
+        for label in [title, detail] { label.toolTip = label.stringValue }
+        var context = [result.title, detail.stringValue, result.actionLabel]
+        if let space = result.destinationSpace, space != result.title { context.append(space) }
+        let accessible = context.filter { !$0.isEmpty }.joined(separator: ", ")
+        setAccessibilityLabel(accessible)
+        toolTip = accessible
+        setSelected(selected)
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        setSelected((superview as? NSTableRowView)?.isSelected == true)
+    }
+
+    func setSelected(_ selected: Bool) {
+        isResultSelected = selected
+        needsLayout = true
+    }
+
+    private func updateColors() {
+        let selected = backgroundStyle == .emphasized
+        title.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
+        detail.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        symbol.contentTintColor = showsFavicon ? nil : title.textColor
+    }
+
+    override func layout() {
+        super.layout()
+        guard let reference, let titleFont = title.font, let detailFont = detail.font else { return }
+        let adjustment = (reference as? CommandPaletteContent)?.leadingAdjustment ?? 0
+        let textX = convert(NSPoint(x: CommandPaletteLayout.textX + adjustment, y: 0), from: reference).x
+        let iconX = convert(NSPoint(x: CommandPaletteLayout.iconCenterX + adjustment, y: 0), from: reference).x
+        let readable = enclosingScrollView.flatMap { $0 as? CommandPaletteResultsScrollView }
+            .map { convert($0.readableContentBounds, from: $0.contentView).intersection(bounds) } ?? bounds
+        let capRadius = max(0, bounds.height - 2 * CommandPaletteLayout.selectionVerticalInset) / 2
+        let returnX = readable.maxX - CommandPaletteLayout.selectionInset - capRadius
+        // Reserve the small affordance slot on every row so text does not
+        // reflow or truncate differently as the shared glass moves past it.
+        let trailing = returnX - CommandPaletteLayout.iconToText
+        let textWidth = max(0, trailing - textX)
+        let firstInkHeight = titleFont.capHeight - titleFont.descender
+        let secondInkHeight = detail.isHidden ? 0 : detailFont.capHeight - detailFont.descender
+        let groupHeight = firstInkHeight + (detail.isHidden ? 0 : 2 + secondInkHeight)
+        let firstBaseline = bounds.midY - groupHeight / 2 + titleFont.capHeight
+        CommandPaletteLayout.place(title, textX: textX, baselineY: firstBaseline, width: textWidth)
+        if !detail.isHidden {
+            let secondBaseline = firstBaseline - titleFont.descender + 2 + detailFont.capHeight
+            CommandPaletteLayout.place(detail, textX: textX, baselineY: secondBaseline, width: textWidth)
+        }
+        CommandPaletteLayout.place(symbol, center: NSPoint(x: iconX, y: bounds.midY))
+    }
+}

@@ -4,7 +4,7 @@ import SwiftUI
 /// The address bar's text field. It's an AppKit field so it can complete the text inline, with the completed part
 /// selected, and handle the arrow keys, Return, and Esc for the suggestion list.
 struct SuggestionAddressField: NSViewRepresentable {
-    enum Command {
+    enum Command: Equatable {
         case moveUp
         case moveDown
         case submit

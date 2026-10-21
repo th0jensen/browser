@@ -34,18 +34,29 @@ final class BrowserShortcutView: NSView {
             guard source === window || isToolbarWindow else { return event }
             if event.type == .otherMouseDown || event.type == .otherMouseUp {
                 guard let browser = self?.browser else { return event }
+                if browser.commandPalette?.isPresented == true { return event }
                 return BrowserMouseNavigation.handle(type: event.type, button: event.buttonNumber,
                                                       back: { browser.goBack() }, forward: { browser.goForward() }) ? nil : event
             }
             guard Self.isBrowserCommand(event) else { return event }
             let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            if event.charactersIgnoringModifiers?.lowercased() == "w", modifiers == .command,
+               let palette = self?.browser?.commandPalette, palette.isPresented {
+                palette.dismiss()
+                return nil
+            }
             if self?.browser?.chromePreferences.tabLayout == .horizontal,
                event.charactersIgnoringModifiers?.lowercased() == "s",
                modifiers == .command || modifiers == [.command, .control] { return nil }
             // Keep menu validation, alternate shortcuts and their existing actions.
             // Returning nil prevents a successful command reaching a second responder.
-            return NSApp.mainMenu?.performKeyEquivalent(with: event) == true ? nil : event
+            return Self.performMenuCommand(event, menu: NSApp.mainMenu) ? nil : event
         }
+    }
+
+    static func performMenuCommand(_ event: NSEvent, menu: NSMenu?) -> Bool {
+        guard isBrowserCommand(event) else { return false }
+        return menu?.performKeyEquivalent(with: event) == true
     }
 
     static func isBrowserCommand(_ event: NSEvent) -> Bool {

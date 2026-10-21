@@ -101,6 +101,10 @@ final class BrowserModel: NSObject {
         }
     }
     var addressFocusRequest = 0
+    var commandPaletteRequest = 0
+    private(set) var commandPaletteMode: CommandPaletteMode = .newDestination
+    private(set) var commandPaletteWantsPresentation = false
+    @ObservationIgnored weak var commandPalette: CommandPaletteController?
     @ObservationIgnored var consumedAddressFocusRequest = 0
     @ObservationIgnored private var suspender: TabSuspender?
     @ObservationIgnored weak var window: NSWindow? {
@@ -188,6 +192,7 @@ final class BrowserModel: NSObject {
     func windowDidClose() {
         guard !isClosed else { return }
         isClosed = true
+        commandPalette?.dismiss(restoreFocus: false)
         cancelTidyingTabs()
         titleTasks.values.forEach { $0.cancel() }
         for tab in allTabs { tab.stopLoading() }
@@ -549,6 +554,13 @@ final class BrowserModel: NSObject {
 
     @discardableResult
     func selectSpace(_ id: UUID) -> Bool {
+        selectSpace(id, createsInitialTab: true)
+    }
+
+    /// Direct destination selection can leave an unvisited Space descriptor-only.
+    /// Preserve the original entry point for callers that need a blank tab.
+    @discardableResult
+    func selectSpace(_ id: UUID, createsInitialTab: Bool) -> Bool {
         guard !isPrivate, !isExtensionWindow, let space = spaces.space(id),
               space.profileID == profileID else { return false }
         guard id != activeSpaceID else { return true }
@@ -575,8 +587,9 @@ final class BrowserModel: NSObject {
         closedTabs = closedTabsBySpace.removeValue(forKey: id) ?? []
         activeTabID = nil
         isRestoringSpaces = false
-        if tabs.isEmpty { addTab(focusAddress: false) }
-        else { activeTabID = state?.selectedTabID ?? tabs.first?.id }
+        if tabs.isEmpty {
+            if createsInitialTab { addTab(focusAddress: false) }
+        } else { activeTabID = state?.selectedTabID ?? tabs.first?.id }
         // Cancel an address-field request left over from the previous Space.
         consumedAddressFocusRequest = addressFocusRequest
         let field = (window?.firstResponder as? AddressField)
@@ -977,8 +990,7 @@ final class BrowserModel: NSObject {
 
     func navigate(to input: String) {
         guard let url = BrowserAddress.url(for: input) else { return }
-        dismissPeek()
-        activeTab?.load(url)
+        open(url)
     }
 
     func reload() {
@@ -1009,7 +1021,41 @@ final class BrowserModel: NSObject {
         activeTab?.webView?.go(to: item)
     }
 
+    /// Preserve the existing zero-argument action for toolbar/footer callers.
+    func showCommandPalette() { showCommandPalette(mode: .newDestination) }
+
+    /// Both modes only request presentation. Cancel older toolbar focus work;
+    /// opening the palette must not load a page, create a tab, or dismiss Peek.
+    func showCommandPalette(mode: CommandPaletteMode) {
+        guard !isClosed, !isExtensionWindow else { return }
+        consumedAddressFocusRequest = addressFocusRequest
+        let field = (window?.firstResponder as? AddressField)
+            ?? ((window?.firstResponder as? NSTextView)?.delegate as? AddressField)
+        field?.requestFocus(0)
+        commandPaletteMode = mode
+        commandPaletteWantsPresentation = true
+        commandPaletteRequest += 1
+    }
+
+    /// Include queued presentation intent, not only the current native view.
+    /// Two toggles before SwiftUI applies either request must remain closed.
+    func toggleCommandPalette() {
+        guard !isClosed, !isExtensionWindow else { return }
+        if commandPaletteWantsPresentation || commandPalette?.isPresented == true {
+            commandPaletteWantsPresentation = false
+            commandPaletteRequest += 1
+            commandPalette?.dismiss()
+        } else { showCommandPalette(mode: .editCurrentDestination) }
+    }
+
+    func commandPaletteDidDismiss(_ palette: CommandPaletteController) {
+        guard commandPalette === palette, commandPaletteWantsPresentation else { return }
+        commandPaletteWantsPresentation = false
+        commandPaletteRequest += 1
+    }
+
     func requestAddressFocus() {
+        commandPalette?.dismiss(restoreFocus: false)
         dismissPeek()
         chromeHover?.addressFocusRequested()
         addressFocusRequest += 1
