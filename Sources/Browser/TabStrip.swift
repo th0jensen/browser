@@ -192,6 +192,7 @@ struct TabStrip: View {
                     }
                     .modifier(ScrollbarVisibility())
                     .scrollClipDisabled(browser.tabDrag.payload != nil)
+                    .background(SidebarSpaceSwipeRegion(browser: browser))
                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { sidebarViewport = $0 }
                     .onChange(of: browser.activeTabID) { _, activeTabID in
                         guard let activeTabID else { return }
