@@ -28,11 +28,13 @@ final class UpstreamIntegrationTests: XCTestCase {
         XCTAssertNil(migrated.unavailableSpaceSessions, file: file, line: line)
         XCTAssertEqual(migrated.tabs.map(\.id), browser.tabs.map { Optional($0.id) }, file: file, line: line)
         XCTAssertTrue(migrated.tabs.allSatisfy { $0.spaceID == spaceID && $0.profileID == BrowserProfile.defaultID }, file: file, line: line)
+        XCTAssertTrue(migrated.tabs.allSatisfy { $0.lastUsedAt != nil }, file: file, line: line)
         let legacyTabs = migrated.tabs.map { tab in
             var tab = tab
             tab.id = nil
             tab.spaceID = nil
             tab.profileID = nil
+            tab.lastUsedAt = nil
             return tab
         }
         XCTAssertEqual(WindowSession(tabs: legacyTabs, selectedIndex: migrated.selectedIndex, splits: migrated.splits),

@@ -83,8 +83,32 @@ final class StoreFile: Sendable {
         }
     }
 
+    /// An archive restore must save its live descriptor before deleting the durable recovery record.
+    /// Unlike `write`, this API reports failed or obsolete publication to the caller.
+    func writeAcknowledged(_ data: Data) async throws {
+        let generation = writes.withLock { state in
+            state.generation += 1
+            state.pending = nil
+            return state.generation
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                do {
+                    guard try publish(data, generation: generation) else { throw CocoaError(.userCancelled) }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
     private func save(_ data: Data, generation: Int) {
-        guard writes.withLock({ $0.generation == generation }), persistedData.withLock({ $0 != data }) else { return }
+        do { _ = try publish(data, generation: generation) }
+        catch { NSLog("Could not save Browser store %@: %@", url.lastPathComponent, error.localizedDescription) }
+    }
+
+    private func publish(_ data: Data, generation: Int) throws -> Bool {
+        guard writes.withLock({ $0.generation == generation }) else { return false }
+        if persistedData.withLock({ $0 == data }) { return true }
         do {
             let directory = url.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -107,15 +131,14 @@ final class StoreFile: Sendable {
                 guard Darwin.rename(temporary.path, url.path) == 0 else { throw posixError() }
                 return true
             }
-            guard published else { return }
+            guard published else { return false }
             let directoryDescriptor = Darwin.open(directory.path, O_RDONLY)
             guard directoryDescriptor >= 0 else { throw posixError() }
             defer { Darwin.close(directoryDescriptor) }
             guard fsync(directoryDescriptor) == 0 else { throw posixError() }
             persistedData.withLock { $0 = data }
-        } catch {
-            NSLog("Could not save Browser store %@: %@", url.lastPathComponent, error.localizedDescription)
-        }
+            return true
+        } catch { throw error }
     }
 
     private func posixError() -> POSIXError {

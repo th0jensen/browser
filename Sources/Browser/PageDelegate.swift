@@ -86,6 +86,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     /// needs the user's permission first, which is remembered for the site.
     private func track(_ download: WKDownload, from webView: WKWebView, isUserStarted: Bool) {
         guard let tab, let browser = tab.browser else { return }
+        tab.hasArchiveTransferWork = true
         let site = webView.backForwardList.currentItem?.url.host() ?? download.originalRequest?.url?.host() ?? ""
         let permissions = browser.sitePermissions
         let confirmation: @MainActor () async -> Bool = { [weak self] in
@@ -110,7 +111,11 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        if let tab { tab.browser?.savedTabBeganLoading(tab) }
+        if let tab {
+            tab.invalidateNavigation()
+            ArchivePageWorkObserver.shared.navigationStarted(in: webView)
+            tab.browser?.savedTabBeganLoading(tab)
+        }
         LinkPreviewController.shared.dismiss(for: webView)
         PagePaintObserver.shared.navigationStarted(in: webView)
     }
@@ -125,7 +130,10 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         PagePaintObserver.shared.navigationFinished(in: webView)
-        if let tab { tab.browser?.savedTabFinishedLoading(tab) }
+        if let tab {
+            tab.browser?.savedTabFinishedLoading(tab)
+            Task { _ = await ArchivePageWorkObserver.shared.confirm(tab) }
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -252,6 +260,8 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
                  initiatedByFrame frame: WKFrameInfo) async -> [URL]? {
+        // The upload may continue after the panel closes; no public API proves it has finished.
+        tab?.hasArchiveTransferWork = true
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = parameters.allowsMultipleSelection
         panel.canChooseDirectories = parameters.allowsDirectories

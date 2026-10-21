@@ -15,6 +15,8 @@ struct TabSession: Codable, Equatable, Sendable {
     var id: UUID? = nil
     var spaceID: UUID? = nil
     var profileID: UUID? = nil
+    /// Optional for sessions saved before the archive feature. Missing time starts a fresh idle period.
+    var lastUsedAt: Date? = nil
 }
 
 struct SpaceSession: Codable, Equatable, Sendable {
@@ -176,11 +178,13 @@ final class SessionStore {
             reopenableWindows = []
         }
         browser.sessionStore = self
+        browser.tabArchive.attach(self)
         browsers.removeAll { $0.browser == nil }
         browsers.append(WeakBrowser(browser: browser))
         defer {
             observeBrowsers()
             scheduleSave()
+            Task { @MainActor [weak browser] in await browser?.reconcileArchiveRecovery() }
         }
         guard restoringPendingWindows, !pendingWindows.isEmpty else { return 0 }
         browser.restoreSession(pendingWindows.removeFirst())
@@ -205,6 +209,22 @@ final class SessionStore {
         saveTask?.cancel()
         saveTask = nil
         file?.writeNow(try? PropertyListEncoder.binary.encode(snapshot))
+    }
+
+    /// Archive restoration must not race a saved window that has not attached yet.
+    func hasPendingArchiveTab(_ record: ArchivedTab) -> Bool {
+        (pendingWindows + reopenableWindows).contains { window in
+            if let spaces = window.spaceSessions {
+                return spaces.contains { space in
+                    space.spaceID == record.spaceID && space.profileID == record.profileID
+                        && space.tabs.contains { $0.id == record.tabID
+                            && ($0.spaceID == nil || $0.spaceID == record.spaceID)
+                            && ($0.profileID == nil || $0.profileID == record.profileID) }
+                }
+            }
+            return record.spaceID == BrowserSpaceStore.defaultSpaceID && record.profileID == BrowserProfile.defaultID
+                && window.tabs.contains { $0.id == record.tabID }
+        }
     }
 
     /// Reuses `browser` only when every Space is safe to replace, with no unavailable or closed-tab recovery
@@ -271,6 +291,14 @@ final class SessionStore {
             let snapshot = snapshot
             file.write { try? PropertyListEncoder.binary.encode(snapshot) }
         }
+    }
+
+    /// A live restore needs acknowledged session storage before deleting its archive recovery record.
+    func saveAcknowledged() async throws {
+        guard let file, !isTerminating else { throw TabArchiveError.unavailable }
+        saveTask?.cancel()
+        saveTask = nil
+        try await file.writeAcknowledged(PropertyListEncoder.binary.encode(snapshot))
     }
 
     /// Saves the windows as they are, and ignores them closing as the app quits.

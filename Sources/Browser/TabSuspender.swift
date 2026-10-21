@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// Frees memory by suspending background tabs that haven't been selected for a while,
@@ -8,14 +9,20 @@ final class TabSuspender {
     private static let checkInterval: Duration = .seconds(60)
 
     private var idleCheck: Task<Void, Never>?
+    private var wakeObserver: NSObjectProtocol?
     private let memoryPressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical],
                                                                          queue: .main)
 
     init(browser: BrowserModel) {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                                        object: nil, queue: .main) { [weak browser] _ in
+            MainActor.assumeIsolated { browser?.resetArchiveIdleGrace() }
+        }
         idleCheck = Task { [weak browser] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.checkInterval)
                 guard let browser else { return }
+                await browser.archiveIdleTabs()
                 let cutoff = ContinuousClock.now - Self.idleInterval
                 await browser.suspendTabs(browser.suspendableTabs.filter { $0.lastActive < cutoff })
             }
@@ -34,6 +41,7 @@ final class TabSuspender {
 
     isolated deinit {
         idleCheck?.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         memoryPressure.cancel()
     }
 }

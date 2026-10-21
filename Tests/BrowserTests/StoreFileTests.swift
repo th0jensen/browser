@@ -53,6 +53,23 @@ final class StoreFileTests: XCTestCase {
         XCTAssertTrue(captured.allSatisfy { $0.value == nil })
     }
 
+    func testAcknowledgedWriteReportsFailureAndCanRetryWithoutLosingNewerFlush() async throws {
+        let directory = URL.temporaryDirectory.appending(path: "StoreFileTests-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("not a directory".utf8).write(to: directory)
+        let file = StoreFile(url: directory.appending(path: "Session.plist"))
+        do { try await file.writeAcknowledged(Data("live".utf8)); XCTFail("A failed write cannot acknowledge durability") }
+        catch { }
+        try FileManager.default.removeItem(at: directory)
+        file.write { Data("obsolete".utf8) }
+        try await file.writeAcknowledged(Data("live".utf8))
+        XCTAssertEqual(file.readNow(), Data("live".utf8))
+        file.writeNow(Data("termination".utf8))
+        XCTAssertEqual(file.readNow(), Data("termination".utf8))
+        let permissions = try FileManager.default.attributesOfItem(atPath: file.url.path)[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o600)
+    }
+
     func testIdenticalSnapshotDoesNotRewriteFile() throws {
         let directory = URL.temporaryDirectory.appending(path: "StoreFileTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
