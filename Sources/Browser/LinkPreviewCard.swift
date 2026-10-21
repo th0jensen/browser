@@ -60,6 +60,11 @@ struct LinkPreviewCard: View {
                             .modifier(IntelligenceShimmer(active: !reduceMotion))
                             .accessibilityLabel("Loading link preview")
                         }
+                        Text(state.url.absoluteString)
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .lineLimit(2).truncationMode(.middle)
+                            .textSelection(.enabled).allowsHitTesting(state.isKept)
+                            .accessibilityLabel("Source: \(state.url.absoluteString)")
                         HStack {
                             if state.isLoading { ProgressView().controlSize(.mini) }
                             Spacer()

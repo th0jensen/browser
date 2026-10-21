@@ -28,28 +28,24 @@ actor LinkPreviewFetcher {
     }
 
     func document(at url: URL) async throws -> Document {
-        guard await Self.hasPublicDestination(url) else { throw IntelligenceError.message("This link cannot be previewed.") }
+        guard await Self.hasPublicDestination(url) else { throw LinkPreviewFailure.fetchFailed }
         try Task.checkCancellation()
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.setValue("text/html,application/xhtml+xml,text/plain;q=0.8", forHTTPHeaderField: "Accept")
         let (bytes, response) = try await session.bytes(for: request)
         defer { bytes.task.cancel() }
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-              let finalURL = response.url, Self.isPublicWebURL(finalURL),
-              ["text/html", "application/xhtml+xml", "text/plain"].contains(response.mimeType?.lowercased() ?? "") else {
-            throw IntelligenceError.message("The page did not provide readable text. Open the link to view it.")
-        }
+        guard let http = response as? HTTPURLResponse,
+              let finalURL = response.url, Self.isPublicWebURL(finalURL) else { throw LinkPreviewFailure.fetchFailed }
+        try Self.validateResponse(mimeType: response.mimeType ?? "", statusCode: http.statusCode)
         var data = Data()
         data.reserveCapacity(64 * 1024)
         for try await byte in bytes {
-            if data.count >= 128 * 1024 { break }
+            if data.count >= LinkPreviewExtractor.byteLimit { break }
             data.append(byte)
         }
         try Task.checkCancellation()
         let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
-        let text = Self.readableText(html)
-        guard text.count >= 100 else { throw IntelligenceError.message("There isn’t enough readable text to preview this page.") }
-        return Document(text: String(text.prefix(6500)), imageURL: Self.previewImage(in: html, relativeTo: finalURL))
+        return try Self.document(from: html, mimeType: response.mimeType ?? "", statusCode: http.statusCode, at: finalURL)
     }
 
     /// Decode a bounded thumbnail, never an unbounded full-resolution webpage image.
@@ -83,27 +79,35 @@ actor LinkPreviewFetcher {
         return output as Data
     }
 
-    nonisolated static func previewImage(in html: String, relativeTo page: URL) -> URL? {
-        // Attribute order and quoting differ across publishers. Never execute HTML.
-        guard let tags = try? NSRegularExpression(pattern: "(?is)<meta\\b[^>]*>"),
-              let attributes = try? NSRegularExpression(pattern: #"([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#) else { return nil }
-        var values: [String: String] = [:]
-        for match in tags.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
-            let tag = (html as NSString).substring(with: match.range)
-            var attrs: [String: String] = [:]
-            for item in attributes.matches(in: tag, range: NSRange(tag.startIndex..., in: tag)) {
-                let key = (tag as NSString).substring(with: item.range(at: 1)).lowercased()
-                if let range = (2...4).map({ item.range(at: $0) }).first(where: { $0.location != NSNotFound }) {
-                    attrs[key] = (tag as NSString).substring(with: range)
-                }
-            }
-            if let key = attrs["property"] ?? attrs["name"], let content = attrs["content"] {
-                values[key.lowercased()] = content
-            }
+    /// Status codes and model errors alone do not establish a challenge page.
+    nonisolated static func document(from source: String, mimeType: String, statusCode: Int, at page: URL) throws -> Document {
+        try Task.checkCancellation()
+        try validateResponse(mimeType: mimeType, statusCode: statusCode)
+        let extraction = try LinkPreviewExtractor.extract(source, mimeType: mimeType)
+        if !(200...299).contains(statusCode) {
+            if extraction.failure == .blocked { throw LinkPreviewFailure.blocked }
+            throw LinkPreviewFailure.fetchFailed
         }
+        if let failure = extraction.failure { throw failure }
+        return Document(text: extraction.text, imageURL: previewImage(metadata: extraction.metadata, relativeTo: page))
+    }
+
+    nonisolated private static func validateResponse(mimeType: String, statusCode: Int) throws {
+        if statusCode == 401 { throw LinkPreviewFailure.loginRequired }
+        guard LinkPreviewExtractor.supportedMIMETypes.contains(mimeType.lowercased()) else {
+            throw (200...299).contains(statusCode) ? LinkPreviewFailure.unsupportedContent : .fetchFailed
+        }
+    }
+
+    nonisolated static func previewImage(in html: String, relativeTo page: URL) -> URL? {
+        guard let extraction = try? LinkPreviewExtractor.extract(html) else { return nil }
+        return previewImage(metadata: extraction.metadata, relativeTo: page)
+    }
+
+    nonisolated private static func previewImage(metadata values: [String: String], relativeTo page: URL) -> URL? {
         for key in ["og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"] {
             guard let value = values[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty,
-                  let url = URL(string: value.replacingOccurrences(of: "&amp;", with: "&"), relativeTo: page)?.absoluteURL,
+                  let url = URL(string: value, relativeTo: page)?.absoluteURL,
                   isPublicWebURL(url) else { continue }
             return url
         }
@@ -164,16 +168,7 @@ actor LinkPreviewFetcher {
     }
 
     nonisolated static func readableText(_ html: String) -> String {
-        var text = html
-        for tag in ["script", "style", "noscript", "svg", "nav", "footer", "form", "header"] {
-            text = text.replacingOccurrences(of: "(?is)<\(tag)\\b[^>]*>.*?</\(tag)\\s*>", with: " ", options: .regularExpression)
-        }
-        text = text.replacingOccurrences(of: "(?s)<!--.*?-->", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-        for (entity, replacement) in [("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'")] {
-            text = text.replacingOccurrences(of: entity, with: replacement)
-        }
-        return text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        (try? LinkPreviewExtractor.extract(html).text.split(whereSeparator: \.isWhitespace).joined(separator: " ")) ?? ""
     }
 }
 
@@ -198,12 +193,14 @@ final class LinkPreviewState {
     var cardWidth: CGFloat = 300
     var contentHeight: CGFloat = 150
     var maximumHeight: CGFloat = 420
-    var error: String?
+    var failure: LinkPreviewFailure?
+    var error: String? { failure?.message }
     init(url: URL) { self.url = url }
 
     var contextText: String {
         var parts = [result?.title, result?.summary].compactMap { $0 }.filter { !$0.isEmpty }
         if let points = result?.keyPoints, !points.isEmpty { parts.append(points.map { "• " + $0 }.joined(separator: "\n")) }
+        if let error { parts.append(error) }
         parts.append(url.absoluteString)
         return parts.joined(separator: "\n\n")
     }
@@ -295,6 +292,9 @@ final class LinkPreviewPresentation {
         guard let window = sourceWindow, let root = window.contentView else { close(); return }
         beginPreparing()
         let content = NSHostingView(rootView: LinkPreviewCard(preview: self))
+        // This presentation owns geometry. Intrinsic constraints must not resize
+        // the detached window while drag tracking freezes the card's frame.
+        content.sizingOptions = []
         content.focusRingType = .none
         self.content = content
         let glass = NSGlassEffectView()
@@ -507,7 +507,7 @@ final class LinkPreviewPresentation {
 @MainActor
 final class LinkPreviewController: NSObject, WKScriptMessageHandler {
     typealias SummaryUpdate = @Sendable (LinkSummary) async -> Void
-    typealias StreamingSummaryProvider = @Sendable (URL, SummaryUpdate) async throws -> LinkSummary
+    typealias StreamingSummaryProvider = @Sendable (URL, @escaping SummaryUpdate) async throws -> LinkSummary
 
     static let shared = LinkPreviewController()
     private static let messageName = "browserLinkPreview"
@@ -654,7 +654,7 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             guard !Task.isCancelled, let preview, !preview.isClosed, preview.state.isLoading else { return }
             preview.task?.cancel()
             preview.task = nil
-            preview.state.error = "Preview unavailable. Open the page to read it."
+            preview.state.failure = .timedOut
             preview.state.isLoading = false
         }
     }
@@ -672,19 +672,19 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
             }
             guard !Task.isCancelled, !preview.isClosed else { return }
             guard isUsable(result) else {
-                if state.result == nil { state.error = "Preview unavailable. Open the page to read it." }
+                if state.result == nil { state.failure = .summaryFailed }
                 state.isLoading = false
                 return
             }
             cacheResult(result, image: state.image, for: url)
             state.result = result
-            state.error = nil
+            state.failure = nil
             state.isLoading = false
             preview.show()
         } catch is CancellationError { }
         catch {
             guard !Task.isCancelled, !preview.isClosed else { return }
-            if state.result == nil { state.error = "Preview unavailable. Open the page to read it." }
+            if state.result == nil { state.failure = (error as? LinkPreviewFailure) ?? .summaryFailed }
             state.isLoading = false
         }
     }
@@ -695,15 +695,21 @@ final class LinkPreviewController: NSObject, WKScriptMessageHandler {
                          onUpdate: @escaping SummaryUpdate) async throws -> LinkSummary {
         if let streamSummary { return try await streamSummary(url, onUpdate) }
         if let summarize { return try await summarize(url) }
-        await LocalIntelligence.shared.prepare(.preview)
-        let document = try await LinkPreviewFetcher.shared.document(at: url)
+        let document: LinkPreviewFetcher.Document
+        do { document = try await LinkPreviewFetcher.shared.document(at: url) }
+        catch is CancellationError { throw CancellationError() }
+        catch let failure as LinkPreviewFailure { throw failure }
+        catch { throw LinkPreviewFailure.fetchFailed }
         guard !Task.isCancelled, !preview.isClosed else { throw CancellationError() }
         if let imageURL = document.imageURL { loadImage(imageURL, for: preview, url: url) }
+        await LocalIntelligence.shared.prepare(.preview)
+        try Task.checkCancellation()
         return try await LocalIntelligence.shared.summarize(text: document.text, url: url, onUpdate: onUpdate)
     }
 
     private func publish(_ partial: LinkSummary, to preview: LinkPreviewPresentation) async {
-        guard !Task.isCancelled, !preview.isClosed, isUsable(partial) else { return }
+        guard !Task.isCancelled, !preview.isClosed, preview.state.isLoading,
+              preview.task != nil, preview.task?.isCancelled != true, isUsable(partial) else { return }
         if preview.isPresented {
             preview.state.result = partial
             return
