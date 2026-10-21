@@ -61,7 +61,13 @@ struct SpaceSwitcher: View {
                 else { fallbackMenu }
             }
             .disabled(browser.tabDrag.payload != nil)
-            .sheet(item: $editor) { request in SpaceEditor(browser: browser, space: request.space) }
+            .popover(item: $editor, attachmentAnchor: .rect(.bounds),
+                     arrowEdge: style == .sidebar ? .trailing : .bottom) { request in
+                SpaceEditor(browser: browser, space: request.space)
+            }
+            .chromePresentation(isPresented: editor != nil, controller: browser.chromeHover,
+                                region: style == .sidebar ? .sidebar : .toolbar)
+            .onChange(of: browser.activeSpaceID) { _, _ in editor = nil }
         }
     }
 
@@ -337,15 +343,19 @@ struct BrowserSpaceHeading: View {
                     Image(systemName: "ellipsis").frame(width: 24, height: 24)
                 }
                 .buttonStyle(.plain)
-                .help("Edit Space name, icon, and theme")
+                .help("Edit Space name and icon")
                 .accessibilityLabel("Edit Space \(space.title)")
+                .popover(item: $editor, attachmentAnchor: .rect(.bounds), arrowEdge: .trailing) { request in
+                    SpaceEditor(browser: browser, space: request.space)
+                }
+                .chromePresentation(isPresented: editor != nil, controller: browser.chromeHover, region: .sidebar)
             }
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.primary)
             .help(space.title)
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Space \(space.title)")
-            .sheet(item: $editor) { request in SpaceEditor(browser: browser, space: request.space) }
+            .onChange(of: browser.activeSpaceID) { _, _ in editor = nil }
         }
     }
 }
@@ -355,7 +365,7 @@ private struct SpaceEditor: View {
     let space: BrowserSpace?
     @State private var name: String
     @State private var icon: BrowserSpaceIcon
-    @State private var theme: BrowserSpaceTheme
+    private let theme: BrowserSpaceTheme
     @State private var errorMessage: String?
     @FocusState private var nameIsFocused: Bool
     @Environment(\.dismiss) private var dismiss
@@ -365,7 +375,7 @@ private struct SpaceEditor: View {
         self.space = space
         _name = State(initialValue: space?.title ?? "")
         _icon = State(initialValue: space?.icon ?? .circle)
-        _theme = State(initialValue: space?.theme ?? .system)
+        theme = space?.theme ?? .system
     }
 
     var body: some View {
@@ -373,17 +383,21 @@ private struct SpaceEditor: View {
             Text(space == nil ? "New Space" : "Edit Space").font(.headline)
             Text("Spaces have separate pinned and temporary tabs. They share logins in the Existing Profile.")
                 .foregroundStyle(.secondary)
-            TextField("Space name", text: $name).focused($nameIsFocused)
-            Picker("Icon", selection: $icon) {
-                ForEach(BrowserSpaceIcon.allCases) { icon in Label(icon.title, systemImage: icon.symbol).tag(icon) }
+            TextField("Space name", text: $name).textFieldStyle(.roundedBorder).focused($nameIsFocused)
+                .accessibilityLabel("Space name")
+            Text("Icon").font(.subheadline.weight(.medium))
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 5), spacing: 6) {
+                ForEach(BrowserSpaceIcon.allCases) { candidate in
+                    Button { icon = candidate } label: {
+                        Image(systemName: candidate.symbol).font(.system(size: 16))
+                            .frame(maxWidth: .infinity).frame(height: 32)
+                            .background(icon == candidate ? Color.primary.opacity(0.1) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain).help(candidate.title).accessibilityLabel("\(candidate.title) icon")
+                }
             }
-            Picker("Theme", selection: $theme) {
-                ForEach(BrowserSpaceTheme.allCases) { theme in Text(theme.title).tag(theme) }
-            }
-            Label(name.isEmpty ? "Space Preview" : name, systemImage: icon.symbol)
-                .foregroundStyle(.primary).padding(10)
-                .glassEffect(.regular.tint(theme.color.opacity(0.15)), in: RoundedRectangle(cornerRadius: 8))
-            if let errorMessage { Text(errorMessage).foregroundStyle(.secondary) }
+            if let errorMessage { Text(errorMessage).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
@@ -392,7 +406,8 @@ private struct SpaceEditor: View {
                     .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
-        .padding(20).frame(width: 360)
+        .padding(20).frame(width: 390)
+        .background(ChromePresentationMarker(identifier: "BrowserSpaceEditorPopover"))
         .onAppear { nameIsFocused = true }
     }
 
