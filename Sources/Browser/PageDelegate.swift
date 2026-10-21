@@ -110,6 +110,8 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        // Document identity changes even when a page reload keeps the same URL.
+        tab?.invalidateNavigation()
         if let tab { tab.browser?.savedTabBeganLoading(tab) }
         LinkPreviewController.shared.dismiss(for: webView)
         PagePaintObserver.shared.navigationStarted(in: webView)

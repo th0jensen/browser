@@ -19,6 +19,7 @@ final class BrowserModel: NSObject {
     let isPrivate: Bool
     @ObservationIgnored weak var sessionStore: SessionStore?
     var findFocusRequest = 0
+    var pageQuestion: PageQuestionController?
     var isShowingHistory = false
     var isShowingClearData = false
     let pinnedPages: PinnedPageStore
@@ -43,6 +44,7 @@ final class BrowserModel: NSObject {
     var activeTabID: UUID? {
         didSet {
             guard oldValue != activeTabID else { return }
+            dismissPageQuestion()
             dismissPeek()
             if let previousTab = tab(withID: oldValue) {
                 if let view = previousTab.webView { LinkPreviewController.shared.dismiss(for: view) }
@@ -156,6 +158,7 @@ final class BrowserModel: NSObject {
     func windowDidClose() {
         guard !isClosed else { return }
         isClosed = true
+        dismissPageQuestion()
         cancelTidyingTabs()
         titleTasks.values.forEach { $0.cancel() }
         for tab in tabs { tab.stopLoading() }
@@ -535,6 +538,7 @@ final class BrowserModel: NSObject {
     @discardableResult
     func openPeek(from opener: BrowserTab, request: URLRequest? = nil,
                   configuration: WKWebViewConfiguration? = nil) -> BrowserTab {
+        dismissPageQuestion()
         dismissPeek()
         if let view = opener.webView { LinkPreviewController.shared.dismiss(for: view) }
         let tab = makeTab(configuration: configuration ?? makeConfiguration())
@@ -828,6 +832,7 @@ final class BrowserModel: NSObject {
 
     func closeFindBar() {
         guard let tab = focusedPage else { return }
+        dismissPageQuestion(for: tab.id)
         tab.isFindBarVisible = false
         tab.focusPage()
     }
