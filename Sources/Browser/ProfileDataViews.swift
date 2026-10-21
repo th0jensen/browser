@@ -1,20 +1,6 @@
 import SwiftUI
 import WebKit
 
-/// Own the clearing operation for the profile selected when the sheet opened.
-struct ProfileClearDataView: View {
-    @State private var data: BrowsingData
-
-    init(history: HistoryStore, dataStore: WKWebsiteDataStore, session: SessionStore, profileID: UUID,
-         spaces: BrowserSpaceStore) {
-        _data = State(initialValue: BrowsingData(history: history, session: session,
-                                               dataStore: dataStore, includesSharedState: false, profileID: profileID,
-                                               ownershipResolver: spaces.owns))
-    }
-
-    var body: some View { ClearDataView(data: data) }
-}
-
 struct ProfileSiteSettingsView: View {
     let permissions: SitePermissions
     let zoom: ZoomStore

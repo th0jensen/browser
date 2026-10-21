@@ -33,7 +33,7 @@ struct BrowserApp: App {
 
     var body: some Scene {
         WindowGroup(id: Self.windowID) {
-            BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: history, session: session)
+            BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: history, session: session, browsingData: browsingData)
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .environment(browsingData)
                 .modifier(ScrollbarVisibility())
@@ -335,8 +335,8 @@ private struct BrowserCommands: Commands {
             Button("Show All History") { browser?.isShowingHistory.toggle() }
                 .keyboardShortcut("y", modifiers: .command)
                 .disabled(browser?.history == nil)
-            Button("Clear History and Website Data…") { browser?.isShowingClearData = true }
-                .disabled(browser == nil)
+            Button("Clear History and Website Data…") { browser?.requestClearData() }
+                .disabled(browser?.canRequestClearData != true)
         }
         CommandMenu("Bookmarks") {
             let bookmarks = browser?.spaces.profiles.resources(for: browser?.profileID ?? BrowserProfile.defaultID)?.bookmarks ?? bookmarks

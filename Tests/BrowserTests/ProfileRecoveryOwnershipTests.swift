@@ -12,6 +12,62 @@ final class ProfileRecoveryOwnershipTests: XCTestCase {
         for pending in [false, true] { try await assertRecoverySurvivesClearing(named: true, pending: pending) }
     }
 
+    func testIndependentLegacyAndUnavailableFieldsSurviveClearAttachSaveAndReloadWithoutNavigation() async throws {
+        for clearFirst in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appending(path: "LegacyUnavailable-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let spaces = BrowserSpaceStore(directory: root, enabled: false)
+            let opaque = Data([0x00, 0xff, 0x57, 0x4b, 0x80, 0x00, 0x01])
+            let unknownTab = TabSession(url: URL(string: "http://127.0.0.1:9/unknown")!, title: "Keep exact unknown",
+                                        interactionState: opaque, id: UUID(), spaceID: UUID(), profileID: UUID())
+            let mismatchTab = TabSession(url: URL(string: "http://127.0.0.1:9/mismatch")!, title: "Keep exact mismatch",
+                                         interactionState: opaque + Data([0xfe]), id: UUID())
+            let unavailable = [
+                SpaceSession(spaceID: UUID(), profileID: UUID(), tabs: [unknownTab], selectedIndex: 0),
+                SpaceSession(spaceID: BrowserSpaceStore.defaultSpaceID, profileID: UUID(), tabs: [mismatchTab], selectedIndex: 0),
+            ]
+            let legacy = WindowSession(tabs: [
+                TabSession(url: nil, title: "", interactionState: nil),
+                TabSession(url: URL(string: "http://127.0.0.1:9/legacy")!, title: "Legacy background", interactionState: opaque),
+            ], selectedIndex: 0, spaceSessions: nil, unavailableSpaceSessions: unavailable)
+            let file = StoreFile(url: root.appending(path: "Session.plist"))
+            file.writeNow(try PropertyListEncoder.binary.encode(SessionSnapshot(windows: [legacy])))
+            let input = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
+            XCTAssertNil(input.windows.first?.spaceSessions)
+            XCTAssertEqual(input.windows.first?.unavailableSpaceSessions, unavailable)
+            let service = SessionStore(file: file)
+            if clearFirst {
+                let data = BrowsingData(history: HistoryStore(file: nil), session: service, dataStore: .nonPersistent(),
+                                        ownershipResolver: spaces.owns)
+                await data.clear(.history, range: .all)
+                XCTAssertNil(service.snapshot.windows.first?.spaceSessions)
+                XCTAssertEqual(service.snapshot.windows.first?.unavailableSpaceSessions, unavailable)
+                XCTAssertTrue(service.snapshot.windows.first?.tabs.isEmpty == true)
+            }
+            let browser = BrowserModel(spaces: spaces)
+            _ = service.attach(browser)
+            XCTAssertEqual(browser.windowSession().unavailableSpaceSessions, unavailable)
+            XCTAssertTrue(browser.allTabs.allSatisfy { $0.webView == nil && $0.navigationRevision == 0 })
+            service.saveBeforeQuitting()
+            let saved = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
+            XCTAssertEqual(saved.windows.first?.unavailableSpaceSessions, unavailable)
+            XCTAssertEqual(saved.windows.first?.unavailableSpaceSessions?.flatMap(\.tabs).map(\.interactionState),
+                           [opaque, opaque + Data([0xfe])])
+            let reloaded = SessionStore(file: file)
+            let next = BrowserModel(spaces: spaces)
+            _ = reloaded.attach(next)
+            XCTAssertEqual(next.windowSession().unavailableSpaceSessions, unavailable)
+            XCTAssertTrue(next.allTabs.allSatisfy { $0.webView == nil && $0.navigationRevision == 0 })
+            reloaded.saveBeforeQuitting()
+            let final = try PropertyListDecoder().decode(SessionSnapshot.self, from: XCTUnwrap(file.readNow()))
+            XCTAssertEqual(final.windows.first?.unavailableSpaceSessions, unavailable)
+            // Compare every record field as well as the opaque interaction bytes; no recovery record is normalized.
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            XCTAssertEqual(try encoder.encode(final.windows.first?.unavailableSpaceSessions), try encoder.encode(Optional(unavailable)))
+        }
+    }
+
     private func assertRecoverySurvivesClearing(named: Bool, pending: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: "RecoveryOwnership-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
