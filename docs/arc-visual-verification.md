@@ -39,4 +39,8 @@ The user requires reference-based verification of both the plan and the implemen
 
 ## Current result
 
-Reference inspection found two design gaps in the initial minimal implementation: a top Space menu instead of a bottom icon strip, and address suggestions instead of an Arc-like Command Bar. Both sections require revision. Other UI sections require the same reference audit before they are called verified. No native screenshot comparison has yet passed under this updated contract.
+Reference inspection found two design gaps in the initial minimal implementation: a top Space menu instead of a bottom icon strip, and address suggestions instead of an Arc-like Command Bar. Their reference-aligned revisions are now implemented and tested. The independent audit also identified profile-shared Favorites and the Find-linked answer surface; these corrections are tracked separately.
+
+A partial native pass on installed Debug source snapshot `dfebf2d` checked bottom placement, native icon/theme creation, six-Space overflow, Control-number selection and exact retained form state. Debug was moved with Window → Move to Built-in Retina Display and its fresh `--qa-profile` and native bounds were confirmed. The app was left running. A WindowServer-ID screenshot of the synthetic form and selected Work footer was saved and inspected; inactive capture is not proof of active glass treatment.
+
+This is not full visual acceptance. Narrow resize requests snapped back; actual physical trackpad behavior, real webpage IME, VoiceOver, appearance/contrast variants and final integrated screenshots remain pending. Do not generalize the partial Spaces pass to Command Bar, Profiles, Archive or Ask. Later metadata/swipe tests and source reviews do not retroactively validate those native states.
