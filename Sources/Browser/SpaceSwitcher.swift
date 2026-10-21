@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 extension BrowserSpaceTheme {
@@ -14,32 +15,28 @@ extension BrowserSpaceTheme {
     }
 }
 
-/// Keep the selected icon visible and reserve real targets for overflow and creation.
-/// Very narrow layouts combine the selected icon and All Spaces menu, never the plus action.
+/// Equal utility gutters keep the selector centered, independent of plus or overflow visibility.
+/// The selected icon stays visible; only extremely narrow layouts combine it with All Spaces.
 struct SpaceStripLayout: Equatable {
     let visibleIndices: Range<Int>
     let showsOverflow: Bool
     let usesCompactMenu: Bool
+    let targetSize: CGFloat
+    let utilityGutter: CGFloat
 
     init(count: Int, selectedIndex: Int, width: CGFloat) {
         let count = max(0, count)
+        let width = width.isFinite ? max(0, width) : 0
+        targetSize = min(24, width / 3)
+        utilityGutter = width >= 88 ? 32 : targetSize
+        let available = max(0, width - utilityGutter * 2)
+        let capacity = targetSize > 0 ? max(1, Int(min(available / targetSize, 10_000))) : 1
+        let visible = min(count, capacity)
         let selected = min(max(0, selectedIndex), max(0, count - 1))
-        usesCompactMenu = !width.isFinite || width < 108
-        if count == 0 {
-            visibleIndices = 0..<0
-            showsOverflow = false
-        } else if usesCompactMenu {
-            visibleIndices = selected..<(selected + 1)
-            showsOverflow = count > 1
-        } else if CGFloat(count) * 36 + 40 <= width {
-            visibleIndices = 0..<count
-            showsOverflow = false
-        } else {
-            let capacity = min(count, max(1, Int(min(width, 10_000) - 80) / 36))
-            let start = min(max(0, selected - capacity / 2), count - capacity)
-            visibleIndices = start..<(start + capacity)
-            showsOverflow = true
-        }
+        let start = min(max(0, selected - visible / 2), count - visible)
+        visibleIndices = start..<(start + visible)
+        showsOverflow = visible < count
+        usesCompactMenu = showsOverflow && visible == 1
     }
 }
 
@@ -84,68 +81,12 @@ struct SpaceSwitcher: View {
     }
 
     private var iconStrip: some View {
-        GeometryReader { geometry in
-            let spaces = browser.spaces.spaces
-            let selected = spaces.firstIndex { $0.id == browser.activeSpaceID } ?? 0
-            let layout = SpaceStripLayout(count: spaces.count, selectedIndex: selected, width: geometry.size.width)
-            HStack(spacing: 4) {
-                if layout.usesCompactMenu {
-                    Menu { spaceMenuItems } label: { icon(current, selected: true) }
-                        .menuIndicator(.hidden).menuStyle(.borderlessButton)
-                        .frame(width: 28)
-                        .help("All Spaces — \(current?.title ?? "Default")")
-                        .accessibilityLabel("All Spaces, current Space \(current?.title ?? "Default")")
-                } else {
-                    ForEach(Array(layout.visibleIndices), id: \.self) { index in
-                        let space = spaces[index]
-                        Button { browser.selectSpace(space.id) } label: {
-                            icon(space, selected: space.id == browser.activeSpaceID)
-                        }
-                        .buttonStyle(.plain)
-                        .help(space.title)
-                        .accessibilityLabel("Switch to Space \(space.title)")
-                        .accessibilityValue(space.id == browser.activeSpaceID ? "Selected" : "")
-                        .accessibilityAddTraits(space.id == browser.activeSpaceID ? [.isSelected] : [])
-                        .contextMenu { Button("Edit Space…") { editor = SpaceEditorRequest(space: space) } }
-                    }
-                    Spacer(minLength: 0)
-                    if layout.showsOverflow {
-                        Menu { spaceMenuItems } label: {
-                            Image(systemName: "ellipsis").frame(width: 28, height: 28)
-                        }
-                        .menuIndicator(.hidden).menuStyle(.borderlessButton)
-                        .frame(width: 28)
-                        .help("All Spaces").accessibilityLabel("All Spaces")
-                    }
-                }
-                Button { editor = SpaceEditorRequest() } label: {
-                    Image(systemName: "plus").frame(width: 28, height: 28)
-                }
-                .buttonStyle(.plain)
-                .help("New Space").accessibilityLabel("New Space")
-            }
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(.primary)
-            .padding(4)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .glassEffect(.regular.tint((current?.theme.color ?? .accentColor).opacity(0.12)), in: Capsule())
-        }
-        .frame(height: 36)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Spaces")
-        .accessibilityIdentifier("BrowserSpaceIconStrip")
-    }
-
-    private func icon(_ space: BrowserSpace?, selected: Bool) -> some View {
-        Image(systemName: space?.icon.symbol ?? BrowserSpaceIcon.circle.symbol)
-            .frame(width: 28, height: 28)
-            .background(selected ? (space?.theme.color ?? .accentColor).opacity(0.18) : .clear,
-                        in: RoundedRectangle(cornerRadius: 7))
-            .overlay {
-                if selected {
-                    RoundedRectangle(cornerRadius: 7).strokeBorder(.primary.opacity(0.35), lineWidth: 1)
-                }
-            }
+        NativeSpaceSelector(spaces: browser.spaces.spaces, activeID: browser.activeSpaceID,
+            select: { browser.selectSpace($0) },
+            edit: { editor = SpaceEditorRequest(space: $0) },
+            create: { editor = SpaceEditorRequest() })
+            .frame(height: 36)
+            .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder private var spaceMenuItems: some View {
@@ -153,6 +94,230 @@ struct SpaceSwitcher: View {
             Button { browser.selectSpace(space.id) } label: {
                 Label(space.title, systemImage: space.id == browser.activeSpaceID ? "checkmark" : space.icon.symbol)
             }
+        }
+    }
+}
+
+private struct NativeSpaceSelector: NSViewRepresentable {
+    let spaces: [BrowserSpace]
+    let activeID: UUID
+    let select: (UUID) -> Void
+    let edit: (BrowserSpace) -> Void
+    let create: () -> Void
+
+    func makeNSView(context: Context) -> SpaceSelectorView { SpaceSelectorView() }
+    func updateNSView(_ view: SpaceSelectorView, context: Context) {
+        view.update(spaces: spaces, activeID: activeID, enabled: context.environment.isEnabled,
+            rightToLeft: context.environment.layoutDirection == .rightToLeft, select: select, edit: edit, create: create)
+    }
+    static func dismantleNSView(_ view: SpaceSelectorView, coordinator: ()) { view.clearActions() }
+}
+
+/// Native controls keep independent hit/focus targets while drawing only dots and the selected symbol.
+/// The group is centered in the full footer; utility visibility never participates in that calculation.
+final class SpaceSelectorView: NSView {
+    let selectorGroup = NSView()
+    let plusButton = SpaceSelectorButton()
+    let overflowButton = SpaceSelectorButton()
+    private(set) var choiceButtons: [SpaceChoiceButton] = []
+    private(set) var spaceMenu = NSMenu(title: "All Spaces")
+    private var spaces: [BrowserSpace] = []
+    private var activeID: UUID?
+    private var enabled = true
+    private var rightToLeft = false
+    private var select: ((UUID) -> Void)?
+    private var edit: ((BrowserSpace) -> Void)?
+    private var create: (() -> Void)?
+    private var compact = false
+    private weak var keyViewWindow: NSWindow?
+    private var keyViewParticipants: [ObjectIdentifier] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        identifier = NSUserInterfaceItemIdentifier("BrowserSpaceIconStrip")
+        setAccessibilityIdentifier("BrowserSpaceIconStrip")
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Spaces")
+        autoresizesSubviews = false
+        selectorGroup.autoresizesSubviews = false
+        addSubview(selectorGroup)
+        addSubview(overflowButton)
+        addSubview(plusButton)
+        plusButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: nil)
+        plusButton.toolTip = "New Space"
+        plusButton.setAccessibilityLabel("New Space")
+        plusButton.target = self
+        plusButton.action = #selector(createSpace)
+        overflowButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: nil)
+        overflowButton.toolTip = "All Spaces"
+        overflowButton.setAccessibilityLabel("All Spaces")
+        overflowButton.target = self
+        overflowButton.action = #selector(showAllSpaces)
+        for button in [plusButton, overflowButton] {
+            button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+            button.contentTintColor = .secondaryLabelColor
+        }
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func update(spaces: [BrowserSpace], activeID: UUID, enabled: Bool, rightToLeft: Bool = false,
+                select: @escaping (UUID) -> Void, edit: @escaping (BrowserSpace) -> Void, create: @escaping () -> Void) {
+        self.spaces = spaces
+        self.activeID = activeID
+        self.enabled = enabled
+        self.rightToLeft = rightToLeft
+        self.select = select
+        self.edit = edit
+        self.create = create
+        spaceMenu = NSMenu(title: "All Spaces")
+        spaceMenu.autoenablesItems = false
+        for space in spaces {
+            let item = NSMenuItem(title: space.title, action: #selector(selectMenuItem(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = space.id
+            item.state = space.id == activeID ? .on : .off
+            item.isEnabled = enabled
+            spaceMenu.addItem(item)
+        }
+        needsLayout = true
+    }
+
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsLayout = true }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); needsLayout = true }
+
+    override func layout() {
+        super.layout()
+        let selected = spaces.firstIndex { $0.id == activeID } ?? 0
+        let layout = SpaceStripLayout(count: spaces.count, selectedIndex: selected, width: bounds.width)
+        compact = layout.usesCompactMenu
+        let side = layout.targetSize
+        let groupWidth = CGFloat(layout.visibleIndices.count) * side
+        selectorGroup.frame = NSRect(x: bounds.midX - groupWidth / 2, y: bounds.midY - side / 2, width: groupWidth, height: side)
+        let old = Dictionary(uniqueKeysWithValues: choiceButtons.map { ($0.spaceID, $0) })
+        let visible = layout.visibleIndices.map { spaces[$0] }
+        for button in choiceButtons where !visible.contains(where: { $0.id == button.spaceID }) { button.removeFromSuperview() }
+        choiceButtons = visible.enumerated().map { index, space in
+            let button = old[space.id] ?? SpaceChoiceButton(spaceID: space.id)
+            button.configure(space, selected: space.id == activeID, compact: compact)
+            button.isEnabled = enabled
+            button.target = self
+            button.action = #selector(selectChoice(_:))
+            let position = rightToLeft ? visible.count - index - 1 : index
+            button.frame = NSRect(x: CGFloat(position) * side, y: 0, width: side, height: side)
+            if button.superview !== selectorGroup { selectorGroup.addSubview(button) }
+            let menu = NSMenu(title: space.title)
+            menu.autoenablesItems = false
+            let item = NSMenuItem(title: "Edit Space…", action: #selector(editSpace(_:)), keyEquivalent: "")
+            item.representedObject = space.id
+            item.target = self
+            item.isEnabled = enabled
+            menu.addItem(item)
+            button.menu = menu
+            return button
+        }
+        let inset = max(0, (layout.utilityGutter - side) / 2)
+        let leadingX = bounds.minX + inset
+        let trailingX = bounds.maxX - inset - side
+        plusButton.frame = NSRect(x: rightToLeft ? leadingX : trailingX, y: bounds.midY - side / 2, width: side, height: side)
+        overflowButton.frame = NSRect(x: rightToLeft ? trailingX : leadingX, y: bounds.midY - side / 2, width: side, height: side)
+        overflowButton.isHidden = !layout.showsOverflow || compact
+        plusButton.isEnabled = enabled
+        overflowButton.isEnabled = enabled
+        let controls: [NSButton] = choiceButtons + (overflowButton.isHidden ? [] : [overflowButton]) + [plusButton]
+        setAccessibilityChildren(controls)
+        setAccessibilitySelectedChildren(choiceButtons.filter { $0.isSelectedSpace })
+        // The window owns both boundaries of this representable's key-view loop.
+        // Do not replace its external successor with a private cycle or nil tail.
+        let participants = controls.filter(\.isEnabled).sorted {
+            $0.convert($0.bounds, to: self).midX < $1.convert($1.bounds, to: self).midX
+        }.map(ObjectIdentifier.init)
+        if keyViewWindow !== window || keyViewParticipants != participants {
+            keyViewWindow = window
+            keyViewParticipants = participants
+            window?.recalculateKeyViewLoop()
+        }
+    }
+
+    @objc private func selectChoice(_ sender: SpaceChoiceButton) {
+        if compact { presentMenu(relativeTo: sender) }
+        else if enabled { select?(sender.spaceID) }
+    }
+    @objc private func selectMenuItem(_ sender: NSMenuItem) {
+        guard enabled, let id = sender.representedObject as? UUID, spaces.contains(where: { $0.id == id }) else { return }
+        select?(id)
+    }
+    @objc private func editSpace(_ sender: NSMenuItem) {
+        guard enabled, let id = sender.representedObject as? UUID, let space = spaces.first(where: { $0.id == id }) else { return }
+        edit?(space)
+    }
+    @objc private func createSpace() { if enabled { create?() } }
+    @objc private func showAllSpaces() { presentMenu(relativeTo: overflowButton) }
+    private func presentMenu(relativeTo button: NSButton) {
+        guard enabled else { return }
+        spaceMenu.popUp(positioning: nil, at: NSPoint(x: button.bounds.midX, y: button.bounds.maxY), in: button)
+    }
+    func clearActions() {
+        select = nil; edit = nil; create = nil
+        enabled = false
+        let controls: [NSButton] = choiceButtons + [plusButton, overflowButton]
+        controls.forEach {
+            $0.isEnabled = false
+            $0.menu?.items.forEach { $0.isEnabled = false }
+        }
+        spaceMenu.items.forEach { $0.isEnabled = false }
+    }
+}
+
+class SpaceSelectorButton: NSButton {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        title = ""
+        isBordered = false
+        setButtonType(.momentaryChange)
+        imagePosition = .imageOnly
+        focusRingType = .exterior
+    }
+    required init?(coder: NSCoder) { nil }
+    override var acceptsFirstResponder: Bool { isEnabled && !isHidden }
+    override var canBecomeKeyView: Bool { acceptsFirstResponder && !isHiddenOrHasHiddenAncestor && window != nil }
+    override var focusRingMaskBounds: NSRect { bounds.insetBy(dx: 2, dy: 2) }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: focusRingMaskBounds, xRadius: 4, yRadius: 4).fill()
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard isEnabled, !isHidden else { return false }
+        performClick(nil)
+        return true
+    }
+}
+
+final class SpaceChoiceButton: SpaceSelectorButton {
+    let spaceID: UUID
+    private(set) var isSelectedSpace = false
+    private(set) var displayedSymbol: String?
+
+    init(spaceID: UUID) { self.spaceID = spaceID; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { nil }
+
+    func configure(_ space: BrowserSpace, selected: Bool, compact: Bool) {
+        isSelectedSpace = selected
+        displayedSymbol = selected ? space.icon.symbol : nil
+        image = displayedSymbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
+        symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+        contentTintColor = .labelColor
+        toolTip = compact ? "All Spaces — \(space.title)" : space.title
+        setAccessibilityLabel(compact ? "All Spaces, current Space \(space.title)" : "Switch to Space \(space.title)")
+        setAccessibilitySelected(selected)
+        setAccessibilityValue(selected ? "Selected" : "Not selected")
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if !isSelectedSpace {
+            (isEnabled ? NSColor.secondaryLabelColor : .disabledControlTextColor).setFill()
+            NSBezierPath(ovalIn: NSRect(x: bounds.midX - 2, y: bounds.midY - 2, width: 4, height: 4)).fill()
         }
     }
 }
