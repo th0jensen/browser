@@ -270,7 +270,7 @@ private struct BrowserCommands: Commands {
             Button("Open Location") { browser?.requestAddressFocus() }
                 .keyboardShortcut("l", modifiers: .command)
             Button(CommandPaletteMode.editCurrentDestination.menuTitle) {
-                browser?.showCommandPalette(mode: .editCurrentDestination)
+                browser?.toggleCommandPalette()
             }
                 .keyboardShortcut("g", modifiers: .command)
             Button("Reload Page") { browser?.reload() }

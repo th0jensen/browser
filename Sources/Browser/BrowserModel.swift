@@ -103,6 +103,7 @@ final class BrowserModel: NSObject {
     var addressFocusRequest = 0
     var commandPaletteRequest = 0
     private(set) var commandPaletteMode: CommandPaletteMode = .newDestination
+    private(set) var commandPaletteWantsPresentation = false
     @ObservationIgnored weak var commandPalette: CommandPaletteController?
     @ObservationIgnored var consumedAddressFocusRequest = 0
     @ObservationIgnored private var suspender: TabSuspender?
@@ -1020,15 +1021,36 @@ final class BrowserModel: NSObject {
         activeTab?.webView?.go(to: item)
     }
 
+    /// Preserve the existing zero-argument action for toolbar/footer callers.
+    func showCommandPalette() { showCommandPalette(mode: .newDestination) }
+
     /// Both modes only request presentation. Cancel older toolbar focus work;
     /// opening the palette must not load a page, create a tab, or dismiss Peek.
-    func showCommandPalette(mode: CommandPaletteMode = .newDestination) {
+    func showCommandPalette(mode: CommandPaletteMode) {
         guard !isClosed, !isExtensionWindow else { return }
         consumedAddressFocusRequest = addressFocusRequest
         let field = (window?.firstResponder as? AddressField)
             ?? ((window?.firstResponder as? NSTextView)?.delegate as? AddressField)
         field?.requestFocus(0)
         commandPaletteMode = mode
+        commandPaletteWantsPresentation = true
+        commandPaletteRequest += 1
+    }
+
+    /// Include queued presentation intent, not only the current native view.
+    /// Two toggles before SwiftUI applies either request must remain closed.
+    func toggleCommandPalette() {
+        guard !isClosed, !isExtensionWindow else { return }
+        if commandPaletteWantsPresentation || commandPalette?.isPresented == true {
+            commandPaletteWantsPresentation = false
+            commandPaletteRequest += 1
+            commandPalette?.dismiss()
+        } else { showCommandPalette(mode: .editCurrentDestination) }
+    }
+
+    func commandPaletteDidDismiss(_ palette: CommandPaletteController) {
+        guard commandPalette === palette, commandPaletteWantsPresentation else { return }
+        commandPaletteWantsPresentation = false
         commandPaletteRequest += 1
     }
 

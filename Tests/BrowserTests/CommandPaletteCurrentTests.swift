@@ -6,7 +6,7 @@ import XCTest
 
 @MainActor
 final class CommandPaletteCurrentTests: XCTestCase {
-    func testCurrentURLIsFullySelectedAndRepeatedCommandRestoresItWithoutNavigation() async throws {
+    func testCommandGTogglesClosedAndOpenRestoringCurrentURLAndFocusWithoutNavigation() async throws {
         let fixture = try await fixture()
         defer { fixture.close() }
         try await loadCurrentPage(fixture)
@@ -15,7 +15,9 @@ final class CommandPaletteCurrentTests: XCTestCase {
         let revision = source.navigationRevision
         let ids = fixture.browser.allTabs.map(\.id)
         let view = source.webView
-        let palette = try await open(fixture, mode: .editCurrentDestination)
+        fixture.window.makeFirstResponder(view)
+        let previousResponder = fixture.window.firstResponder
+        let palette = try await toggleOpen(fixture)
         let editor = try XCTUnwrap(palette.field.currentEditor() as? NSTextView)
         XCTAssertEqual(editor.string, url)
         XCTAssertEqual(editor.selectedRange(), NSRange(location: 0, length: url.utf16.count))
@@ -25,10 +27,14 @@ final class CommandPaletteCurrentTests: XCTestCase {
         XCTAssertEqual(palette.glass?.superview?.layer?.backgroundColor?.alpha ?? 0, 0)
         editor.insertText("café 🦊 partial edit", replacementRange: editor.selectedRange())
         try await waitFor("partial native edit") { palette.typedText == "café 🦊 partial edit" }
-        _ = try await open(fixture, mode: .editCurrentDestination)
-        XCTAssertTrue(palette.field.currentEditor() === editor)
-        XCTAssertEqual(editor.string, url)
-        XCTAssertEqual(editor.selectedRange(), NSRange(location: 0, length: url.utf16.count))
+        fixture.browser.toggleCommandPalette()
+        XCTAssertFalse(palette.isPresented)
+        XCTAssertFalse(fixture.browser.commandPaletteWantsPresentation)
+        XCTAssertTrue(fixture.window.firstResponder === previousResponder)
+        _ = try await toggleOpen(fixture)
+        let reopened = try XCTUnwrap(palette.field.currentEditor() as? NSTextView)
+        XCTAssertEqual(reopened.string, url)
+        XCTAssertEqual(reopened.selectedRange(), NSRange(location: 0, length: url.utf16.count))
         XCTAssertEqual(fixture.browser.allTabs.map(\.id), ids)
         XCTAssertEqual(source.navigationRevision, revision)
         XCTAssertTrue(source.webView === view)
@@ -202,7 +208,7 @@ final class CommandPaletteCurrentTests: XCTestCase {
         }
     }
 
-    func testCurrentModeIMEIsNotSubmittedAndCommandGReseedsOnlyOnExplicitRequest() async throws {
+    func testCurrentModeIMEIsNotSubmittedAndToggleClosesBeforeNextOpenReseeds() async throws {
         let fixture = try await fixture()
         defer { fixture.close() }
         try await loadCurrentPage(fixture)
@@ -215,11 +221,14 @@ final class CommandPaletteCurrentTests: XCTestCase {
         palette.perform(.submit)
         XCTAssertTrue(palette.isPresented)
         XCTAssertEqual(fixture.source.navigationRevision, revision)
-        _ = try await open(fixture, mode: .editCurrentDestination)
-        XCTAssertFalse(editor.hasMarkedText())
+        fixture.browser.toggleCommandPalette()
+        XCTAssertFalse(palette.isPresented)
+        _ = try await toggleOpen(fixture)
+        let reopened = try XCTUnwrap(palette.field.currentEditor() as? NSTextView)
+        XCTAssertFalse(reopened.hasMarkedText())
         let expected = try XCTUnwrap(fixture.source.url).absoluteString
-        XCTAssertEqual(editor.string, expected)
-        XCTAssertEqual(editor.selectedRange(), NSRange(location: 0, length: expected.utf16.count))
+        XCTAssertEqual(reopened.string, expected)
+        XCTAssertEqual(reopened.selectedRange(), NSRange(location: 0, length: expected.utf16.count))
         XCTAssertEqual(fixture.browser.allTabs.count, 1)
     }
 
@@ -266,7 +275,7 @@ final class CommandPaletteCurrentTests: XCTestCase {
         XCTAssertTrue(BrowserShortcutView.performMenuCommand(try event("l", .command), menu: menu))
         XCTAssertEqual(fixture.browser.addressFocusRequest, addressRequest + 1)
         XCTAssertEqual(fixture.browser.allTabs.count, 1)
-        XCTAssertEqual(CommandPaletteMode.editCurrentDestination.menuTitle, "Open Command Bar")
+        XCTAssertEqual(CommandPaletteMode.editCurrentDestination.menuTitle, "Toggle Command Bar")
     }
 
     func testOnlySelectedResultShowsReturnAcrossSelectionReloadAndReuse() async throws {
@@ -336,6 +345,17 @@ final class CommandPaletteCurrentTests: XCTestCase {
 
     private func open(_ fixture: PaletteFixture, mode: CommandPaletteMode) async throws -> CommandPaletteController {
         fixture.browser.showCommandPalette(mode: mode)
+        return try await waitForOpen(fixture, mode: mode)
+    }
+
+    private func toggleOpen(_ fixture: PaletteFixture) async throws -> CommandPaletteController {
+        XCTAssertFalse(fixture.browser.commandPalette?.isPresented == true)
+        XCTAssertFalse(fixture.browser.commandPaletteWantsPresentation)
+        fixture.browser.toggleCommandPalette()
+        return try await waitForOpen(fixture, mode: .editCurrentDestination)
+    }
+
+    private func waitForOpen(_ fixture: PaletteFixture, mode: CommandPaletteMode) async throws -> CommandPaletteController {
         let request = fixture.browser.commandPaletteRequest
         try await waitFor("applied command palette request") {
             guard let palette = fixture.browser.commandPalette, let anchor = palette.anchor as? CommandPaletteAnchor else { return false }
@@ -375,8 +395,11 @@ private final class PaletteMenuTarget: NSObject {
     var nextCalls = 0
     var previousCalls = 0
     init(browser: BrowserModel) { self.browser = browser }
-    @objc func current() { currentCalls += 1; browser.showCommandPalette(mode: .editCurrentDestination) }
-    @objc func new() { browser.showCommandPalette() }
+    @objc func current() { currentCalls += 1; browser.toggleCommandPalette() }
+    @objc func new() {
+        let compatibleAction: () -> Void = browser.showCommandPalette
+        compatibleAction()
+    }
     @objc func location() { browser.requestAddressFocus() }
     @objc func next() { nextCalls += 1 }
     @objc func previous() { previousCalls += 1 }

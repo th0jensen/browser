@@ -8,7 +8,7 @@ enum CommandPaletteMode: Equatable, Sendable {
     var menuTitle: String {
         switch self {
         case .newDestination: "New Tab"
-        case .editCurrentDestination: "Open Command Bar"
+        case .editCurrentDestination: "Toggle Command Bar"
         }
     }
 }
@@ -27,7 +27,7 @@ struct CommandPaletteHost: NSViewRepresentable {
     }
 
     func updateNSView(_ view: CommandPaletteAnchor, context: Context) {
-        view.update(request: request, mode: browser.commandPaletteMode)
+        view.update()
     }
 
     static func dismantleNSView(_ view: CommandPaletteAnchor, coordinator: ()) {
@@ -37,11 +37,11 @@ struct CommandPaletteHost: NSViewRepresentable {
 
 final class CommandPaletteAnchor: NSView {
     let palette: CommandPaletteController
-    private var requested = 0
+    private weak var browser: BrowserModel?
     private(set) var applied = 0
-    private var requestedMode: CommandPaletteMode = .newDestination
 
     init(browser: BrowserModel, bookmarks: BookmarkStore) {
+        self.browser = browser
         palette = CommandPaletteController(browser: browser, bookmarks: bookmarks)
         super.init(frame: .zero)
         palette.anchor = self
@@ -53,15 +53,25 @@ final class CommandPaletteAnchor: NSView {
         palette.isPresented ? super.hitTest(point) : nil
     }
 
-    func update(request: Int, mode: CommandPaletteMode) {
-        requested = request
-        requestedMode = mode
-        if palette.isPresented, !palette.contextIsValid { palette.dismiss(restoreFocus: false) }
+    func update() {
         DispatchQueue.main.async { [weak self] in self?.applyRequest() }
     }
 
-    private func applyRequest() {
-        if requested != applied, palette.present(mode: requestedMode) { applied = requested }
+    func applyRequest() {
+        // Read the live window intent. An earlier queued SwiftUI update must not
+        // reopen a bar that a second Cmd-G has already cancelled.
+        guard let browser else { return }
+        if palette.isPresented, !palette.contextIsValid, browser.commandPaletteRequest == applied {
+            palette.dismiss(restoreFocus: false)
+        }
+        guard browser.commandPaletteRequest != applied else { return }
+        let request = browser.commandPaletteRequest
+        if !browser.commandPaletteWantsPresentation {
+            // A completed acceptance may already own a destination focus task.
+            // Consuming its closed request must not cancel that handoff.
+            if palette.isPresented { palette.dismiss() }
+            applied = request
+        } else if palette.present(mode: browser.commandPaletteMode) { applied = request }
     }
 
     override func viewDidMoveToWindow() {
@@ -72,7 +82,7 @@ final class CommandPaletteAnchor: NSView {
 
     override func layout() {
         super.layout()
-        if requested != applied { DispatchQueue.main.async { [weak self] in self?.applyRequest() } }
+        if browser?.commandPaletteRequest != applied { DispatchQueue.main.async { [weak self] in self?.applyRequest() } }
         palette.layoutPresentation()
     }
 }
@@ -94,6 +104,10 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     private var overlay: CommandPaletteOverlay?
     private(set) var results: [AddressResult] = []
     private(set) var typedText = ""
+    private var prefilledSourceURL: URL?
+    private var currentSourceResultID: AddressResult.Action?
+    private var inputWasEdited = false
+    private var inputLeadingInset: CGFloat?
     private(set) var completionStart: Int?
     private weak var previousResponder: NSResponder?
     private weak var sourceTab: BrowserTab?
@@ -200,7 +214,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
             }
             return true
         }
-        if isPresented { dismiss(restoreFocus: false) }
+        if isPresented { dismiss(restoreFocus: false, updatesRequest: false) }
         removeEventMonitor()
         if let peek = browser.peek { previousResponder = peek.tab.webView }
         else { previousResponder = ((window.firstResponder as? NSTextView)?.delegate as? NSResponder) ?? window.firstResponder }
@@ -245,6 +259,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
             editor.string = typedText
             editor.setSelectedRange(NSRange(location: 0, length: typedText.utf16.count))
             editor.scrollRangeToVisible(NSRange(location: 0, length: 0))
+            // Keep the native unscrolled drawing inset, not the document's
+            // changing position while the user scrolls a long URL horizontally.
+            inputLeadingInset = CommandPaletteLayout.leadingPoint(field).x
         }
         layoutPresentation()
     }
@@ -252,16 +269,20 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     private func resetInput(mode: CommandPaletteMode) {
         (field.currentEditor() as? NSTextView)?.unmarkText()
         self.mode = mode
-        typedText = mode == .editCurrentDestination ? sourceFocusedPage?.url?.absoluteString ?? "" : ""
+        prefilledSourceURL = mode == .editCurrentDestination ? sourceFocusedPage?.url : nil
+        typedText = prefilledSourceURL?.absoluteString ?? ""
+        inputWasEdited = false
         completionStart = nil
         field.updatePresentation(text: typedText, url: nil, title: "")
         refreshResults()
     }
 
-    func dismiss(restoreFocus: Bool = true) {
+    func dismiss(restoreFocus: Bool = true, updatesRequest: Bool = true) {
         focusTask?.cancel()
+        if updatesRequest { browser?.commandPaletteDidDismiss(self) }
         guard let overlay else { return }
         let window = overlay.window
+        if let editor = field.currentEditor() as? NSTextView { editor.unmarkText() }
         if field.currentEditor() != nil || window?.firstResponder === table { window?.makeFirstResponder(nil) }
         overlay.removeFromSuperview()
         self.overlay = nil
@@ -270,6 +291,9 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         table.deselectAll(nil)
         table.reloadData()
         typedText = ""
+        prefilledSourceURL = nil
+        currentSourceResultID = nil
+        inputLeadingInset = nil
         completionStart = nil
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers = []
@@ -306,7 +330,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         let textX = CommandPaletteLayout.textX + content.leadingAdjustment
         CommandPaletteLayout.place(field, textX: textX,
                                    baselineY: 32 + (field.font?.capHeight ?? 0) / 2,
-                                   width: max(0, width - textX - CommandPaletteLayout.inset))
+                                   width: max(0, width - textX - CommandPaletteLayout.inset), leadingInset: inputLeadingInset)
         separator.isHidden = results.isEmpty
         scroll.isHidden = results.isEmpty
     }
@@ -322,6 +346,7 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         }
         let text = editor.string
         let appending = text.count > typedText.count && text.hasPrefix(typedText)
+        if text != typedText { inputWasEdited = true }
         typedText = text
         refreshResults()
         if appending, let completion = AddressSuggestions.inlineCompletion(of: text, with: results.first?.completionSuggestion) {
@@ -336,6 +361,25 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
     private func refreshResults() {
         guard let browser else { return }
         results = AddressResults.results(for: typedText, browser: browser, bookmarks: bookmarks.bookmarks, includesTypedAddress: true)
+        currentSourceResultID = nil
+        if !inputWasEdited, let url = prefilledSourceURL, typedText == url.absoluteString, let source = sourceFocusedPage {
+            // This is a checked current-source intent, not permission to parse
+            // arbitrary typed schemes. It also outranks matching *other* tabs.
+            let current = AddressResult(owner: ObjectIdentifier(browser), action: .navigate(url), title: source.title,
+                                        detail: url.absoluteString,
+                                        destinationSpace: browser.isPrivate ? "Private Window" : browser.spaces.space(browser.activeSpaceID)?.title)
+            currentSourceResultID = current.id
+            results.removeAll { $0.id == current.id }
+            results.insert(current, at: 0)
+            if results.count > 8, let index = results.lastIndex(where: {
+                if case .search = $0.action { return false }
+                return true
+            }) {
+                // The shared builder reserves explicit Search. Keep that slot
+                // when current-source intent displaces a lower-ranked match.
+                results.remove(at: index)
+            }
+        }
         table.reloadData()
         if !results.isEmpty { table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false) }
         else { table.deselectAll(nil) }
@@ -383,10 +427,26 @@ final class CommandPaletteController: NSObject, NSTextFieldDelegate, NSTableView
         guard contextIsValid, let browser else { dismiss(restoreFocus: false); return }
         guard results.indices.contains(table.selectedRow) else { return }
         let result = results[table.selectedRow]
+        let displayedText = field.currentEditor()?.string ?? field.stringValue
+        if !inputWasEdited, result.id == currentSourceResultID, let url = prefilledSourceURL,
+           displayedText == url.absoluteString, let source = sourceFocusedPage, source.url == url {
+            guard source.browser === browser, source.spaceID == sourceSpaceID,
+                  browser.spaces.space(source.spaceID)?.profileID == source.profileID,
+                  (browser.tabAcrossSpaces(withID: source.id) === source || browser.peek?.tab === source),
+                  browser.websiteDataStore(forProfileID: source.profileID) != nil else {
+                dismiss(restoreFocus: false)
+                return
+            }
+            // The unchanged current URL means return to this exact live page.
+            // Retain its document/form state, for HTTP and unsupported schemes
+            // alike. No reload, search, tab switch, or broad scheme allowance.
+            dismiss()
+            return
+        }
+        // Other selected rows are explicit actions, even without a text edit.
         // A completion's visible host may be shorter than its history resource.
         // Return accepts that exact completion; explicit row clicks accept the row.
         var accepted = result
-        let displayedText = field.currentEditor()?.string ?? field.stringValue
         if acceptCompletion, completionStart != nil, table.selectedRow == 0,
            let url = AddressSuggestions.completedURL(for: displayedText, with: result.completionSuggestion) {
             accepted = AddressResult(owner: result.owner, action: .navigate(url), title: result.title,
@@ -511,14 +571,14 @@ enum CommandPaletteLayout {
         return NSPoint(x: field.bounds.minX, y: y)
     }
 
-    static func place(_ field: NSTextField, textX: CGFloat, baselineY: CGFloat, width: CGFloat) {
+    static func place(_ field: NSTextField, textX: CGFloat, baselineY: CGFloat, width: CGFloat, leadingInset: CGFloat? = nil) {
         let height = ceil(max(field.intrinsicContentSize.height, field.cell?.cellSize.height ?? 0))
         field.setFrameSize(NSSize(width: max(0, width), height: max(1, height)))
         let cellRect = field.cell?.titleRect(forBounds: field.bounds) ?? field.bounds
         let extraWidth = cellRect.minX - field.bounds.minX + field.bounds.maxX - cellRect.maxX
         field.setFrameSize(NSSize(width: max(0, width + extraWidth), height: field.frame.height))
         guard let parent = field.superview else { return }
-        let leading = parent.convert(leadingPoint(field), from: field)
+        let leading = parent.convert(leadingInset.map { NSPoint(x: $0, y: 0) } ?? leadingPoint(field), from: field)
         let baseline = parent.convert(baselinePoint(field), from: field)
         field.setFrameOrigin(NSPoint(x: field.frame.minX + textX - leading.x,
                                      y: field.frame.minY + baselineY - baseline.y))
