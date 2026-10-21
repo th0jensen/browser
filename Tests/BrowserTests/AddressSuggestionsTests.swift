@@ -51,6 +51,43 @@ final class AddressSuggestionsTests: XCTestCase {
         XCTAssertTrue(AddressSuggestions.rank("  ", pages: pages, bookmarks: [], now: now).isEmpty)
     }
 
+    func testBoundedTopKMatchesFullSortWithStableTiesAndBookmarkMerging() {
+        let pages = (0..<180).map { index in
+            let host = index % 3 == 0 ? "git\(index).example" : "site\(index).example"
+            let title = index % 3 == 1 ? "Git guide" : "A digital garden"
+            return page("https://\(host)/", title: title, visits: index % 7, daysAgo: Double(index % 100))
+        }
+        let bookmarks = pages.enumerated().compactMap { index, page in
+            index % 5 == 0 ? Bookmark(title: page.title, url: page.url) : nil
+        }
+        let bookmarked = Set(bookmarks.map(\.url))
+        func tier(_ page: HistoryPage) -> Int {
+            if AddressSuggestions.strippedAddress(page.url).hasPrefix("git") { return 3 }
+            if page.title.hasPrefix("Git") { return 2 }
+            return 1
+        }
+        func weight(_ page: HistoryPage) -> Double {
+            AddressSuggestions.frecency(visitCount: page.visitCount, lastVisit: page.lastVisit, now: now)
+                + (bookmarked.contains(page.url) ? 2 : 0)
+        }
+        let sorted = pages.sorted { a, b in
+            if tier(a) != tier(b) { return tier(a) > tier(b) }
+            if weight(a) != weight(b) { return weight(a) > weight(b) }
+            let aLength = AddressSuggestions.strippedAddress(a.url).count
+            let bLength = AddressSuggestions.strippedAddress(b.url).count
+            if aLength != bLength { return aLength < bLength }
+            return a.url.absoluteString < b.url.absoluteString
+        }
+        for limit in [0, 1, 2, 6, 17, 180, 200] {
+            let expected = sorted.prefix(limit).map {
+                AddressSuggestion(url: $0.url, title: $0.title, isBookmarked: bookmarked.contains($0.url))
+            }
+            XCTAssertEqual(AddressSuggestions.rank("git", pages: pages, bookmarks: bookmarks, now: now, limit: limit), expected)
+            XCTAssertEqual(AddressSuggestions.rank("git", pages: pages.reversed(), bookmarks: bookmarks.reversed(), now: now, limit: limit), expected)
+        }
+        XCTAssertTrue(AddressSuggestions.rank("git", pages: pages, bookmarks: bookmarks, limit: -1).isEmpty)
+    }
+
     func testOlderVisitsCountForLess() {
         XCTAssertGreaterThan(AddressSuggestions.frecency(visitCount: 2, lastVisit: now, now: now),
                              AddressSuggestions.frecency(visitCount: 2, lastVisit: now - 10 * 24 * 60 * 60, now: now))

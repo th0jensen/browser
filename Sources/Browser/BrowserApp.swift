@@ -137,7 +137,7 @@ private struct BrowserCommands: Commands {
                 .keyboardShortcut("n", modifiers: .command)
             Button("New Private Window") { openWindow(id: BrowserApp.privateWindowID) }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
-            Button("New Tab") { browser?.addTab() }
+            Button("New Tab") { browser?.showCommandPalette() }
                 .keyboardShortcut("t", modifiers: .command)
             Button("Reopen Closed Tab") { browser?.reopenClosedTab() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])

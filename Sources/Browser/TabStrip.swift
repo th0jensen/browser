@@ -31,6 +31,9 @@ struct TabStrip: View {
     @Binding var hoverCardTabID: UUID?
     var usesNativeHoverPopover = false
     var floating = false
+    /// Hosts with a command palette inject destination presentation. Older hosts
+    /// keep their existing blank-tab behavior without depending on that module.
+    var newTabAction: (() -> Void)? = nil
     @AppStorage(ChromeCustomization.compactKey) private var compactTabs = true
     @AppStorage(BrowserIntelligence.showsTidyTabsKey) private var showsTidyTabs = true
 
@@ -267,8 +270,13 @@ struct TabStrip: View {
             }
     }
 
+    func requestNewTab() {
+        if let newTabAction { newTabAction() }
+        else { browser.addTab() }
+    }
+
     private func newTabRow(height: CGFloat) -> some View {
-        Button { browser.addTab() } label: {
+        Button(action: requestNewTab) {
             Label("New Tab", systemImage: "plus")
                 .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(.secondary)
@@ -399,7 +407,7 @@ struct TabStrip: View {
 
     @ViewBuilder
     private var stripMenu: some View {
-        Button("New Tab") { browser.addTab() }
+        Button("New Tab", action: requestNewTab)
         Button("New Folder…") { browser.requestNewFolder() }
         Button("Reopen Closed Tab") { browser.reopenClosedTab() }
             .disabled(!browser.canReopenClosedTab)

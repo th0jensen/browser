@@ -20,9 +20,9 @@ struct BrowserWindow: View {
     /// What the user typed, without the inline completion.
     @State private var typedAddress = ""
     @State private var completionStart: Int?
-    @State private var suggestions: [AddressSuggestion] = []
+    @State private var suggestions: [AddressResult] = []
     @State private var selectedSuggestion: Int?
-    @State private var addressBlurRequest = 0
+    @State private var addressPageFocusTask: Task<Void, Never>?
     @State private var hoverCardTabID: UUID?
     @State private var isFullScreen = false
     @AppStorage("toolbarLayout.vertical") private var verticalToolbarLayout = Data()
@@ -109,7 +109,7 @@ struct BrowserWindow: View {
         HStack(spacing: 0) {
             if tabLayout == .vertical && !autoHideSidebar {
                 TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
-                         hoverCardTabID: $hoverCardTabID)
+                         hoverCardTabID: $hoverCardTabID, newTabAction: { browser.showCommandPalette() })
                     .frame(width: sidebarWidth)
                     .privateChrome(browser.isPrivate)
                     .overlay(alignment: .trailing) {
@@ -125,7 +125,7 @@ struct BrowserWindow: View {
             if tabLayout == .vertical && autoHideSidebar {
                 ChromeRevealRegion(controller: chromeHover, region: .sidebar) {
                     TabStrip(browser: browser, layout: .vertical, isFullScreen: isFullScreen,
-                         hoverCardTabID: $hoverCardTabID, floating: true)
+                         hoverCardTabID: $hoverCardTabID, floating: true, newTabAction: { browser.showCommandPalette() })
                     .frame(width: sidebarWidth)
                     .privateChrome(browser.isPrivate)
                     .background(ChromePresentationMarker(identifier: "BrowserFloatingSidebarGeometry", onViewAvailable: { view in
@@ -236,6 +236,7 @@ struct BrowserWindow: View {
             if !browser.isPrivate { await BrowserExtensions.shared.restore() }
         }
         .onDisappear {
+            addressPageFocusTask?.cancel()
             windowState.close()
             persistSidebarWidth()
             chromeHover.stop()
@@ -378,7 +379,8 @@ struct BrowserWindow: View {
 
     private var horizontalTabs: some View {
         TabStrip(browser: browser, layout: .horizontal, isFullScreen: isFullScreen,
-                 hoverCardTabID: $hoverCardTabID, usesNativeHoverPopover: true, floating: usesFullscreenToolbarOverlay)
+                 hoverCardTabID: $hoverCardTabID, usesNativeHoverPopover: true, floating: usesFullscreenToolbarOverlay,
+                 newTabAction: { browser.showCommandPalette() })
             .frame(maxHeight: .infinity, alignment: .top)
             .privateChrome(browser.isPrivate)
             .tint(accent)
@@ -387,13 +389,13 @@ struct BrowserWindow: View {
     // MARK: Address bar
 
     private func editAddress(_ text: String) {
+        addressPageFocusTask?.cancel()
         // Typing more of the text completes it again; deleting doesn't, so the deleted completion stays gone.
         let isAppending = text.count > typedAddress.count && text.hasPrefix(typedAddress)
         typedAddress = text
         selectedSuggestion = nil
-        suggestions = AddressSuggestions.rank(text, pages: browser.history?.pages ?? [],
-                                              bookmarks: bookmarks.bookmarks)
-        if isAppending, let completion = AddressSuggestions.inlineCompletion(of: text, with: suggestions.first) {
+        suggestions = AddressResults.results(for: text, browser: browser, bookmarks: bookmarks.bookmarks)
+        if isAppending, let completion = AddressSuggestions.inlineCompletion(of: text, with: suggestions.first?.completionSuggestion) {
             completionStart = (text as NSString).length
             address = completion
         } else {
@@ -413,7 +415,7 @@ struct BrowserWindow: View {
                 address = typedAddress
             } else {
                 selectedSuggestion = min(index, suggestions.count - 1)
-                address = suggestions[min(index, suggestions.count - 1)].url.absoluteString
+                address = suggestions[min(index, suggestions.count - 1)].editorText
             }
             return true
         case .submit:
@@ -421,7 +423,7 @@ struct BrowserWindow: View {
                 open(suggestions[selectedSuggestion])
             } else {
                 if let id = browser.activeTabID { chromeHover.addressNavigationSubmitted(in: id) }
-                if completionStart != nil, let completed = AddressSuggestions.completedURL(for: address, with: suggestions.first) {
+                if completionStart != nil, let completed = AddressSuggestions.completedURL(for: address, with: suggestions.first?.completionSuggestion) {
                     browser.navigate(to: completed.absoluteString)
                 } else {
                     browser.navigate(to: address)
@@ -443,21 +445,27 @@ struct BrowserWindow: View {
         }
     }
 
-    private func open(_ suggestion: AddressSuggestion) {
+    private func open(_ suggestion: AddressResult) {
         // The list can report a click more than once before it closes.
-        guard !suggestions.isEmpty else { return }
-        address = suggestion.url.absoluteString
-        browser.open(suggestion.url)
-        finishEditingAddress()
+        guard suggestions.contains(suggestion) else { return }
+        if case .command(let command) = suggestion.action {
+            guard command.isAvailable(in: browser) else { return }
+            // End this edit before New Tab requests a new native field editor.
+            finishEditingAddress()
+            AddressResults.execute(suggestion, in: browser)
+        } else if AddressResults.execute(suggestion, in: browser) {
+            finishEditingAddress()
+        }
     }
 
     private func finishEditingAddress() {
+        addressPageFocusTask?.cancel()
         closeSuggestions()
         completionStart = nil
-        addressBlurRequest += 1
-        browser.window?.makeFirstResponder(browser.focusedPage?.webView)
+        browser.window?.makeFirstResponder(nil)
         addressIsFocused = false
         chromeHover.addressIsFocused = false
+        addressPageFocusTask = AddressResults.focusDestination(in: browser)
     }
 
     private func closeSuggestions() {
@@ -505,6 +513,10 @@ struct BrowserWindow: View {
                     .overlay {
                         pageShape.strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
                     }
+                } else {
+                    // A Space selected from the palette can have no live tab yet.
+                    NewTabView(bookmarks: bookmarks, browser: browser) { browser.requestAddressFocus() }
+                        .clipShape(pageShape)
                 }
             }
             .overlay {
@@ -518,6 +530,9 @@ struct BrowserWindow: View {
             .padding([.trailing, .bottom], BrowserChrome.edgeInset)
         }
         .padding(.top, BrowserChrome.edgeInset)
+        .background(CommandPaletteHost(browser: browser, bookmarks: bookmarks,
+                                       request: browser.commandPaletteRequest,
+                                       spaceID: browser.activeSpaceID, tabID: browser.activeTabID))
     }
 
     private func hoverCard(tabFrames: [UUID: Anchor<CGRect>]) -> some View {
@@ -655,7 +670,7 @@ struct BrowserWindow: View {
                 .disabled(tabLayout != .vertical)
                 .help(autoHideSidebar ? "Pin Sidebar (⌘S)" : "Automatically Hide Sidebar (⌘S)")
         case .newTab:
-            Button { browser.addTab() } label: { Label("New Tab", systemImage: "plus") }
+            Button { browser.showCommandPalette() } label: { Label("New Tab", systemImage: "plus") }
                 .labelStyle(ChromeToolbarLabelStyle())
                 .font(.system(size: BrowserChrome.toolbarSymbolSize, weight: .regular))
                 .chromeToolbarButtonStyle()
@@ -716,7 +731,7 @@ struct BrowserWindow: View {
             NativeToolbarCommand(identifier: "settings", title: "Settings", symbol: "gearshape",
                                  action: { openSettings() }, menu: customizationMenu),
             NativeToolbarCommand(identifier: "newTab", title: "New Tab", symbol: "plus", help: "New Tab (⌘T)",
-                                 action: { browser.addTab() }, menu: customizationMenu)
+                                 action: { browser.showCommandPalette() }, menu: customizationMenu)
         ]
         for action in [NavigationAction.back, .forward, .reload] {
             let symbol = switch action {

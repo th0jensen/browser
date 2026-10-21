@@ -34,11 +34,17 @@ final class BrowserShortcutView: NSView {
             guard source === window || isToolbarWindow else { return event }
             if event.type == .otherMouseDown || event.type == .otherMouseUp {
                 guard let browser = self?.browser else { return event }
+                if browser.commandPalette?.isPresented == true { return event }
                 return BrowserMouseNavigation.handle(type: event.type, button: event.buttonNumber,
                                                       back: { browser.goBack() }, forward: { browser.goForward() }) ? nil : event
             }
             guard Self.isBrowserCommand(event) else { return event }
             let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            if event.charactersIgnoringModifiers?.lowercased() == "w", modifiers == .command,
+               let palette = self?.browser?.commandPalette, palette.isPresented {
+                palette.dismiss()
+                return nil
+            }
             if self?.browser?.chromePreferences.tabLayout == .horizontal,
                event.charactersIgnoringModifiers?.lowercased() == "s",
                modifiers == .command || modifiers == [.command, .control] { return nil }

@@ -10,11 +10,11 @@ struct AddressTextField: NSViewRepresentable {
     var pageURL: URL?
     var pageTitle = ""
     var completionStart: Int? = nil
-    var suggestions: [AddressSuggestion] = []
+    var suggestions: [AddressResult] = []
     var selectedSuggestion: Int? = nil
     var onEdit: ((String) -> Void)? = nil
     var onCommand: ((SuggestionAddressField.Command) -> Bool)? = nil
-    var onChooseSuggestion: ((AddressSuggestion) -> Void)? = nil
+    var onChooseSuggestion: ((AddressResult) -> Void)? = nil
     let focusRequest: Int
     let onFocusApplied: (Int) -> Void
     let onFocusChange: (Bool) -> Void
@@ -70,10 +70,16 @@ struct AddressTextField: NSViewRepresentable {
             guard let field = notification.object as? NSTextField else { return }
             let editedText = field.currentEditor()?.string ?? field.stringValue
             parent.text = editedText
+            // Let the input method own marked text. Generate results only after commitment.
+            if (field.currentEditor() as? NSTextView)?.hasMarkedText() == true {
+                closeSuggestions()
+                return
+            }
             parent.onEdit?(editedText)
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard !textView.hasMarkedText() else { return false }
             let command: SuggestionAddressField.Command
             switch commandSelector {
             case #selector(NSResponder.moveUp(_:)): command = .moveUp
@@ -88,7 +94,8 @@ struct AddressTextField: NSViewRepresentable {
         func updateSuggestions(for field: AddressField) {
             guard !parent.suggestions.isEmpty, parent.chromeRegionIsVisible,
                   !field.isHiddenOrHasHiddenAncestor, let window = field.window,
-                  field.currentEditor() != nil else { closeSuggestions(); return }
+                  let editor = field.currentEditor() as? NSTextView,
+                  !editor.hasMarkedText() else { closeSuggestions(); return }
             let panel: AddressSuggestionPanel
             if let existing = suggestionPanel { panel = existing }
             else {
@@ -107,7 +114,7 @@ struct AddressTextField: NSViewRepresentable {
             panel.contentView = NSHostingView(rootView: content)
             let anchor = window.convertToScreen(field.convert(field.bounds, to: nil))
             let width = max(300, anchor.width + 70)
-            let height = CGFloat(parent.suggestions.count * 29 + 10)
+            let height = CGFloat(parent.suggestions.count * 43 + 10)
             let screen = window.screen?.visibleFrame ?? anchor
             let x = min(max(anchor.minX - 22, screen.minX), screen.maxX - width)
             panel.setFrame(NSRect(x: x, y: anchor.minY - height - 8, width: width, height: height), display: true)
@@ -154,7 +161,7 @@ final class AddressField: NSTextField {
         if currentEditor() != nil { isPresentingEditor = true }
         editingText = isPresentingEditor ? text : (url?.absoluteString ?? text)
         if let editor = currentEditor() as? NSTextView, isPresentingEditor {
-            if editor.string != editingText {
+            if !editor.hasMarkedText(), editor.string != editingText {
                 editor.string = editingText
                 let length = (editingText as NSString).length
                 let start = min(completionStart ?? length, length)
