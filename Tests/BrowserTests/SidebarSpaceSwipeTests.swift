@@ -79,19 +79,95 @@ final class SidebarSpaceSwipeTests: XCTestCase {
         }
     }
 
-    func testDescriptorDestinationDoesNotWrapSkipForeignOwnersOrAcceptUnknownIDs() {
+    func testDescriptorDestinationDoesNotWrapSkipUnavailableOwnersOrAcceptUnknownIDs() {
         let profile = BrowserProfile.defaultID
         let a = BrowserSpace(id: UUID(), title: "A", profileID: profile)
         let b = BrowserSpace(id: UUID(), title: "B", profileID: profile)
-        let foreign = BrowserSpace(id: UUID(), title: "Foreign", profileID: UUID())
-        let items = [a, b, foreign, BrowserSpace(id: UUID(), title: "Last", profileID: profile)]
-        XCTAssertEqual(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: a.id, profileID: profile, offset: 1), b.id)
-        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: a.id, profileID: profile, offset: -1))
-        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: b.id, profileID: profile, offset: 1))
-        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: UUID(), profileID: profile, offset: 1))
-        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: foreign.id, profileID: profile, offset: -1))
-        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: a.id, profileID: profile, offset: 2))
-        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: [], activeID: a.id, profileID: profile, offset: 1))
+        let unavailable = BrowserSpace(id: UUID(), title: "Unavailable", profileID: UUID())
+        let items = [a, b, unavailable, BrowserSpace(id: UUID(), title: "Last", profileID: profile)]
+        let known: (UUID) -> Bool = { $0 == profile }
+        XCTAssertEqual(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: a.id, offset: 1, isProfileAvailable: known), b.id)
+        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: a.id, offset: -1, isProfileAvailable: known))
+        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: b.id, offset: 1, isProfileAvailable: known))
+        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: UUID(), offset: 1, isProfileAvailable: known))
+        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: unavailable.id, offset: -1, isProfileAvailable: known))
+        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: items, activeID: a.id, offset: 2, isProfileAvailable: known))
+        XCTAssertNil(SidebarSpaceSwipeRecognizer.destination(in: [], activeID: a.id, offset: 1, isProfileAvailable: known))
+    }
+
+    func testDescriptorDestinationAllowsBothDirectionsBetweenKnownOrdinaryProfiles() {
+        let profiles = [BrowserProfile.defaultID, UUID(), UUID()]
+        let spaces = profiles.enumerated().map { BrowserSpace(id: UUID(), title: "Space \($0.offset)", profileID: $0.element) }
+        let known: (UUID) -> Bool = { profiles.contains($0) }
+        for index in 0..<2 {
+            XCTAssertEqual(SidebarSpaceSwipeRecognizer.destination(in: spaces, activeID: spaces[index].id,
+                offset: 1, isProfileAvailable: known), spaces[index + 1].id)
+            XCTAssertEqual(SidebarSpaceSwipeRecognizer.destination(in: spaces, activeID: spaces[index + 1].id,
+                offset: -1, isProfileAvailable: known), spaces[index].id)
+        }
+    }
+
+    func testNativeNamedProfileRecognitionDoesNotLoadResourcesBeforeCommittedSelection() throws {
+        let spaces = BrowserSpaceStore(directory: .temporaryDirectory, enabled: false)
+        let firstProfile = try spaces.profiles.create(title: "Work")
+        let secondProfile = try spaces.profiles.create(title: "Personal")
+        let firstSpace = try spaces.createSpace(title: "Work", profileID: firstProfile.id)
+        let secondSpace = try spaces.createSpace(title: "Personal", profileID: secondProfile.id)
+        let fixture = try Fixture(spaces: spaces)
+        defer { fixture.close() }
+        let original = try XCTUnwrap(fixture.browser.activeTab)
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: firstProfile.id))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: secondProfile.id))
+        XCTAssertTrue(fixture.send(.init(phase: .began, x: -100)))
+        fixture.send(.init(phase: .changed, x: -10))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: firstProfile.id))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: secondProfile.id))
+        XCTAssertEqual(fixture.browser.allTabs.map(\.id), [original.id])
+        fixture.send(.init(phase: .ended))
+        XCTAssertEqual(fixture.browser.activeSpaceID, firstSpace.id)
+        let firstTab = try XCTUnwrap(fixture.browser.activeTab)
+        XCTAssertEqual(firstTab.profileID, firstProfile.id)
+        XCTAssertTrue(spaces.profiles.hasLoadedResources(for: firstProfile.id), "Normal committed selection may resolve its own resources")
+        fixture.send(.init(phase: .began, x: -100))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: secondProfile.id))
+        fixture.send(.init(phase: .cancelled))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: secondProfile.id))
+        fixture.send(.init(phase: .began, x: -100))
+        fixture.send(.init(phase: .ended))
+        XCTAssertEqual(fixture.browser.activeSpaceID, secondSpace.id)
+        XCTAssertEqual(fixture.browser.activeTab?.profileID, secondProfile.id)
+        XCTAssertTrue(fixture.browser.tabAcrossSpaces(withID: original.id) === original)
+        XCTAssertTrue(fixture.browser.tabAcrossSpaces(withID: firstTab.id) === firstTab)
+        XCTAssertEqual(firstTab.profileID, firstProfile.id)
+        XCTAssertEqual(original.profileID, BrowserProfile.defaultID)
+        XCTAssertTrue(fixture.browser.allTabs.allSatisfy { $0.webView == nil })
+    }
+
+    func testNativeUnavailableProfileNeighborIsNotSkippedOrResolved() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "SwipeProfiles-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let profiles = BrowserProfileStore(directory: root, enabled: false)
+        let known = try profiles.create(title: "Known after unavailable")
+        let unknownID = UUID()
+        let descriptors = [
+            BrowserSpace(id: BrowserSpaceStore.defaultSpaceID, title: "Default", profileID: BrowserProfile.defaultID),
+            BrowserSpace(id: UUID(), title: "Unavailable", profileID: unknownID),
+            BrowserSpace(id: UUID(), title: "Known", profileID: known.id),
+        ]
+        try JSONEncoder().encode(descriptors).write(to: root.appending(path: "Spaces.json"))
+        let spaces = BrowserSpaceStore(directory: root, profiles: profiles)
+        let fixture = try Fixture(spaces: spaces)
+        defer { fixture.close() }
+        let original = try XCTUnwrap(fixture.browser.activeTab)
+        fixture.send(.init(phase: .began, x: -100))
+        fixture.send(.init(phase: .ended))
+        XCTAssertEqual(fixture.browser.activeSpaceID, BrowserSpaceStore.defaultSpaceID)
+        XCTAssertFalse(fixture.browser.selectSpace(descriptors[1].id))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: unknownID))
+        XCTAssertFalse(spaces.profiles.hasLoadedResources(for: known.id))
+        XCTAssertEqual(fixture.browser.allTabs.map(\.id), [original.id])
+        XCTAssertNil(original.webView)
     }
 
     func testNativeRegionSelectsOnlyItsOwningWindowAndKeepsViewsLazy() throws {
@@ -315,13 +391,15 @@ private final class Fixture {
     let window: SwipeTestWindow
     let region = SidebarSpaceSwipeView(frame: .init(x: 0, y: 80, width: 220, height: 400))
 
-    init() throws {
+    init(spaces suppliedSpaces: BrowserSpaceStore? = nil) throws {
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         let chrome = WindowChromePreferences(defaults: defaults)
         chrome.tabLayout = .vertical
-        let spaces = BrowserSpaceStore(directory: .temporaryDirectory, enabled: false)
-        _ = try spaces.createSpace(title: "Work")
-        _ = try spaces.createSpace(title: "Personal")
+        let spaces = suppliedSpaces ?? BrowserSpaceStore(directory: .temporaryDirectory, enabled: false)
+        if suppliedSpaces == nil {
+            _ = try spaces.createSpace(title: "Work")
+            _ = try spaces.createSpace(title: "Personal")
+        }
         browser = BrowserModel(chromePreferences: chrome, spaces: spaces)
         browser.consumedAddressFocusRequest = browser.addressFocusRequest
         window = SwipeTestWindow(contentRect: .init(x: 0, y: 0, width: 300, height: 500),

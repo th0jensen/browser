@@ -212,10 +212,12 @@ struct ClearDataView: View {
                     Text("Signs you out of most websites.")
                 }
                 Toggle("Cached images and files", isOn: binding(for: .cache))
-                Toggle("Site icons", isOn: binding(for: .favicons))
+                if data.includesSharedState { Toggle("Site icons", isOn: binding(for: .favicons)) }
             }
 
-            Text("Private windows aren’t affected. Their data is removed when they close.")
+            Text(data.includesSharedState
+                 ? "Only the Existing Profile is cleared. Private windows and other profiles are not affected."
+                 : "Only this profile is cleared. Other profiles and private windows are not affected.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -252,7 +252,8 @@ private struct BrowserCommands: Commands {
                     browser?.selectSpace(at: number - 1)
                 }
                 .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .control)
-                .disabled(space == nil || browser?.isPrivate != false || browser?.isExtensionWindow != false)
+                .disabled(space == nil || browser?.isPrivate != false || browser?.isExtensionWindow != false
+                          || space.map { browser?.spaces.profiles.profile($0.profileID) == nil } == true)
             }
         }
         // Native toggleToolbarShown: only changes NSToolbar.isVisible, which
@@ -322,7 +323,7 @@ private struct BrowserCommands: Commands {
             }
             .disabled(session.reopenableWindows.isEmpty)
 
-            let recentVisits = history.recentVisits(limit: 15)
+            let recentVisits = browser?.history?.recentVisits(limit: 15) ?? []
             if !recentVisits.isEmpty {
                 Divider()
                 ForEach(recentVisits) { visit in
@@ -338,6 +339,7 @@ private struct BrowserCommands: Commands {
                 .disabled(browser == nil)
         }
         CommandMenu("Bookmarks") {
+            let bookmarks = browser?.spaces.profiles.resources(for: browser?.profileID ?? BrowserProfile.defaultID)?.bookmarks ?? bookmarks
             Button(bookmarks.isBookmarked(bookmarkableTab?.url) ? "Remove Bookmark" : "Bookmark This Page") {
                 guard let tab = bookmarkableTab, let url = tab.url else { return }
                 bookmarks.toggle(title: tab.pageTitle, url: url)

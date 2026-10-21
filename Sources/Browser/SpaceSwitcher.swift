@@ -54,8 +54,10 @@ struct SpaceSwitcher: View {
     let browser: BrowserModel
     var style: Style = .menu
     @State private var editor: SpaceEditorRequest?
+    @State private var isShowingProfileSettings = false
 
     private var current: BrowserSpace? { browser.spaces.space(browser.activeSpaceID) }
+    private var profileTitle: String { browser.spaces.profiles.profile(browser.profileID)?.title ?? "Profile unavailable" }
 
     var body: some View {
         if !browser.isPrivate && !browser.isExtensionWindow {
@@ -65,12 +67,16 @@ struct SpaceSwitcher: View {
             }
             .disabled(browser.tabDrag.payload != nil)
             .sheet(item: $editor) { request in SpaceEditor(browser: browser, space: request.space) }
+            .sheet(isPresented: $isShowingProfileSettings) {
+                ProfileSiteSettingsView(permissions: browser.sitePermissions, zoom: browser.zoomLevels, title: profileTitle)
+            }
         }
     }
 
     private var fallbackMenu: some View {
         Menu {
-            Text("\(BrowserProfile.displayName) · Shared logins")
+            profileMenuItems
+            Divider()
             spaceMenuItems
             Divider()
             if let current { Button("Edit This Space…") { editor = SpaceEditorRequest(space: current) } }
@@ -79,7 +85,7 @@ struct SpaceSwitcher: View {
             Label(current?.title ?? "Default", systemImage: current?.icon.symbol ?? BrowserSpaceIcon.circle.symbol)
                 .lineLimit(1)
         }
-        .help("Switch Space. Spaces use the Existing Profile and share logins.")
+        .help("Spaces in the same profile share logins. Different profiles use separate website data.")
         .accessibilityLabel("Space: \(current?.title ?? "Default")")
     }
 
@@ -90,7 +96,11 @@ struct SpaceSwitcher: View {
             let layout = SpaceStripLayout(count: spaces.count, selectedIndex: selected, width: geometry.size.width)
             HStack(spacing: 4) {
                 if layout.usesCompactMenu {
-                    Menu { spaceMenuItems } label: { icon(current, selected: true) }
+                    Menu {
+                        profileMenuItems
+                        Divider()
+                        spaceMenuItems
+                    } label: { icon(current, selected: true) }
                         .menuIndicator(.hidden).menuStyle(.borderlessButton)
                         .frame(width: 28)
                         .help("All Spaces — \(current?.title ?? "Default")")
@@ -102,15 +112,24 @@ struct SpaceSwitcher: View {
                             icon(space, selected: space.id == browser.activeSpaceID)
                         }
                         .buttonStyle(.plain)
-                        .help(space.title)
-                        .accessibilityLabel("Switch to Space \(space.title)")
+                        .disabled(browser.spaces.profiles.profile(space.profileID) == nil)
+                        .help("\(space.title) — \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")")
+                        .accessibilityLabel("Switch to Space \(space.title), \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")")
                         .accessibilityValue(space.id == browser.activeSpaceID ? "Selected" : "")
                         .accessibilityAddTraits(space.id == browser.activeSpaceID ? [.isSelected] : [])
-                        .contextMenu { Button("Edit Space…") { editor = SpaceEditorRequest(space: space) } }
+                        .contextMenu {
+                            if space.id == browser.activeSpaceID { profileMenuItems }
+                            else { Text("Profile: \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")") }
+                            Button("Edit Space…") { editor = SpaceEditorRequest(space: space) }
+                        }
                     }
                     Spacer(minLength: 0)
                     if layout.showsOverflow {
-                        Menu { spaceMenuItems } label: {
+                        Menu {
+                            profileMenuItems
+                            Divider()
+                            spaceMenuItems
+                        } label: {
                             Image(systemName: "ellipsis").frame(width: 28, height: 28)
                         }
                         .menuIndicator(.hidden).menuStyle(.borderlessButton)
@@ -148,11 +167,23 @@ struct SpaceSwitcher: View {
             }
     }
 
+    @ViewBuilder private var profileMenuItems: some View {
+        Text("Profile: \(profileTitle)")
+        if !browser.supportsExtensions { Text("Extensions and password autofill are not available in this profile.") }
+        if browser.spaces.profiles.loadFailed { Text("Profiles could not be read. Keep Profiles.json for recovery.") }
+        if browser.profileID != BrowserProfile.defaultID {
+            Button("Profile Site Settings…") { isShowingProfileSettings = true }
+            Button("Clear Profile Data…") { browser.isShowingClearData = true }
+        }
+    }
+
     @ViewBuilder private var spaceMenuItems: some View {
         ForEach(browser.spaces.spaces) { space in
             Button { browser.selectSpace(space.id) } label: {
                 Label(space.title, systemImage: space.id == browser.activeSpaceID ? "checkmark" : space.icon.symbol)
+                Text(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")
             }
+            .disabled(browser.spaces.profiles.profile(space.profileID) == nil)
         }
     }
 }
@@ -177,9 +208,9 @@ struct BrowserSpaceHeading: View {
             }
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.primary)
-            .help(space.title)
+            .help("\(space.title) — \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")")
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("Space \(space.title)")
+            .accessibilityLabel("Space \(space.title), \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")")
             .sheet(item: $editor) { request in SpaceEditor(browser: browser, space: request.space) }
         }
     }
@@ -192,6 +223,9 @@ private struct SpaceEditor: View {
     @State private var icon: BrowserSpaceIcon
     @State private var theme: BrowserSpaceTheme
     @State private var errorMessage: String?
+    @State private var selectedProfileID: UUID
+    @State private var newProfileName = ""
+    private let newProfileChoice = UUID(uuidString: "00000000-0000-4000-8000-000000000003")!
     @FocusState private var nameIsFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -201,14 +235,34 @@ private struct SpaceEditor: View {
         _name = State(initialValue: space?.title ?? "")
         _icon = State(initialValue: space?.icon ?? .circle)
         _theme = State(initialValue: space?.theme ?? .system)
+        _selectedProfileID = State(initialValue: space?.profileID ?? browser.profileID)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(space == nil ? "New Space" : "Edit Space").font(.headline)
-            Text("Spaces have separate pinned and temporary tabs. They share logins in the Existing Profile.")
+            Text("Spaces have separate pinned and temporary tabs. Spaces in the same profile share logins.")
                 .foregroundStyle(.secondary)
             TextField("Space name", text: $name).focused($nameIsFocused)
+            if let space {
+                LabeledContent("Profile", value: browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")
+                Text("A Space’s profile cannot change. Create a new Space to use another profile.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                Picker("Profile", selection: $selectedProfileID) {
+                    ForEach(browser.spaces.profiles.profiles) { Text($0.title).tag($0.id) }
+                    Text("New Profile…").tag(newProfileChoice)
+                }
+                if selectedProfileID == newProfileChoice { TextField("Profile name", text: $newProfileName) }
+            }
+            if selectedProfileID != BrowserProfile.defaultID {
+                Text("Separate cookies, website data, history, bookmarks, and site settings. Extensions and password autofill are not available. App Settings still manage the Existing Profile. Tracker protection and app preferences apply to all profiles. Downloads save to the shared Downloads folder.")
+                    .font(.callout).foregroundStyle(.secondary)
+                #if DEBUG
+                Text("Debug and QA website data are temporary, even for named profiles.")
+                    .font(.callout).foregroundStyle(.secondary)
+                #endif
+            }
             Picker("Icon", selection: $icon) {
                 ForEach(BrowserSpaceIcon.allCases) { icon in Label(icon.title, systemImage: icon.symbol).tag(icon) }
             }
@@ -224,7 +278,9 @@ private struct SpaceEditor: View {
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(space == nil ? "Create" : "Save") { save() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || (space == nil && selectedProfileID == newProfileChoice
+                                  && newProfileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }
         .padding(20).frame(width: 360)
@@ -235,7 +291,12 @@ private struct SpaceEditor: View {
         do {
             guard !browser.isPrivate, !browser.isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
             if let space { try browser.spaces.updateSpace(space.id, title: name, icon: icon, theme: theme) }
-            else { try browser.createSpace(title: name, icon: icon, theme: theme) }
+            else {
+                if selectedProfileID == newProfileChoice {
+                    selectedProfileID = try browser.spaces.profiles.create(title: newProfileName).id
+                }
+                try browser.createSpace(title: name, profileID: selectedProfileID, icon: icon, theme: theme)
+            }
             dismiss()
         } catch { errorMessage = error.localizedDescription }
     }

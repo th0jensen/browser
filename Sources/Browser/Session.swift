@@ -221,9 +221,12 @@ final class SessionStore {
         return windows.count
     }
 
-    /// Forgets the windows waiting to be reopened, for when all history is cleared.
-    func forgetClosedWindows() {
-        reopenableWindows = []
+    /// Clear only this profile's recovery records. Live windows and unknown-owner recovery stay intact.
+    func forgetClosedWindows(forProfileID profileID: UUID = BrowserProfile.defaultID,
+                             ownershipResolver: SpaceSessionOwnershipResolver = BrowserSpaceStore.shared.owns) {
+        reopenableWindows = reopenableWindows.compactMap { $0.removingRecovery(for: profileID, ownershipResolver: ownershipResolver) }
+        pendingWindows = pendingWindows.compactMap { $0.removingRecovery(for: profileID, ownershipResolver: ownershipResolver) }
+        windowsBeingOpened = min(windowsBeingOpened, pendingWindows.count)
         scheduleSave()
     }
 

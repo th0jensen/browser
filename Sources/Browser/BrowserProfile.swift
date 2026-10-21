@@ -4,7 +4,7 @@ import WebKit
 /// Debug has its own sandbox and always uses disposable browsing data, including direct app launches.
 @MainActor
 enum BrowserProfile {
-    /// The existing WebKit profile. Spaces do not create separate cookie jars.
+    /// Keep the existing WebKit store and login data in place.
     static let defaultID = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
     static let displayName = "Existing Profile"
     static let bundleIdentifier = Bundle.main.bundleIdentifier ?? "dev.athas.browser"
@@ -34,6 +34,12 @@ enum BrowserProfile {
         ? FileManager.default.temporaryDirectory.appending(path: "BrowserTests-\(ProcessInfo.processInfo.processIdentifier)")
         : URL.applicationSupportDirectory.appending(path: bundleIdentifier, directoryHint: .isDirectory))
     static let websiteDataStore: WKWebsiteDataStore = isTesting || qaDirectory != nil ? .nonPersistent() : .default()
+
+    static var usesDisposableWebsiteData: Bool { isTesting || qaDirectory != nil }
+
+    static func makeWebsiteDataStore(identifier: UUID, disposable: Bool) -> WKWebsiteDataStore {
+        disposable ? .nonPersistent() : WKWebsiteDataStore(forIdentifier: identifier)
+    }
 
     static func prepare() throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

@@ -48,7 +48,8 @@ enum BookmarksBarVisibility: String, CaseIterable, Identifiable {
 @Observable
 final class BookmarkStore {
     private(set) var bookmarks: [Bookmark] = []
-    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let defaults: UserDefaults?
+    @ObservationIgnored private var file: StoreFile?
     private static let storageKey = "bookmarks"
 
     init(defaults: UserDefaults = .standard) {
@@ -57,6 +58,12 @@ final class BookmarkStore {
            let bookmarks = try? JSONDecoder().decode([Bookmark].self, from: data) {
             self.bookmarks = bookmarks
         }
+    }
+
+    init(file: StoreFile?) {
+        defaults = nil
+        self.file = file
+        if let data = file?.readNow(), let saved = try? JSONDecoder().decode([Bookmark].self, from: data) { bookmarks = saved }
     }
 
     func bookmark(for url: URL?) -> Bookmark? {
@@ -105,7 +112,8 @@ final class BookmarkStore {
 
     private func save() {
         guard let data = try? JSONEncoder().encode(bookmarks) else { return }
-        defaults.set(data, forKey: Self.storageKey)
+        defaults?.set(data, forKey: Self.storageKey)
+        file?.writeNow(data)
     }
 }
 
@@ -113,11 +121,13 @@ final class BookmarkStore {
 struct SiteIcon: View {
     let url: URL
     var size: CGFloat = 16
-    @State private var icon: Image?
+    @Environment(\.faviconContext) private var context
+    @State private var loaded: (request: FaviconRequest, icon: Image?)?
 
     var body: some View {
+        let request = FaviconRequest(url: url, context: context)
         Group {
-            if let icon = icon ?? FaviconStore.cachedIcon(for: url) {
+            if let icon = (loaded?.request == request ? loaded?.icon : nil) ?? FaviconStore.cachedIcon(for: url, context: context) {
                 icon
                     .resizable()
                     .scaledToFit()
@@ -127,7 +137,11 @@ struct SiteIcon: View {
             }
         }
         .frame(width: size, height: size)
-        .task(id: url) { icon = await FaviconStore.icon(for: url) }
+        .task(id: request) {
+            let icon = await FaviconStore.icon(for: url, context: context)
+            guard !Task.isCancelled else { return }
+            loaded = (request, icon)
+        }
     }
 
     private var monogram: some View {

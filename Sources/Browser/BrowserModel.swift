@@ -9,19 +9,45 @@ import WebKit
 final class BrowserModel: NSObject {
     @ObservationIgnored weak var chromeHover: ChromeHoverController?
     let chromePreferences: WindowChromePreferences
-    let downloads: DownloadManager
-    let sitePermissions: SitePermissions
-    let history: HistoryStore?
-    let zoomLevels: ZoomStore
-    let websiteDataStore: WKWebsiteDataStore
-    let passwords: PasswordManager?
+    private let defaultDownloads: DownloadManager
+    private let defaultSitePermissions: SitePermissions
+    private let defaultHistory: HistoryStore?
+    private let defaultZoomLevels: ZoomStore
+    private let defaultWebsiteDataStore: WKWebsiteDataStore
+    private let defaultPasswords: PasswordManager?
+    var downloads: DownloadManager { downloads(for: profileID) }
+    var sitePermissions: SitePermissions { permissions(for: profileID) }
+    var history: HistoryStore? { history(for: profileID) }
+    var zoomLevels: ZoomStore { zoom(for: profileID) }
+    var websiteDataStore: WKWebsiteDataStore { websiteDataStore(forProfileID: profileID)! }
+    var passwords: PasswordManager? { profileID == BrowserProfile.defaultID ? defaultPasswords : nil }
+    var passwordsForDefaultProfile: PasswordManager? { defaultPasswords }
+    var supportsExtensions: Bool { !isPrivate && profileID == BrowserProfile.defaultID }
+    @ObservationIgnored private let privateIconID = UUID()
+    var faviconContext: FaviconContext {
+        if isPrivate { return .transient(privateIconID) }
+        return profileID == BrowserProfile.defaultID ? .existingProfile : .transient(profileID)
+    }
+
+    func history(for id: UUID) -> HistoryStore? {
+        id == BrowserProfile.defaultID ? defaultHistory : spaces.profiles.resources(for: id)?.history
+    }
+    func permissions(for id: UUID) -> SitePermissions {
+        id == BrowserProfile.defaultID ? defaultSitePermissions : spaces.profiles.resources(for: id)!.permissions
+    }
+    func zoom(for id: UUID) -> ZoomStore {
+        id == BrowserProfile.defaultID ? defaultZoomLevels : spaces.profiles.resources(for: id)!.zoom
+    }
+    func downloads(for id: UUID) -> DownloadManager {
+        id == BrowserProfile.defaultID ? defaultDownloads : spaces.profiles.resources(for: id)!.downloads
+    }
     /// QA profiles are nonpersistent too; privacy is a separate browsing mode.
     let isPrivate: Bool
     @ObservationIgnored weak var sessionStore: SessionStore?
     var findFocusRequest = 0
     var isShowingHistory = false
     var isShowingClearData = false
-    let profileID = BrowserProfile.defaultID
+    var profileID: UUID { spaces.space(activeSpaceID)?.profileID ?? BrowserProfile.defaultID }
     let spaces: BrowserSpaceStore
     private(set) var activeSpaceID = BrowserSpaceStore.defaultSpaceID
     private var inactiveSpaces: [UUID: BrowserSpaceState] = [:]
@@ -125,13 +151,13 @@ final class BrowserModel: NSObject {
          passwords: PasswordManager? = nil, isPrivate: Bool = false, createsInitialTab: Bool = true,
          spaces: BrowserSpaceStore? = nil) {
         self.chromePreferences = chromePreferences ?? WindowChromePreferences()
-        self.downloads = downloads
-        self.sitePermissions = isPrivate ? SitePermissions() : sitePermissions
-        self.history = isPrivate ? nil : history
-        self.zoomLevels = isPrivate ? ZoomStore(defaults: nil) : zoomLevels
-        self.websiteDataStore = isPrivate && websiteDataStore.isPersistent ? .nonPersistent() : websiteDataStore
+        self.defaultDownloads = downloads
+        self.defaultSitePermissions = isPrivate ? SitePermissions() : sitePermissions
+        self.defaultHistory = isPrivate ? nil : history
+        self.defaultZoomLevels = isPrivate ? ZoomStore(defaults: nil) : zoomLevels
+        self.defaultWebsiteDataStore = isPrivate && websiteDataStore.isPersistent ? .nonPersistent() : websiteDataStore
         self.isPrivate = isPrivate
-        self.passwords = !isPrivate && websiteDataStore.isPersistent && BrowserProfile.qaDirectory == nil ? passwords : nil
+        self.defaultPasswords = !isPrivate && websiteDataStore.isPersistent && BrowserProfile.qaDirectory == nil ? passwords : nil
         let spaceStore = isPrivate ? BrowserSpaceStore(directory: BrowserProfile.directory, enabled: false)
             : spaces ?? (BrowserProfile.isTesting ? BrowserSpaceStore(directory: BrowserProfile.directory, enabled: false) : .shared)
         self.spaces = spaceStore
@@ -156,20 +182,26 @@ final class BrowserModel: NSObject {
     }
 
     func websiteDataStore(forProfileID id: UUID) -> WKWebsiteDataStore? {
-        id == profileID ? websiteDataStore : nil
+        if id == BrowserProfile.defaultID { return defaultWebsiteDataStore }
+        guard !isPrivate else { return nil }
+        return spaces.profiles.resources(for: id)?.websiteDataStore
     }
 
-    func makeConfiguration(for url: URL? = nil) -> WKWebViewConfiguration {
-        let context = !isPrivate ? url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) } : nil
-        let configuration = context?.webViewConfiguration ?? BrowserTab.makeConfiguration(includingExtensions: !isPrivate)
-        configuration.websiteDataStore = websiteDataStore
-        preparePageConfiguration(configuration)
+    func makeConfiguration(for url: URL? = nil, profileID requestedID: UUID? = nil) -> WKWebViewConfiguration {
+        let id = requestedID ?? profileID
+        precondition(websiteDataStore(forProfileID: id) != nil, "Unknown profile cannot load a page.")
+        let extensions = !isPrivate && id == BrowserProfile.defaultID
+        let context = extensions ? url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) } : nil
+        let configuration = context?.webViewConfiguration ?? BrowserTab.makeConfiguration(includingExtensions: extensions)
+        preparePageConfiguration(configuration, profileID: id)
         return configuration
     }
 
-    func preparePageConfiguration(_ configuration: WKWebViewConfiguration) {
-        configuration.websiteDataStore = websiteDataStore
-        if passwords != nil {
+    func preparePageConfiguration(_ configuration: WKWebViewConfiguration, profileID requestedID: UUID? = nil) {
+        let id = requestedID ?? profileID
+        configuration.websiteDataStore = websiteDataStore(forProfileID: id)!
+        if id != BrowserProfile.defaultID || isPrivate { configuration.webExtensionController = nil }
+        if id == BrowserProfile.defaultID, defaultPasswords != nil {
             PasswordAutofill.install(in: configuration.userContentController, handler: PasswordMessageHandler(browser: self))
         }
     }
@@ -528,14 +560,10 @@ final class BrowserModel: NSObject {
     func tabAcrossSpaces(withID id: UUID) -> BrowserTab? { allTabs.first { $0.id == id } }
 
     @discardableResult
-    func createSpace(title: String) throws -> BrowserSpace {
-        try createSpace(title: title, icon: .circle, theme: .system)
-    }
-
-    @discardableResult
-    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws -> BrowserSpace {
+    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID,
+                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system) throws -> BrowserSpace {
         guard !isPrivate, !isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
-        let space = try spaces.createSpace(title: title, icon: icon, theme: theme)
+        let space = try spaces.createSpace(title: title, profileID: profileID, icon: icon, theme: theme)
         selectSpace(space.id)
         return space
     }
@@ -549,7 +577,7 @@ final class BrowserModel: NSObject {
     @discardableResult
     func selectSpace(_ id: UUID) -> Bool {
         guard !isPrivate, !isExtensionWindow, let space = spaces.space(id),
-              space.profileID == profileID else { return false }
+              spaces.profiles.profile(space.profileID) != nil else { return false }
         guard id != activeSpaceID else { return true }
         cancelTidyingTabs()
         titleTasks.values.forEach { $0.cancel() }
@@ -595,7 +623,7 @@ final class BrowserModel: NSObject {
             return .init(id: group.id, tabIndices: group.tabIDs.compactMap { indices[$0] }, anchorIndex: anchor,
                          focusedIndex: focused, orientation: group.orientation, weights: group.weights)
         }
-        return SpaceSession(spaceID: id, profileID: profileID, tabs: state.tabs.map { tab in
+        return SpaceSession(spaceID: id, profileID: spaces.space(id)!.profileID, tabs: state.tabs.map { tab in
             TabSession(url: tab.isNewTab ? nil : tab.url, title: tab.pageTitle,
                        interactionState: tab.isNewTab ? nil : tab.interactionState as? Data,
                        pinnedPageID: tab.pinnedPageID, folderPageID: tab.folderPageID, temporarySection: tab.temporarySection,
@@ -616,7 +644,7 @@ final class BrowserModel: NSObject {
         if !isPrivate, !isExtensionWindow, session.spaceSessions == nil {
             // A pre-Spaces window always migrates into Default, not whichever
             // context happens to be selected when Reopen Session is requested.
-            let legacy = SpaceSession(spaceID: BrowserSpaceStore.defaultSpaceID, profileID: profileID,
+            let legacy = SpaceSession(spaceID: BrowserSpaceStore.defaultSpaceID, profileID: BrowserProfile.defaultID,
                                       tabs: session.tabs, selectedIndex: session.selectedIndex, splits: session.splits)
             restoreSession(WindowSession(tabs: session.tabs, selectedIndex: session.selectedIndex,
                                          activeSpaceID: BrowserSpaceStore.defaultSpaceID, spaceSessions: [legacy]))
@@ -640,9 +668,7 @@ final class BrowserModel: NSObject {
                 unrestoredSpaceSessions.append(saved)
                 continue
             }
-            guard saved.profileID == profileID, spaces.space(saved.spaceID)?.profileID == profileID,
-                  saved.tabs.allSatisfy({ ($0.profileID == nil || $0.profileID == profileID)
-                      && ($0.spaceID == nil || $0.spaceID == saved.spaceID) }) else {
+            guard spaces.owns(saved) else {
                 // Keep unsupported ownership for recovery, without loading it in this profile.
                 unrestoredSpaceSessions.append(saved)
                 continue
@@ -732,7 +758,8 @@ final class BrowserModel: NSObject {
                   configuration: WKWebViewConfiguration? = nil) -> BrowserTab {
         dismissPeek()
         if let view = opener.webView { LinkPreviewController.shared.dismiss(for: view) }
-        let tab = makeTab(configuration: configuration ?? makeConfiguration())
+        precondition(opener.browser === self && opener.spaceID == activeSpaceID)
+        let tab = makeTab(configuration: configuration ?? makeConfiguration(profileID: opener.profileID))
         tab.openerID = opener.id
         tab.isPopUp = configuration != nil
         tab.isNewTab = false
@@ -770,7 +797,7 @@ final class BrowserModel: NSObject {
     }
 
     private func adopt(_ tab: BrowserTab) -> BrowserTab {
-        precondition(tab.browser === self && tab.profileID == profileID, "A live tab cannot change its owning browser or profile.")
+        precondition(tab.browser === self && spaces.space(tab.spaceID)?.profileID == tab.profileID, "A live tab cannot change its owning browser or profile.")
         tab.didAttachToBrowser()
         return tab
     }
@@ -800,11 +827,11 @@ final class BrowserModel: NSObject {
         guard let sourceIndex = tabs.firstIndex(where: { $0.id == id }),
               tabs.indices.contains(destinationIndex),
               sourceIndex != destinationIndex else { return false }
-        let previousIndex = allTabs.firstIndex(where: { $0.id == id }) ?? sourceIndex
+        let previousIndex = extensionTabs.firstIndex(where: { $0.id == id }) ?? sourceIndex
         tabs[sourceIndex].temporarySection = tabs[destinationIndex].temporarySection
         tabs.move(fromOffsets: IndexSet(integer: sourceIndex),
                   toOffset: destinationIndex > sourceIndex ? destinationIndex + 1 : destinationIndex)
-        if !isPrivate { BrowserExtensions.shared.controller.didMoveTab(tabs[destinationIndex], from: previousIndex, in: self) }
+        if supportsExtensions { BrowserExtensions.shared.controller.didMoveTab(tabs[destinationIndex], from: previousIndex, in: self) }
         if haptic { reorderFeedback() }
         return true
     }
@@ -912,7 +939,8 @@ final class BrowserModel: NSObject {
     @discardableResult
     func openChildTab(of opener: BrowserTab, configuration: WKWebViewConfiguration? = nil,
                       loading request: URLRequest? = nil, select: Bool) -> BrowserTab {
-        let tab = adopt(BrowserTab(configuration: configuration ?? makeConfiguration(), browser: self, spaceID: opener.spaceID))
+        precondition(opener.browser === self)
+        let tab = adopt(BrowserTab(configuration: configuration ?? makeConfiguration(profileID: opener.profileID), browser: self, spaceID: opener.spaceID))
         tab.isNewTab = false
         tab.openerID = opener.id
         tab.isPopUp = configuration != nil
@@ -1258,13 +1286,13 @@ extension BrowserModel {
         var ordered = ids.compactMap { tab(withID: $0) }.filter { temporary.contains($0.id) }
         let seen = Set(ordered.map(\.id))
         ordered += regularTabs.filter { !seen.contains($0.id) }
-        let oldIndices = Dictionary(uniqueKeysWithValues: allTabs.enumerated().map { ($0.element.id, $0.offset) })
+        let oldIndices = Dictionary(uniqueKeysWithValues: extensionTabs.enumerated().map { ($0.element.id, $0.offset) })
         var iterator = ordered.makeIterator()
         for index in tabs.indices where temporary.contains(tabs[index].id) {
             if let next = iterator.next() { tabs[index] = next }
         }
-        for (index, tab) in allTabs.enumerated() {
-            if !isPrivate, let old = oldIndices[tab.id], old != index {
+        for (index, tab) in extensionTabs.enumerated() {
+            if supportsExtensions, let old = oldIndices[tab.id], old != index {
                 BrowserExtensions.shared.controller.didMoveTab(tab, from: old, in: self)
             }
         }

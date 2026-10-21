@@ -10,10 +10,22 @@ final class ExtensionWindowController: NSWindowController, NSWindowDelegate {
 }
 
 extension BrowserExtensions {
+    /// Resolve dependencies from the immutable opener, even after its window selects another profile.
+    /// Kept separate from native window presentation so ownership can be tested without desktop activation.
+    func makeWindowModel(configuration: WKWebViewConfiguration, opener: BrowserTab? = nil) -> BrowserModel {
+        guard let opener, let source = opener.browser else { return BrowserModel(configuration: configuration) }
+        precondition(opener.supportsExtensions, "An isolated profile cannot open a default-profile extension window.")
+        return BrowserModel(downloads: source.downloads(for: opener.profileID),
+                            sitePermissions: source.permissions(for: opener.profileID), configuration: configuration,
+                            history: source.history(for: opener.profileID), zoomLevels: source.zoom(for: opener.profileID),
+                            websiteDataStore: source.websiteDataStore(forProfileID: opener.profileID)!,
+                            passwords: source.passwordsForDefaultProfile, spaces: source.spaces)
+    }
+
     @discardableResult
     func openWindow(configuration: WKWebViewConfiguration, urls: [URL] = [],
                     frame: CGRect = .null, focus: Bool = true, opener: BrowserTab? = nil) -> BrowserModel {
-        let browser = BrowserModel(downloads: opener?.browser?.downloads ?? DownloadManager(), configuration: configuration)
+        let browser = makeWindowModel(configuration: configuration, opener: opener)
         browser.isExtensionWindow = true
         browser.activeTab?.extensionOrigin = urls.first
             .flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }?.baseURL

@@ -21,7 +21,7 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
             let request = PageNavigationRequest(tab: tab, webView: webView)
             // The restored window can lay out immediately while its first navigation waits for protection.
             let protection = ContentBlocker.shared
-            let extensions = tab.browser?.isPrivate == true ? nil : BrowserExtensions.shared
+            let extensions = tab.supportsExtensions ? BrowserExtensions.shared : nil
             let needsProtection = !protection.isPreparedForNavigation
             let needsExtensions = extensions?.isPreparedForNavigation == false
             if needsProtection && needsExtensions {
@@ -34,11 +34,12 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
                 await extensions?.prepare()
             }
             guard request.isCurrent else { return .cancel }
-            if tab.browser?.isPrivate != true { BrowserExtensions.shared.updateRules(in: webView) }
+            if tab.supportsExtensions { BrowserExtensions.shared.updateRules(in: webView) }
         }
+        if navigationAction.request.url?.scheme == "webkit-extension", tab?.supportsExtensions != true { return .cancel }
         if navigationAction.shouldPerformDownload { return .download }
-        if navigationAction.targetFrame?.isMainFrame == true, let url = navigationAction.request.url,
-           url.absoluteString != "about:blank" {
+        if tab?.supportsExtensions == true, navigationAction.targetFrame?.isMainFrame == true,
+           let url = navigationAction.request.url, url.absoluteString != "about:blank" {
             let controller = BrowserExtensions.shared.controller
             let currentContext = tab?.extensionOrigin.flatMap { controller.extensionContext(for: $0) }
             let nextContext = controller.extensionContext(for: url)
@@ -87,13 +88,13 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     private func track(_ download: WKDownload, from webView: WKWebView, isUserStarted: Bool) {
         guard let tab, let browser = tab.browser else { return }
         let site = webView.backForwardList.currentItem?.url.host() ?? download.originalRequest?.url?.host() ?? ""
-        let permissions = browser.sitePermissions
+        let permissions = browser.permissions(for: tab.profileID)
         let confirmation: @MainActor () async -> Bool = { [weak self] in
             await permissions.decide([.downloads], on: site) {
                 await self?.askToAllowDownloads(on: site, in: webView)
             }
         }
-        browser.downloads.track(download, in: browser.window, sourceTitle: browser.isPrivate ? "" : tab.pageTitle, sourceURL: browser.isPrivate ? nil : tab.url, allowsIntelligence: !browser.isPrivate, confirmation: isUserStarted ? nil : confirmation)
+        browser.downloads(for: tab.profileID).track(download, in: browser.window, sourceTitle: browser.isPrivate ? "" : tab.pageTitle, sourceURL: browser.isPrivate ? nil : tab.url, allowsIntelligence: !browser.isPrivate, confirmation: isUserStarted ? nil : confirmation)
         // A download typed into a new tab leaves no page behind, so show the new tab page again.
         if webView.backForwardList.currentItem == nil { tab.isNewTab = true }
     }
@@ -154,10 +155,10 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         case .cameraAndMicrophone: [.camera, .microphone]
         @unknown default: []
         }
-        guard let browser = tab?.browser, !permissions.isEmpty, !origin.host.isEmpty else { return .deny }
+        guard let tab, let browser = tab.browser, !permissions.isEmpty, !origin.host.isEmpty else { return .deny }
         let site = origin.port == 0 ? origin.host : "\(origin.host):\(origin.port)"
         let topSite = frame.isMainFrame ? nil : webView.url?.host()
-        let isAllowed = await browser.sitePermissions.decide(permissions, on: "\(origin.protocol)://\(site)") {
+        let isAllowed = await browser.permissions(for: tab.profileID).decide(permissions, on: "\(origin.protocol)://\(site)") {
             [weak self] in
             await self?.askForMediaCapture(permissions, site: site, embeddedIn: topSite, in: webView)
         }

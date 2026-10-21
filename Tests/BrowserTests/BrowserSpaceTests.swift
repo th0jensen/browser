@@ -500,8 +500,11 @@ final class BrowserSpaceTests: XCTestCase {
         // external requests, or file sandbox grants that cannot survive a new view.
         view.loadSimulatedRequest(URLRequest(url: firstURL), responseHTML: "<title>First Space Page</title><p>First</p>")
         try await waitUntil { !source.isLoading && source.pageTitle == "First Space Page" }
+        XCTAssertEqual(source.pageTitle, "First Space Page")
         view.loadSimulatedRequest(URLRequest(url: secondURL), responseHTML: "<title>Second Space Page</title><p>Second</p>")
         try await waitUntil { !source.isLoading && source.pageTitle == "Second Space Page" && source.canGoBack }
+        XCTAssertEqual(source.pageTitle, "Second Space Page")
+        XCTAssertTrue(source.canGoBack)
         let other = try browser.createSpace(title: "Other")
         let file = StoreFile(url: root.appending(path: "Session.plist"))
         let store = SessionStore(file: file)
@@ -523,9 +526,44 @@ final class BrowserSpaceTests: XCTestCase {
         XCTAssertTrue(restored.selectSpace(defaultID))
         try await waitUntil { restoredSource.canGoBack }
         let restoredView = try XCTUnwrap(restoredSource.webView)
+        XCTAssertTrue(restoredSource.canGoBack)
+        XCTAssertEqual(restoredSource.pageTitle, "Second Space Page")
+        XCTAssertEqual(restoredSource.url, secondURL)
+        XCTAssertEqual(restoredSource.backList.map(\.url), [firstURL])
         XCTAssertEqual(restoredView.backForwardList.backList.map(\.url), [firstURL])
         XCTAssertEqual(restoredView.backForwardList.currentItem?.url, secondURL)
         XCTAssertTrue(restoredView.configuration.websiteDataStore === restored.websiteDataStore)
+        XCTAssertTrue(restoredView.configuration.websiteDataStore === restored.websiteDataStore(forProfileID: restoredSource.profileID))
+    }
+
+    func testExplicitFileNavigationRetainsOriginalViewHistoryAcrossSpaceSwitch() async throws {
+        let root = directory()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstURL = root.appending(path: "first.html")
+        let secondURL = root.appending(path: "second.html")
+        try Data("<title>First Space Page</title>".utf8).write(to: firstURL)
+        try Data("<title>Second Space Page</title>".utf8).write(to: secondURL)
+        let browser = BrowserModel()
+        let source = try XCTUnwrap(browser.activeTab)
+        defer { browser.allTabs.forEach { $0.stopLoading() } }
+        source.load(firstURL)
+        try await waitUntil { !source.isLoading && source.pageTitle == "First Space Page" }
+        source.load(secondURL)
+        try await waitUntil { !source.isLoading && source.pageTitle == "Second Space Page" && source.canGoBack }
+        let view = try XCTUnwrap(source.webView)
+        _ = try browser.createSpace(title: "Other")
+        // Keep actual Back navigation assertions in the original view, with its explicit per-file grants.
+        source.goBack()
+        try await waitUntil { !source.isLoading && source.pageTitle == "First Space Page" && source.canGoForward }
+        XCTAssertEqual(source.url, firstURL)
+        XCTAssertEqual(source.pageTitle, "First Space Page")
+        XCTAssertTrue(source.canGoForward)
+        XCTAssertEqual(source.forwardList.map(\.url), [secondURL])
+        XCTAssertTrue(source.webView === view)
+        XCTAssertTrue(browser.selectSpace(defaultID))
+        XCTAssertTrue(browser.activeTab === source)
+        XCTAssertTrue(source.webView === view)
     }
 
     func testCorruptAndUnreadableSessionFilesStayUntouchedByLaterSaves() throws {

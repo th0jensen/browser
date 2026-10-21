@@ -35,6 +35,10 @@ struct BrowserSettings: View {
                 Text((selection ?? .general).rawValue)
                     .font(.system(size: 22, weight: .semibold))
                     .padding(.horizontal, 20).padding(.top, 22).padding(.bottom, 4)
+                if [.privacy, .passwords, .siteSettings, .extensions].contains(selection ?? .general) {
+                    Text("Existing Profile. Use the Space menu for another profile’s data and site settings. Tracker protection and app preferences apply to all profiles.")
+                        .font(.callout).foregroundStyle(.secondary).padding(.horizontal, 20).padding(.vertical, 8)
+                }
                 Group {
                     switch selection ?? .general {
                     case .general: GeneralSettings(updater: .shared)
