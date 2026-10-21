@@ -93,6 +93,9 @@ final class BrowserProfileStore {
         id == BrowserProfile.defaultID ? directory : directory.appending(path: "Profiles/\(id.uuidString)", directoryHint: .isDirectory)
     }
 
+    /// A side-effect-free check for lazy-resource regression tests and diagnostics.
+    func hasLoadedResources(for id: UUID) -> Bool { resourcesByID[id] != nil }
+
     func resources(for id: UUID) -> IsolatedProfileResources? {
         guard id != BrowserProfile.defaultID, let descriptor = profile(id) else { return nil }
         if let existing = resourcesByID[id] { return existing }

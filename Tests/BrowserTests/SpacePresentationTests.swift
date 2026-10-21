@@ -36,6 +36,248 @@ final class SpacePresentationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: root.appending(path: "Spaces.before-appearance.json")), legacy)
     }
 
+    private enum InjectedWriteFailure: Error { case stopped }
+
+    private func assertOwnerOnly(_ file: URL, filePath: StaticString = #filePath, line: UInt = #line) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600, file: filePath, line: line)
+    }
+
+    private func assertNoStagingFiles(in directory: URL, file: StaticString = #filePath, line: UInt = #line) throws {
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix(".Spaces-") && $0.hasSuffix(".tmp") }
+        XCTAssertTrue(leftovers.isEmpty, "Failed staging must be removed: \(leftovers)", file: file, line: line)
+    }
+
+    func testFailedFirstMetadataWriteNeverCreatesCanonicalAndFreshStoreCanRetry() throws {
+        for failurePoint in [BrowserSpaceStore.WriteCheckpoint.partialStagingWrite, .beforePublication] {
+            for creating in [true, false] {
+                let root = directory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let canonical = root.appending(path: "Spaces.json")
+                var stagedURL: URL?
+                var reachedFailurePoint = false
+                let store = BrowserSpaceStore(directory: root, writeCheckpoint: { checkpoint, temporary in
+                    stagedURL = temporary
+                    try self.assertOwnerOnly(temporary)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: canonical.path), "Canonical must remain absent throughout staging")
+                    let staged = try Data(contentsOf: temporary)
+                    XCTAssertFalse(staged.isEmpty)
+                    if checkpoint == .partialStagingWrite {
+                        XCTAssertThrowsError(try JSONDecoder().decode([BrowserSpace].self, from: staged))
+                    } else {
+                        let records = try JSONDecoder().decode([BrowserSpace].self, from: staged)
+                        XCTAssertEqual(records.count, creating ? 2 : 1)
+                        XCTAssertTrue(records.allSatisfy { $0.profileID == BrowserProfile.defaultID })
+                    }
+                    if checkpoint == failurePoint {
+                        reachedFailurePoint = true
+                        throw InjectedWriteFailure.stopped
+                    }
+                })
+                let original = store.spaces
+                if creating {
+                    XCTAssertThrowsError(try store.createSpace(title: "Unpublished", icon: .work, theme: .blue))
+                } else {
+                    XCTAssertThrowsError(try store.updateSpace(BrowserSpaceStore.defaultSpaceID, title: "Unpublished", icon: .work, theme: .blue))
+                }
+                XCTAssertTrue(reachedFailurePoint)
+                XCTAssertEqual(store.spaces, original)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: canonical.path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(stagedURL).path))
+                try assertNoStagingFiles(in: root)
+
+                // A fresh launch has no corrupt canonical file and needs no repair after the fault is removed.
+                let retry = BrowserSpaceStore(directory: root)
+                let recoveredID: UUID
+                if creating {
+                    recoveredID = try retry.createSpace(title: "Recovered", icon: .book, theme: .green).id
+                } else {
+                    recoveredID = BrowserSpaceStore.defaultSpaceID
+                    try retry.updateSpace(recoveredID, title: "Recovered", icon: .book, theme: .green)
+                }
+                try assertOwnerOnly(canonical)
+                try assertNoStagingFiles(in: root)
+                let reopened = BrowserSpaceStore(directory: root)
+                XCTAssertEqual(reopened.spaces, retry.spaces)
+                XCTAssertEqual(reopened.space(recoveredID)?.title, "Recovered")
+                XCTAssertEqual(reopened.space(recoveredID)?.icon, .book)
+                XCTAssertEqual(reopened.space(recoveredID)?.theme, .green)
+                XCTAssertTrue(reopened.spaces.allSatisfy { $0.profileID == BrowserProfile.defaultID })
+            }
+        }
+    }
+
+    func testStagingFailuresPreserveExistingMetadataAndEveryOriginalRecoveryCopy() throws {
+        for failurePoint in [BrowserSpaceStore.WriteCheckpoint.partialStagingWrite, .beforePublication] {
+            // Modern metadata; legacy metadata without a backup; legacy metadata with an older recovery copy.
+            for scenario in 0...2 {
+                let root = directory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                let ids = [BrowserSpaceStore.defaultSpaceID, UUID()]
+                let records = ids.enumerated().map { index, id -> [String: Any] in
+                    var record: [String: Any] = ["id": id.uuidString, "title": "Original \(index)", "profileID": BrowserProfile.defaultID.uuidString]
+                    if scenario == 0 { record["icon"] = "work"; record["theme"] = "blue" }
+                    return record
+                }
+                let original = try JSONSerialization.data(withJSONObject: records)
+                let canonical = root.appending(path: "Spaces.json")
+                try original.write(to: canonical)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: canonical.path)
+                let backup = root.appending(path: "Spaces.before-appearance.json")
+                let olderRecovery = try JSONEncoder().encode([BrowserSpace(id: BrowserSpaceStore.defaultSpaceID,
+                    title: "Older Recovery", profileID: BrowserProfile.defaultID)])
+                if scenario == 2 {
+                    try olderRecovery.write(to: backup)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+                }
+                var reachedFailurePoint = false
+                let store = BrowserSpaceStore(directory: root, writeCheckpoint: { checkpoint, temporary in
+                    try self.assertOwnerOnly(temporary)
+                    XCTAssertEqual(try Data(contentsOf: canonical), original)
+                    if checkpoint == failurePoint {
+                        reachedFailurePoint = true
+                        throw InjectedWriteFailure.stopped
+                    }
+                })
+                let published = store.spaces
+                XCTAssertThrowsError(try store.updateSpace(ids[1], title: "Unpublished", icon: .heart, theme: .pink))
+                XCTAssertTrue(reachedFailurePoint)
+                XCTAssertEqual(store.spaces, published)
+                XCTAssertEqual(try Data(contentsOf: canonical), original)
+                try assertOwnerOnly(canonical)
+                try assertNoStagingFiles(in: root)
+                if scenario != 0 {
+                    XCTAssertEqual(try Data(contentsOf: backup), scenario == 2 ? olderRecovery : original)
+                    try assertOwnerOnly(backup)
+                }
+
+                let retry = BrowserSpaceStore(directory: root)
+                try retry.updateSpace(ids[1], title: "Recovered", icon: .leaf, theme: .green)
+                let reloaded = BrowserSpaceStore(directory: root)
+                XCTAssertEqual(reloaded.spaces.map(\.id), ids)
+                XCTAssertEqual(reloaded.spaces[1].title, "Recovered")
+                XCTAssertEqual(reloaded.spaces[1].icon, .leaf)
+                XCTAssertTrue(reloaded.spaces.allSatisfy { $0.profileID == BrowserProfile.defaultID })
+                try assertOwnerOnly(canonical)
+                try assertNoStagingFiles(in: root)
+                if scenario != 0 {
+                    XCTAssertEqual(try Data(contentsOf: backup), scenario == 2 ? olderRecovery : original)
+                    try assertOwnerOnly(backup)
+                }
+            }
+        }
+    }
+
+    func testNamedProfileFirstWriteFailureKeepsOwnershipRetryAndUnknownProfileRejection() throws {
+        for failurePoint in [BrowserSpaceStore.WriteCheckpoint.partialStagingWrite, .beforePublication] {
+            let root = directory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let profiles = BrowserProfileStore(directory: root)
+            let profile = try profiles.create(title: "Work")
+            let profileFile = root.appending(path: "Profiles.json")
+            let profileBytes = try Data(contentsOf: profileFile)
+            let canonical = root.appending(path: "Spaces.json")
+            var reachedFailurePoint = false
+            let store = BrowserSpaceStore(directory: root, profiles: profiles, writeCheckpoint: { checkpoint, temporary in
+                try self.assertOwnerOnly(temporary)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: canonical.path))
+                if checkpoint == .beforePublication {
+                    let records = try JSONDecoder().decode([BrowserSpace].self, from: Data(contentsOf: temporary))
+                    XCTAssertEqual(records.map(\.profileID), [BrowserProfile.defaultID, profile.id])
+                    XCTAssertEqual(records.last?.icon, .work)
+                    XCTAssertEqual(records.last?.theme, .blue)
+                }
+                if checkpoint == failurePoint {
+                    reachedFailurePoint = true
+                    throw InjectedWriteFailure.stopped
+                }
+            })
+            let original = store.spaces
+            XCTAssertThrowsError(try store.createSpace(title: "Work", profileID: profile.id, icon: .work, theme: .blue))
+            XCTAssertTrue(reachedFailurePoint)
+            XCTAssertEqual(store.spaces, original)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: canonical.path))
+            XCTAssertEqual(try Data(contentsOf: profileFile), profileBytes)
+            XCTAssertFalse(profiles.hasLoadedResources(for: profile.id))
+            try assertNoStagingFiles(in: root)
+            let retry = BrowserSpaceStore(directory: root)
+            let created = try retry.createSpace(title: "Recovered", profileID: profile.id, icon: .book, theme: .green)
+            try assertOwnerOnly(canonical)
+            let reloaded = BrowserSpaceStore(directory: root)
+            XCTAssertEqual(reloaded.space(created.id), created)
+            XCTAssertEqual(created.profileID, profile.id)
+            XCTAssertTrue(reloaded.owns(SpaceSession(spaceID: created.id, profileID: profile.id, tabs: [], selectedIndex: 0)))
+            let saved = try Data(contentsOf: canonical)
+            var called = false
+            let rejectsUnknown = BrowserSpaceStore(directory: root, writeCheckpoint: { _, _ in called = true })
+            XCTAssertThrowsError(try rejectsUnknown.createSpace(title: "Unknown", profileID: UUID(), icon: .code, theme: .gray))
+            XCTAssertFalse(called, "Unavailable profiles fail before any staging checkpoint")
+            XCTAssertEqual(try Data(contentsOf: canonical), saved)
+            try assertNoStagingFiles(in: root)
+        }
+    }
+
+    func testNamedProfileLegacyAppearanceBackupSurvivesStagingFailureAndRetry() throws {
+        for failurePoint in [BrowserSpaceStore.WriteCheckpoint.partialStagingWrite, .beforePublication] {
+            let root = directory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let profiles = BrowserProfileStore(directory: root)
+            let profile = try profiles.create(title: "Work")
+            let namedID = UUID()
+            let legacy = try JSONSerialization.data(withJSONObject: [
+                ["id": BrowserSpaceStore.defaultSpaceID.uuidString, "title": "Default", "profileID": BrowserProfile.defaultID.uuidString],
+                ["id": namedID.uuidString, "title": "Work", "profileID": profile.id.uuidString],
+            ])
+            let canonical = root.appending(path: "Spaces.json")
+            let backup = root.appending(path: "Spaces.before-appearance.json")
+            try legacy.write(to: canonical)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: canonical.path)
+            let store = BrowserSpaceStore(directory: root, profiles: profiles, writeCheckpoint: { checkpoint, temporary in
+                try self.assertOwnerOnly(temporary)
+                XCTAssertEqual(try Data(contentsOf: canonical), legacy)
+                if checkpoint == failurePoint { throw InjectedWriteFailure.stopped }
+            })
+            XCTAssertThrowsError(try store.updateSpace(namedID, title: "Unpublished", icon: .heart, theme: .pink))
+            XCTAssertEqual(store.space(namedID)?.profileID, profile.id)
+            XCTAssertEqual(store.space(namedID)?.title, "Work")
+            XCTAssertEqual(try Data(contentsOf: canonical), legacy)
+            XCTAssertEqual(try Data(contentsOf: backup), legacy)
+            try assertOwnerOnly(backup)
+            try assertNoStagingFiles(in: root)
+            let retry = BrowserSpaceStore(directory: root)
+            try retry.updateSpace(namedID, title: "Recovered", icon: .leaf, theme: .green)
+            let reloaded = BrowserSpaceStore(directory: root)
+            XCTAssertEqual(reloaded.space(namedID)?.profileID, profile.id)
+            XCTAssertEqual(reloaded.space(namedID)?.title, "Recovered")
+            XCTAssertEqual(reloaded.space(namedID)?.icon, .leaf)
+            XCTAssertEqual(reloaded.space(namedID)?.theme, .green)
+            XCTAssertEqual(try Data(contentsOf: backup), legacy)
+            try assertOwnerOnly(canonical)
+            try assertNoStagingFiles(in: root)
+        }
+    }
+
+    func testNullAndWrongTypeAppearanceFieldsKeepOwnershipAndDefaults() throws {
+        let id = UUID()
+        let fixtures: [[String: Any]] = [
+            ["icon": NSNull(), "theme": NSNull()],
+            ["icon": 42, "theme": ["unexpected": true]],
+            ["icon": ["unexpected": true], "theme": [1, 2]],
+            ["icon": true, "theme": false],
+        ]
+        for appearance in fixtures {
+            var record: [String: Any] = ["id": id.uuidString, "title": "Original", "profileID": BrowserProfile.defaultID.uuidString]
+            record.merge(appearance) { _, value in value }
+            let space = try JSONDecoder().decode(BrowserSpace.self, from: JSONSerialization.data(withJSONObject: record))
+            XCTAssertEqual(space.id, id)
+            XCTAssertEqual(space.profileID, BrowserProfile.defaultID)
+            XCTAssertEqual(space.title, "Original")
+            XCTAssertEqual(space.icon, .circle)
+            XCTAssertEqual(space.theme, .system)
+        }
+    }
+
     func testUnknownAppearanceMetadataDoesNotHideLegacySpaceRecords() throws {
         let data = try JSONSerialization.data(withJSONObject: [
             "id": UUID().uuidString, "title": "Future", "profileID": BrowserProfile.defaultID.uuidString,

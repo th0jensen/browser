@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -62,6 +63,9 @@ final class BrowserSpaceStore {
     private var needsAppearanceBackup = false
     @ObservationIgnored private var folderStores: [UUID: TabFolderStore] = [:]
     @ObservationIgnored private var pinnedStores: [UUID: PinnedPageStore] = [:]
+    /// Narrow synchronous fault seam for metadata staging tests. Ordinary writes use no hook.
+    @ObservationIgnored private let writeCheckpoint: ((WriteCheckpoint, URL) throws -> Void)?
+    enum WriteCheckpoint { case partialStagingWrite, beforePublication }
 
     enum Failure: LocalizedError {
         case unavailable, invalidName, unsupportedProfile
@@ -74,10 +78,12 @@ final class BrowserSpaceStore {
         }
     }
 
-    init(directory: URL, enabled: Bool = true, profiles: BrowserProfileStore? = nil) {
+    init(directory: URL, enabled: Bool = true, profiles: BrowserProfileStore? = nil,
+         writeCheckpoint: ((WriteCheckpoint, URL) throws -> Void)? = nil) {
         self.profiles = profiles ?? BrowserProfileStore(directory: directory, enabled: enabled)
         self.directory = directory
         self.enabled = enabled
+        self.writeCheckpoint = writeCheckpoint
         let initial = BrowserSpace(id: Self.defaultSpaceID, title: "Default", profileID: BrowserProfile.defaultID)
         spaces = [initial]
         let file = directory.appending(path: "Spaces.json")
@@ -146,15 +152,36 @@ final class BrowserSpaceStore {
                     try FileManager.default.linkItem(at: file, to: backup)
                 }
             }
-            if !FileManager.default.fileExists(atPath: file.path) {
-                guard FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-                    throw CocoaError(.fileWriteUnknown)
-                }
-            }
-            try JSONEncoder().encode(next).write(to: file, options: .atomic)
+            try writeMetadata(JSONEncoder().encode(next), to: file)
             needsAppearanceBackup = false
         }
         spaces = next
+    }
+
+    /// Never create an empty canonical file. Until rename succeeds, only this private staging file changes.
+    private func writeMetadata(_ data: Data, to file: URL) throws {
+        let temporary = directory.appending(path: ".Spaces-\(UUID()).tmp")
+        let descriptor = Darwin.open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: temporary)
+        }
+        guard fchmod(descriptor, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        if let writeCheckpoint {
+            let midpoint = data.count / 2
+            try handle.write(contentsOf: data.prefix(midpoint))
+            try writeCheckpoint(.partialStagingWrite, temporary)
+            try handle.write(contentsOf: data.dropFirst(midpoint))
+        } else {
+            try handle.write(contentsOf: data)
+        }
+        try handle.synchronize()
+        try handle.close()
+        try writeCheckpoint?(.beforePublication, temporary)
+        // Same-directory rename publishes all bytes and mode together, for initial creation and replacement.
+        guard Darwin.rename(temporary.path, file.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     /// Legacy descriptors stay in place. Their identifiers and order do not change.
