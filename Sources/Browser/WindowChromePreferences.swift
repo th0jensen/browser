@@ -19,6 +19,7 @@ final class WindowChromePreferences {
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let prefix: String
     var tabLayout: TabLayout { didSet { defaults.set(tabLayout.rawValue, forKey: prefix + ".tabLayout") } }
+    var showsSpaceTitle: Bool { didSet { defaults.set(showsSpaceTitle, forKey: prefix + ".spaceTitle") } }
     private var hidesToolbar: Bool { didSet { defaults.set(hidesToolbar, forKey: prefix + ".toolbar") } }
     private var hidesSidebar: Bool { didSet { defaults.set(hidesSidebar, forKey: prefix + ".sidebar") } }
     var autoHideToolbar: Bool {
@@ -33,6 +34,7 @@ final class WindowChromePreferences {
     init(defaults: UserDefaults = .standard, variant: Variant = .current) {
         self.defaults = defaults
         prefix = "windowChrome.\(variant.rawValue)"
+        showsSpaceTitle = defaults.object(forKey: prefix + ".spaceTitle") as? Bool ?? true
         tabLayout = TabLayout(rawValue: defaults.string(forKey: prefix + ".tabLayout") ?? defaults.string(forKey: TabLayout.storageKey) ?? "") ?? .horizontal
         hidesToolbar = defaults.object(forKey: prefix + ".toolbar") as? Bool
             ?? defaults.bool(forKey: CompactToolbar.storageKey)
