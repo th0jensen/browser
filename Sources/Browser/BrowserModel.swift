@@ -1104,21 +1104,45 @@ final class BrowserModel: NSObject {
     /// Background tabs that can be suspended to free memory, least recently used first. A pop-up and its opener
     /// can script each other, so neither is suspended while both are open.
     var suspendableTabs: [BrowserTab] {
+        let windowTabs = allTabs
+        let openIDs = Set(windowTabs.map(\.id) + [peek?.tab.id].compactMap { $0 })
+        let visibleIDs = visibleTabIDs
         var linkedIDs = Set<UUID>()
-        for tab in allTabs where tab.isPopUp {
-            guard let openerID = tab.openerID, self.tabAcrossSpaces(withID: openerID) != nil else { continue }
+        for tab in windowTabs where tab.isPopUp {
+            guard let openerID = tab.openerID, openIDs.contains(openerID) else { continue }
             linkedIDs.formUnion([tab.id, openerID])
         }
-        return allTabs
-            .filter { !visibleTabIDs.contains($0.id) && $0.canSuspend && !linkedIDs.contains($0.id) }
-            .sorted { $0.lastActive < $1.lastActive }
+        return windowTabs.enumerated()
+            .filter { !visibleIDs.contains($0.element.id) && $0.element.canSuspend && !linkedIDs.contains($0.element.id) }
+            .sorted {
+                if $0.element.lastActive != $1.element.lastActive { return $0.element.lastActive < $1.element.lastActive }
+                return $0.offset < $1.offset
+            }
+            .map(\.element)
     }
 
-    /// Suspends the tabs in order, except pages playing media. Each is checked again after asking WebKit about
-    /// media, since it might have been selected in the meantime.
-    func suspendTabs(_ candidates: [BrowserTab]) async {
+    /// Live eligibility across the window's Spaces. Do not rebuild the LRU order or restore any views.
+    func canSuspendTab(_ tab: BrowserTab) -> Bool {
+        guard tabAcrossSpaces(withID: tab.id) === tab, !visibleTabIDs.contains(tab.id), tab.canSuspend else { return false }
+        if tab.isPopUp, let openerID = tab.openerID,
+           tabAcrossSpaces(withID: openerID) != nil || peek?.tab.id == openerID { return false }
+        return !allTabs.contains { $0.isPopUp && $0.openerID == tab.id }
+    }
+
+    /// Candidate order is fixed for this pass. Eligibility and source identity must still be checked after WebKit
+    /// answers: the page may have been selected, closed, restored or navigated while the query was pending.
+    func suspendTabs(_ candidates: [BrowserTab],
+                     mediaState: @MainActor (WKWebView) async -> WKMediaPlaybackState = {
+                         await $0.requestMediaPlaybackState()
+                     }) async {
         for tab in candidates {
-            guard !(await tab.isPlayingMedia()), suspendableTabs.contains(where: { $0 === tab }) else { continue }
+            guard !Task.isCancelled else { return }
+            guard canSuspendTab(tab), let source = tab.webView else { continue }
+            let revision = tab.navigationRevision
+            let state = await mediaState(source)
+            guard !Task.isCancelled else { return }
+            guard state != .playing, tab.webView === source, tab.navigationRevision == revision,
+                  canSuspendTab(tab) else { continue }
             tab.suspend()
         }
     }
