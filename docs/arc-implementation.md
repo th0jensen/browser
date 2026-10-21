@@ -19,12 +19,13 @@ The shared workflow PR allows the existing Debug test job to run on stacked PRs.
 | Preview extraction and failure states | `pi-agent/arc-preview-safety` | PR workflow | [Draft PR #29](https://github.com/th0jensen/browser/pull/29); Debug tests passed; visual comparison pending |
 | Tab suspension eligibility | `pi-agent/arc-tab-lifecycle` | Spaces | [Draft PR #25](https://github.com/th0jensen/browser/pull/25); suspension integration tests passed; full rerun after parent fixture correction |
 | Explicit Shift-click Peek | `pi-agent/arc-peek-gesture` | PR workflow | [Draft PR #28](https://github.com/th0jensen/browser/pull/28); review fix and Debug tests passed; native visual/input checks pending |
-| Spaces and ownership foundation | `pi-agent/arc-spaces` | PR workflow | [Draft PR #26](https://github.com/th0jensen/browser/pull/26); initial Debug suite passed; bottom-switcher and reference alignment active |
+| Spaces and ownership foundation | `pi-agent/arc-spaces` | PR workflow | [Draft PR #26](https://github.com/th0jensen/browser/pull/26); themed bottom strip and Debug tests passed; native swipe and visual checks pending |
 | Arc-like command palette and local results | `pi-agent/arc-command-bar` | Spaces | Local result engine reviewed; centered Liquid Glass presentation revision active |
 | Reversible temporary-tab archive | `pi-agent/arc-tab-archive` | Spaces | Active |
-| Local page questions and citations | `pi-agent/arc-page-answers` | Naming | Active |
+| Local page questions and citations | `pi-agent/arc-page-answers` | Naming | Safety re-review and Debug tests passed; Find-linked glass presentation revision active |
 | Deterministic link routing | `pi-agent/arc-link-routing` | Spaces | [Draft PR #30](https://github.com/th0jensen/browser/pull/30); Debug tests passed; native visual/delivery checks pending |
-| Separate persistent profiles | `pi-agent/arc-profiles` | Spaces | Active |
+| Separate persistent profiles | `pi-agent/arc-profiles` | Spaces | Isolation fixes tested; unknown-owner recovery correction and footer integration pending |
+| Profile-shared live Favorites | `pi-agent/arc-favorites` | Profiles and Spaces | Ownership contract in progress; do not claim Space Essentials as Favorites parity |
 
 ## 3. Prompt rules
 
@@ -34,7 +35,7 @@ All inference stays on device. Model output cannot authorize file movement, choo
 
 ## 4. Review and validation gates
 
-The [Arc reference and visual acceptance contract](arc-visual-verification.md) is part of the user's requirements. Use official behavior references and inspect actual public images before accepting a UI section. Keep Arc's useful placement and hierarchy while using Browser's native Liquid Glass. The initial top Space menu and ordinary address suggestions did not meet that requirement; both are under revision. A separate cross-feature reference audit checks the remaining UI sections.
+The [Arc reference and visual acceptance contract](arc-visual-verification.md) is part of the user's requirements. Use official behavior references and inspect actual public images before accepting a UI section. Keep Arc's useful placement and hierarchy while using Browser's native Liquid Glass. The initial top Space menu and ordinary address suggestions did not meet that requirement; both are under revision. The [independent cross-feature reference audit](arc-reference-audit.md) records official behavior sources, inspected images, concrete design gaps, deliberate Browser adaptations, and required native comparison states. It is a source/reference snapshot, not a GUI pass. In particular, profile-shared Favorites and Find-linked answers need correction; the themed footer is now present in source and has passed Debug tests.
 
 - Read current source before changing it. Keep cleanup inside the feature scope.
 - Add deterministic regression tests for state, safety, cancellation, and migration.
