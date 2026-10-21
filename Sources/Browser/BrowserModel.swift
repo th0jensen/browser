@@ -21,8 +21,26 @@ final class BrowserModel: NSObject {
     var findFocusRequest = 0
     var isShowingHistory = false
     var isShowingClearData = false
-    let pinnedPages: PinnedPageStore
-    let folders: TabFolderStore
+    let profileID = BrowserProfile.defaultID
+    let spaces: BrowserSpaceStore
+    private(set) var activeSpaceID = BrowserSpaceStore.defaultSpaceID
+    private var inactiveSpaces: [UUID: BrowserSpaceState] = [:]
+    private var unrestoredSpaceSessions: [SpaceSession] = []
+    private var isRestoringSpaces = false
+    private let defaultPinnedPages: PinnedPageStore
+    private let defaultFolders: TabFolderStore
+    var pinnedPages: PinnedPageStore {
+        pinnedPages(forSpaceID: activeSpaceID)
+    }
+    var folders: TabFolderStore { folders(forSpaceID: activeSpaceID) }
+
+    func folders(forSpaceID id: UUID) -> TabFolderStore {
+        id == BrowserSpaceStore.defaultSpaceID ? defaultFolders : spaces.folders(for: id)
+    }
+
+    func pinnedPages(forSpaceID id: UUID) -> PinnedPageStore {
+        id == BrowserSpaceStore.defaultSpaceID ? defaultPinnedPages : spaces.pinnedPages(for: id)
+    }
     var folderEditorRequest: FolderEditorRequest?
     var renamingSavedPageID: UUID?
     var isTidyingTabs = false
@@ -40,9 +58,15 @@ final class BrowserModel: NSObject {
     private(set) var peek: PeekPage?
     var splits: [SplitTabGroup] = []
     private var closedTabs: [ClosedTab] = []
+    private var closedTabsBySpace: [UUID: [ClosedTab]] = [:]
     var activeTabID: UUID? {
         didSet {
-            guard oldValue != activeTabID else { return }
+            guard oldValue != activeTabID, !isRestoringSpaces else { return }
+            // Existing commands select only within the current Space.
+            if let activeTabID, !tabs.contains(where: { $0.id == activeTabID }) {
+                self.activeTabID = oldValue
+                return
+            }
             dismissPeek()
             if let previousTab = tab(withID: oldValue) {
                 if let view = previousTab.webView { LinkPreviewController.shared.dismiss(for: view) }
@@ -98,7 +122,8 @@ final class BrowserModel: NSObject {
          folders: TabFolderStore? = nil, chromePreferences: WindowChromePreferences? = nil,
          history: HistoryStore? = nil, zoomLevels: ZoomStore = .shared,
          websiteDataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore,
-         passwords: PasswordManager? = nil, isPrivate: Bool = false, createsInitialTab: Bool = true) {
+         passwords: PasswordManager? = nil, isPrivate: Bool = false, createsInitialTab: Bool = true,
+         spaces: BrowserSpaceStore? = nil) {
         self.chromePreferences = chromePreferences ?? WindowChromePreferences()
         self.downloads = downloads
         self.sitePermissions = isPrivate ? SitePermissions() : sitePermissions
@@ -107,10 +132,13 @@ final class BrowserModel: NSObject {
         self.websiteDataStore = isPrivate && websiteDataStore.isPersistent ? .nonPersistent() : websiteDataStore
         self.isPrivate = isPrivate
         self.passwords = !isPrivate && websiteDataStore.isPersistent && BrowserProfile.qaDirectory == nil ? passwords : nil
-        self.pinnedPages = pinnedPages ?? (BrowserProfile.isTesting || isPrivate
-            ? PinnedPageStore(directory: BrowserProfile.directory, enabled: false) : .shared)
-        self.folders = folders ?? (BrowserProfile.isTesting || isPrivate
-            ? TabFolderStore(directory: BrowserProfile.directory, enabled: false) : .shared)
+        let spaceStore = isPrivate ? BrowserSpaceStore(directory: BrowserProfile.directory, enabled: false)
+            : spaces ?? (BrowserProfile.isTesting ? BrowserSpaceStore(directory: BrowserProfile.directory, enabled: false) : .shared)
+        self.spaces = spaceStore
+        self.defaultPinnedPages = isPrivate ? PinnedPageStore(directory: BrowserProfile.directory, enabled: false)
+            : pinnedPages ?? spaceStore.pinnedPages(for: BrowserSpaceStore.defaultSpaceID)
+        self.defaultFolders = isPrivate ? TabFolderStore(directory: BrowserProfile.directory, enabled: false)
+            : folders ?? spaceStore.folders(for: BrowserSpaceStore.defaultSpaceID)
         super.init()
         tabDrag.canSplit = { [weak self] source, target in self?.canSplitDrag(source, with: target) == true }
         if createsInitialTab { addTab(configuration: configuration) }
@@ -125,6 +153,10 @@ final class BrowserModel: NSObject {
     static func makePrivate(downloads: DownloadManager) -> BrowserModel {
         BrowserModel(downloads: downloads, sitePermissions: SitePermissions(), zoomLevels: ZoomStore(defaults: nil),
                      websiteDataStore: .nonPersistent(), isPrivate: true)
+    }
+
+    func websiteDataStore(forProfileID id: UUID) -> WKWebsiteDataStore? {
+        id == profileID ? websiteDataStore : nil
     }
 
     func makeConfiguration(for url: URL? = nil) -> WKWebViewConfiguration {
@@ -143,7 +175,7 @@ final class BrowserModel: NSObject {
     }
 
     func tab(for webView: WKWebView) -> BrowserTab? {
-        (tabs + (peek.map { [$0.tab] } ?? [])).first { $0.webView === webView }
+        (allTabs + (peek.map { [$0.tab] } ?? [])).first { $0.webView === webView }
     }
 
     func requestSessionSave() {
@@ -158,7 +190,7 @@ final class BrowserModel: NSObject {
         isClosed = true
         cancelTidyingTabs()
         titleTasks.values.forEach { $0.cancel() }
-        for tab in tabs { tab.stopLoading() }
+        for tab in allTabs { tab.stopLoading() }
         dismissPeek()
     }
 
@@ -219,6 +251,7 @@ final class BrowserModel: NSObject {
     }
 
     func moveToFolder(_ tab: BrowserTab, parentID: UUID?, before: UUID? = nil) {
+        guard tab.browser === self, tab.spaceID == activeSpaceID else { return }
         if peek?.tab === tab { expandPeek() }
         changeFolders {
             if let id = tab.folderPageID, folders.item(id) != nil {
@@ -409,11 +442,13 @@ final class BrowserModel: NSObject {
     }
 
     func canPin(_ tab: BrowserTab) -> Bool {
+        guard tab.browser === self, tab.spaceID == activeSpaceID else { return false }
         guard let url = tab.url, PinnedPageStore.valid(url) else { return false }
         return pinnedPages.items.count < PinnedPageStore.limit || pinnedPages.items.contains { $0.url == url }
     }
 
     func pin(_ tab: BrowserTab) {
+        guard tab.browser === self, tab.spaceID == activeSpaceID else { return }
         if peek?.tab === tab { expandPeek() }
         guard let url = tab.url else { return }
         pinToEssentials(url: url, title: tab.title, folderPageID: tab.folderPageID, tab: tab)
@@ -472,34 +507,195 @@ final class BrowserModel: NSObject {
         }
     }
 
+    /// Active-Space reuse only, for an incoming URL. This is not a window replacement check.
     var isBlank: Bool { tabs.count == 1 && tabs[0].isNewTab }
 
+    /// Reopening a saved window must not discard live work or recovery state in any Space.
+    var canReplaceWindowWithSession: Bool {
+        !isPrivate && !isExtensionWindow && peek == nil && unrestoredSpaceSessions.isEmpty
+            && closedTabs.isEmpty && closedTabsBySpace.values.allSatisfy(\.isEmpty)
+            && splits.isEmpty && inactiveSpaces.values.allSatisfy { $0.splits.isEmpty }
+            && allTabs.allSatisfy {
+                $0.isNewTab && $0.url == nil && $0.interactionState == nil && !$0.isPopUp
+                    && $0.pinnedPageID == nil && $0.folderPageID == nil && $0.temporarySection == nil
+            }
+    }
+
+    var allTabs: [BrowserTab] {
+        spaces.spaces.flatMap { $0.id == activeSpaceID ? tabs : inactiveSpaces[$0.id]?.tabs ?? [] }
+    }
+
+    func tabAcrossSpaces(withID id: UUID) -> BrowserTab? { allTabs.first { $0.id == id } }
+
+    @discardableResult
+    func createSpace(title: String) throws -> BrowserSpace {
+        try createSpace(title: title, icon: .circle, theme: .system)
+    }
+
+    @discardableResult
+    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme,
+                     symbol: String? = nil, emoji: String = "", color: FolderColor = .primary) throws -> BrowserSpace {
+        guard !isPrivate, !isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
+        let space = try spaces.createSpace(title: title, icon: icon, theme: theme, symbol: symbol, emoji: emoji, color: color)
+        selectSpace(space.id)
+        return space
+    }
+
+    @discardableResult
+    func selectSpace(at index: Int) -> Bool {
+        guard spaces.spaces.indices.contains(index) else { return false }
+        return selectSpace(spaces.spaces[index].id)
+    }
+
+    @discardableResult
+    func selectSpace(_ id: UUID) -> Bool {
+        guard !isPrivate, !isExtensionWindow, let space = spaces.space(id),
+              space.profileID == profileID else { return false }
+        guard id != activeSpaceID else { return true }
+        cancelTidyingTabs()
+        titleTasks.values.forEach { $0.cancel() }
+        titleTasks = [:]
+        titleTaskTokens = [:]
+        namingSavedPageIDs = []
+        folderEditorRequest = nil
+        renamingSavedPageID = nil
+        dismissPeek()
+        if let tab = activeTab {
+            if let view = tab.webView { LinkPreviewController.shared.dismiss(for: view) }
+            tab.lastActive = .now
+        }
+        inactiveSpaces[activeSpaceID] = BrowserSpaceState(tabs: tabs, selectedTabID: activeTabID, splits: splits)
+        closedTabsBySpace[activeSpaceID] = closedTabs
+        // Avoid selection side effects while the arrays and ownership change together.
+        isRestoringSpaces = true
+        activeSpaceID = id
+        let state = inactiveSpaces.removeValue(forKey: id)
+        tabs = state?.tabs ?? []
+        splits = state?.splits ?? []
+        closedTabs = closedTabsBySpace.removeValue(forKey: id) ?? []
+        activeTabID = nil
+        isRestoringSpaces = false
+        if tabs.isEmpty { addTab(focusAddress: false) }
+        else { activeTabID = state?.selectedTabID ?? tabs.first?.id }
+        // Cancel an address-field request left over from the previous Space.
+        consumedAddressFocusRequest = addressFocusRequest
+        let field = (window?.firstResponder as? AddressField)
+            ?? ((window?.firstResponder as? NSTextView)?.delegate as? AddressField)
+        field?.requestFocus(0)
+        chromeHover?.dismissAddressFocus()
+        window?.makeFirstResponder(activeTab?.webView)
+        requestSessionSave()
+        return true
+    }
+
+    private func spaceSession(id: UUID, state: BrowserSpaceState) -> SpaceSession {
+        let indices = Dictionary(uniqueKeysWithValues: state.tabs.enumerated().map { ($0.element.id, $0.offset) })
+        let savedSplits = state.splits.compactMap { group -> BrowserSessionSnapshot.Split? in
+            guard let anchor = indices[group.anchorID], let focused = indices[group.focusedID],
+                  group.tabIDs.allSatisfy({ indices[$0] != nil }) else { return nil }
+            return .init(id: group.id, tabIndices: group.tabIDs.compactMap { indices[$0] }, anchorIndex: anchor,
+                         focusedIndex: focused, orientation: group.orientation, weights: group.weights)
+        }
+        return SpaceSession(spaceID: id, profileID: profileID, tabs: state.tabs.map { tab in
+            TabSession(url: tab.isNewTab ? nil : tab.url, title: tab.pageTitle,
+                       interactionState: tab.isNewTab ? nil : tab.interactionState as? Data,
+                       pinnedPageID: tab.pinnedPageID, folderPageID: tab.folderPageID, temporarySection: tab.temporarySection,
+                       id: tab.id, spaceID: tab.spaceID, profileID: tab.profileID)
+        }, selectedIndex: state.selectedTabID.flatMap { indices[$0] } ?? 0, splits: savedSplits.isEmpty ? nil : savedSplits)
+    }
+
     func windowSession() -> WindowSession {
-        let metadata = BrowserSessionSnapshot(browser: self)
-        return WindowSession(tabs: zip(tabs, metadata.tabs).map { tab, saved in
-            TabSession(url: saved.url, title: saved.title, interactionState: saved.url == nil ? nil : tab.interactionState as? Data,
-                       pinnedPageID: saved.pinnedPageID, folderPageID: saved.folderPageID,
-                       temporarySection: saved.temporarySection)
-        }, selectedIndex: metadata.selectedIndex, splits: metadata.splits)
+        let current = spaceSession(id: activeSpaceID, state: BrowserSpaceState(tabs: tabs, selectedTabID: activeTabID, splits: splits))
+        var saved = [current]
+        saved += spaces.spaces.compactMap { space in inactiveSpaces[space.id].map { spaceSession(id: space.id, state: $0) } }
+        return WindowSession(tabs: current.tabs, selectedIndex: current.selectedIndex, splits: current.splits,
+                             activeSpaceID: activeSpaceID, spaceSessions: saved,
+                             unavailableSpaceSessions: unrestoredSpaceSessions.isEmpty ? nil : unrestoredSpaceSessions)
     }
 
     func restoreSession(_ session: WindowSession) {
-        let legacy = BrowserSessionSnapshot(tabs: session.tabs.map {
+        if !isPrivate, !isExtensionWindow, session.spaceSessions == nil {
+            // A pre-Spaces window always migrates into Default, not whichever
+            // context happens to be selected when Reopen Session is requested.
+            let legacy = SpaceSession(spaceID: BrowserSpaceStore.defaultSpaceID, profileID: profileID,
+                                      tabs: session.tabs, selectedIndex: session.selectedIndex, splits: session.splits)
+            restoreSession(WindowSession(tabs: session.tabs, selectedIndex: session.selectedIndex,
+                                         activeSpaceID: BrowserSpaceStore.defaultSpaceID, spaceSessions: [legacy]))
+            return
+        }
+        // Private and extension windows keep their existing single-context behavior.
+        guard !isPrivate, !isExtensionWindow, let savedSpaces = session.spaceSessions else {
+            restoreSpaceTabs(session.tabs, selectedIndex: session.selectedIndex, splits: session.splits)
+            return
+        }
+        allTabs.forEach { BrowserExtensions.shared.didClose($0) }
+        dismissPeek()
+        inactiveSpaces = [:]
+        closedTabsBySpace = [:]
+        closedTabs = []
+        unrestoredSpaceSessions = session.unavailableSpaceSessions ?? []
+        isRestoringSpaces = true
+        var seenSpaces = Set<UUID>(), seenTabs = Set<UUID>()
+        for saved in savedSpaces {
+            guard seenSpaces.insert(saved.spaceID).inserted else {
+                unrestoredSpaceSessions.append(saved)
+                continue
+            }
+            guard saved.profileID == profileID, spaces.space(saved.spaceID)?.profileID == profileID,
+                  saved.tabs.allSatisfy({ ($0.profileID == nil || $0.profileID == profileID)
+                      && ($0.spaceID == nil || $0.spaceID == saved.spaceID) }) else {
+                // Keep unsupported ownership for recovery, without loading it in this profile.
+                unrestoredSpaceSessions.append(saved)
+                continue
+            }
+            activeSpaceID = saved.spaceID
+            tabs = []
+            splits = []
+            activeTabID = nil
+            let entries = saved.tabs.map { entry -> TabSession in
+                var entry = entry
+                if let id = entry.id, !seenTabs.insert(id).inserted { entry.id = nil }
+                return entry
+            }
+            restoreSpaceTabs(entries, selectedIndex: saved.selectedIndex, splits: saved.splits)
+            inactiveSpaces[saved.spaceID] = BrowserSpaceState(tabs: tabs, selectedTabID: activeTabID, splits: splits)
+        }
+        activeSpaceID = session.activeSpaceID.flatMap { inactiveSpaces[$0] != nil ? $0 : nil }
+            ?? BrowserSpaceStore.defaultSpaceID
+        let state = inactiveSpaces.removeValue(forKey: activeSpaceID)
+        tabs = state?.tabs ?? []
+        splits = state?.splits ?? []
+        activeTabID = nil
+        isRestoringSpaces = false
+        if tabs.isEmpty { addTab(focusAddress: false) }
+        else { activeTabID = state?.selectedTabID ?? tabs.first?.id }
+    }
+
+    private func restoreSpaceTabs(_ entries: [TabSession], selectedIndex: Int, splits: [BrowserSessionSnapshot.Split]?) {
+        // Explicit ownership always wins over a legacy default. Never load a foreign tab.
+        guard entries.allSatisfy({ ($0.profileID == nil || $0.profileID == profileID)
+            && ($0.spaceID == nil || $0.spaceID == activeSpaceID) }) else { return }
+        let legacy = BrowserSessionSnapshot(tabs: entries.map {
             BrowserSessionSnapshot.Tab(url: $0.url, title: $0.title, pinnedPageID: $0.pinnedPageID,
                                        folderPageID: $0.folderPageID, temporarySection: $0.temporarySection)
-        }, selectedIndex: session.selectedIndex)
-        restoreSession(legacy, interactionStates: session.tabs.map(\.interactionState), splits: session.splits)
+        }, selectedIndex: selectedIndex)
+        restoreSession(legacy, interactionStates: entries.map(\.interactionState), splits: splits, tabIDs: entries.map(\.id))
     }
 
     func restoreSession(_ session: BrowserSessionSnapshot, interactionStates: [Data?] = [],
-                        splits: [BrowserSessionSnapshot.Split]? = nil) {
+                        splits: [BrowserSessionSnapshot.Split]? = nil, tabIDs: [UUID?] = []) {
         guard !session.tabs.isEmpty else { return }
-        let previous = tabs
+        let previous: [BrowserTab] = isRestoringSpaces ? [] : tabs
+        var restoredIDs = Set<UUID>()
         var boundPins = Set<UUID>()
         var boundFolders = Set<UUID>()
         tabs = session.tabs.enumerated().map { index, saved in
-            guard let url = saved.url, ["https", "http", "file", "webkit-extension"].contains(url.scheme ?? "") else { return makeTab() }
-            let tab = adopt(BrowserTab(url: url, title: saved.title, interactionState: interactionStates.indices.contains(index) ? interactionStates[index] : nil, browser: self, restoresVisit: true))
+            let candidateID = tabIDs.indices.contains(index) ? tabIDs[index] ?? UUID() : UUID()
+            let id = restoredIDs.insert(candidateID).inserted ? candidateID : UUID()
+            guard let url = saved.url, ["https", "http", "file", "webkit-extension"].contains(url.scheme ?? "") else {
+                return adopt(BrowserTab(newTabIn: self, id: id))
+            }
+            let tab = adopt(BrowserTab(url: url, title: saved.title, interactionState: interactionStates.indices.contains(index) ? interactionStates[index] : nil, browser: self, restoresVisit: true, id: id))
             let page = saved.folderPageID == nil ? (pinnedPages.items.first { $0.id == saved.pinnedPageID }
                 ?? pinnedPages.items.first { $0.url == url }) : nil
             if let page, boundPins.insert(page.id).inserted { tab.pinnedPageID = page.id }
@@ -575,7 +771,7 @@ final class BrowserModel: NSObject {
     }
 
     private func adopt(_ tab: BrowserTab) -> BrowserTab {
-        tab.browser = self
+        precondition(tab.browser === self && tab.profileID == profileID, "A live tab cannot change its owning browser or profile.")
         tab.didAttachToBrowser()
         return tab
     }
@@ -605,10 +801,11 @@ final class BrowserModel: NSObject {
         guard let sourceIndex = tabs.firstIndex(where: { $0.id == id }),
               tabs.indices.contains(destinationIndex),
               sourceIndex != destinationIndex else { return false }
+        let previousIndex = allTabs.firstIndex(where: { $0.id == id }) ?? sourceIndex
         tabs[sourceIndex].temporarySection = tabs[destinationIndex].temporarySection
         tabs.move(fromOffsets: IndexSet(integer: sourceIndex),
                   toOffset: destinationIndex > sourceIndex ? destinationIndex + 1 : destinationIndex)
-        if !isPrivate { BrowserExtensions.shared.controller.didMoveTab(tabs[destinationIndex], from: sourceIndex, in: self) }
+        if !isPrivate { BrowserExtensions.shared.controller.didMoveTab(tabs[destinationIndex], from: previousIndex, in: self) }
         if haptic { reorderFeedback() }
         return true
     }
@@ -647,6 +844,22 @@ final class BrowserModel: NSObject {
     }
 
     func closeTab(_ id: UUID) {
+        if let tab = tabAcrossSpaces(withID: id), tab.spaceID != activeSpaceID,
+           var state = inactiveSpaces[tab.spaceID] {
+            cancelSavedTitle(for: tab)
+            tab.stopLoading()
+            var closed = closedTabsBySpace[tab.spaceID] ?? []
+            closed.append(ClosedTab(url: tab.isNewTab ? nil : tab.url, title: tab.pageTitle,
+                                    interactionState: tab.interactionState, folderPageID: tab.folderPageID))
+            closedTabsBySpace[tab.spaceID] = Array(closed.suffix(10))
+            state.tabs.removeAll { $0.id == id }
+            state.splits.removeAll { $0.tabIDs.contains(id) }
+            if state.selectedTabID == id { state.selectedTabID = state.tabs.first?.id }
+            inactiveSpaces[tab.spaceID] = state
+            BrowserExtensions.shared.didClose(tab)
+            requestSessionSave()
+            return
+        }
         if peek?.tab.id == id { dismissPeek(); return }
         if peek?.openerID == id { dismissPeek() }
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
@@ -700,7 +913,7 @@ final class BrowserModel: NSObject {
     @discardableResult
     func openChildTab(of opener: BrowserTab, configuration: WKWebViewConfiguration? = nil,
                       loading request: URLRequest? = nil, select: Bool) -> BrowserTab {
-        let tab = makeTab(configuration: configuration ?? makeConfiguration())
+        let tab = adopt(BrowserTab(configuration: configuration ?? makeConfiguration(), browser: self, spaceID: opener.spaceID))
         tab.isNewTab = false
         tab.openerID = opener.id
         tab.isPopUp = configuration != nil
@@ -710,10 +923,20 @@ final class BrowserModel: NSObject {
         while tabs.indices.contains(index), tabs[index].openerID == opener.id {
             index += 1
         }
-        tabs.insert(tab, at: index)
+        if opener.spaceID == activeSpaceID {
+            tabs.insert(tab, at: index)
+        } else if var state = inactiveSpaces[opener.spaceID] {
+            let insertion = state.tabs.firstIndex(where: { $0.id == opener.id }).map { $0 + 1 } ?? state.tabs.count
+            state.tabs.insert(tab, at: insertion)
+            inactiveSpaces[opener.spaceID] = state
+        }
         BrowserExtensions.shared.didOpen(tab)
         if let request { tab.webView?.load(request) }
-        if select { activeTabID = tab.id }
+        if select {
+            if opener.spaceID != activeSpaceID { selectSpace(opener.spaceID) }
+            activeTabID = tab.id
+        }
+        requestSessionSave()
         return tab
     }
 
@@ -894,11 +1117,11 @@ final class BrowserModel: NSObject {
     /// can script each other, so neither is suspended while both are open.
     var suspendableTabs: [BrowserTab] {
         var linkedIDs = Set<UUID>()
-        for tab in tabs where tab.isPopUp {
-            guard let openerID = tab.openerID, self.tab(withID: openerID) != nil else { continue }
+        for tab in allTabs where tab.isPopUp {
+            guard let openerID = tab.openerID, self.tabAcrossSpaces(withID: openerID) != nil else { continue }
             linkedIDs.formUnion([tab.id, openerID])
         }
-        return tabs
+        return allTabs
             .filter { !visibleTabIDs.contains($0.id) && $0.canSuspend && !linkedIDs.contains($0.id) }
             .sorted { $0.lastActive < $1.lastActive }
     }
@@ -1036,12 +1259,12 @@ extension BrowserModel {
         var ordered = ids.compactMap { tab(withID: $0) }.filter { temporary.contains($0.id) }
         let seen = Set(ordered.map(\.id))
         ordered += regularTabs.filter { !seen.contains($0.id) }
-        let oldIndices = Dictionary(uniqueKeysWithValues: tabs.enumerated().map { ($0.element.id, $0.offset) })
+        let oldIndices = Dictionary(uniqueKeysWithValues: allTabs.enumerated().map { ($0.element.id, $0.offset) })
         var iterator = ordered.makeIterator()
         for index in tabs.indices where temporary.contains(tabs[index].id) {
             if let next = iterator.next() { tabs[index] = next }
         }
-        for (index, tab) in tabs.enumerated() {
+        for (index, tab) in allTabs.enumerated() {
             if !isPrivate, let old = oldIndices[tab.id], old != index {
                 BrowserExtensions.shared.controller.didMoveTab(tab, from: old, in: self)
             }
@@ -1056,14 +1279,14 @@ extension BrowserModel {
     }
 
     func savedTabFinishedLoading(_ tab: BrowserTab) {
-        guard !isPrivate, let id = tab.folderPageID, tab.loadError == nil, !isExtensionWindow, !tab.isAwayFromPinnedPage else { return }
-        changeFolders { try folders.updatePageTitle(id, title: tab.pageTitle) }
+        guard !isPrivate, tab.browser === self, let id = tab.folderPageID, tab.loadError == nil, !isExtensionWindow, !tab.isAwayFromPinnedPage else { return }
+        changeFolders { try folders(forSpaceID: tab.spaceID).updatePageTitle(id, title: tab.pageTitle) }
         tidySavedTabTitle(tab)
     }
 
     func savedTabBeganLoading(_ tab: BrowserTab) {
         cancelSavedTitle(for: tab)
-        if !isPrivate, !BrowserProfile.isTesting, tab.folderPageID != nil,
+        if !isPrivate, tab.spaceID == activeSpaceID, !BrowserProfile.isTesting, tab.folderPageID != nil,
            UserDefaults.standard.bool(forKey: BrowserIntelligence.tidyTabTitlesKey) {
             Task { await LocalIntelligence.shared.prepare(.name) }
         }
@@ -1076,7 +1299,7 @@ extension BrowserModel {
     }
 
     func tidySavedTabTitle(_ tab: BrowserTab) {
-        guard !isPrivate else { return }
+        guard !isPrivate, tab.spaceID == activeSpaceID else { return }
         guard !BrowserProfile.isTesting, UserDefaults.standard.bool(forKey: BrowserIntelligence.tidyTabTitlesKey),
               !tab.isLoading, !tab.isNewTab, tab.loadError == nil, tab.pinnedPageID == nil,
               let id = tab.folderPageID, let page = folders.item(id), page.nameSource == nil,

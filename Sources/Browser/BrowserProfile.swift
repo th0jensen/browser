@@ -4,6 +4,9 @@ import WebKit
 /// Debug has its own sandbox and always uses disposable browsing data, including direct app launches.
 @MainActor
 enum BrowserProfile {
+    /// The existing WebKit profile. Spaces do not create separate cookie jars.
+    static let defaultID = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
+    static let displayName = "Existing Profile"
     static let bundleIdentifier = Bundle.main.bundleIdentifier ?? "dev.athas.browser"
     static let isTesting = NSClassFromString("XCTestCase") != nil
         || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil

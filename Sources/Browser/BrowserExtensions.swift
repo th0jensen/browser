@@ -289,7 +289,7 @@ extension BrowserExtensions {
         guard !browser.isPrivate, !windows.contains(browser) else { return }
         windows.add(browser)
         controller.didOpenWindow(browser)
-        browser.tabs.forEach {
+        browser.allTabs.forEach {
             controller.didOpenTab($0)
             if let webView = $0.webView {
                 updateRules(in: webView)
@@ -302,7 +302,7 @@ extension BrowserExtensions {
     func unregister(_ browser: BrowserModel) {
         if popupBrowser === browser { closePopup() }
         guard windows.contains(browser) else { return }
-        for tab in browser.tabs { controller.didCloseTab(tab, windowIsClosing: true) }
+        for tab in browser.allTabs { controller.didCloseTab(tab, windowIsClosing: true) }
         controller.didCloseWindow(browser)
         windows.remove(browser)
         if focusedBrowser === browser { focusedBrowser = nil; controller.didFocusWindow(nil) }
@@ -360,7 +360,7 @@ extension BrowserExtensions {
             appearanceDefaults?.set(hex, forKey: Self.forcedDarkBackgroundKey)
         } else { appearanceDefaults?.removeObject(forKey: Self.forcedDarkBackgroundKey) }
         for browser in windows.allObjects {
-            for tab in browser.tabs { if let webView = tab.webView { applyPageBackground(to: webView) } }
+            for tab in browser.allTabs { if let webView = tab.webView { applyPageBackground(to: webView) } }
         }
     }
 
@@ -403,7 +403,7 @@ extension BrowserExtensions {
             applyRules(to: controller)
         }
         for browser in windows.allObjects {
-            for tab in browser.tabs { if let webView = tab.webView { updateRules(in: webView) } }
+            for tab in browser.allTabs { if let webView = tab.webView { updateRules(in: webView) } }
         }
     }
 
@@ -720,7 +720,12 @@ extension BrowserExtensions: WKWebExtensionControllerDelegate {
         guard let tab = browser.activeTab else { throw ExtensionFailure("Could not create a tab.") }
         tab.extensionOrigin = isExtensionPage ? context.baseURL : nil
         if let url = configuration.url { tab.load(url) }
-        if configuration.index < browser.tabs.count { browser.moveTab(tab.id, to: configuration.index) }
+        // Extension indices span the window; creation still belongs to its active Space.
+        if configuration.index >= 0 {
+            let offset = browser.allTabs.firstIndex { $0.spaceID == browser.activeSpaceID } ?? 0
+            let localIndex = max(0, configuration.index - offset)
+            if localIndex < browser.tabs.count { browser.moveTab(tab.id, to: localIndex) }
+        }
         if !configuration.shouldBeActive { browser.activeTabID = previous }
         return tab
     }

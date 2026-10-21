@@ -112,6 +112,7 @@ struct BrowserWindow: View {
                          hoverCardTabID: $hoverCardTabID)
                     .frame(width: sidebarWidth)
                     .privateChrome(browser.isPrivate)
+                    .offset(x: BrowserChrome.dockedSidebarHorizontalInset)
                     .overlay(alignment: .trailing) {
                         SidebarResizeHandle(width: sidebarWidthBinding, isResizing: $sidebarIsResizing)
                             .offset(x: BrowserChrome.edgeInset)

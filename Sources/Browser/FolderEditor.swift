@@ -37,10 +37,6 @@ struct FolderEditor: View {
     @State private var error: String?
     @FocusState private var nameIsFocused: Bool
 
-    private let symbols = ["folder", "briefcase", "house", "airplane", "book", "doc.text", "terminal", "curlybraces",
-                           "gamecontroller", "film", "music.note", "cart", "heart", "star", "leaf", "flame",
-                           "photo", "pencil", "graduationcap", "globe", "map", "cup.and.saucer", "building.2", "lightbulb"]
-
     init(browser: BrowserModel, request: FolderEditorRequest) {
         self.browser = browser
         self.request = request
@@ -63,36 +59,7 @@ struct FolderEditor: View {
                     Text(browser.folders.path(for: row.item)).tag(Optional(row.id))
                 }
             }
-            Text("Icon").font(.subheadline.weight(.medium))
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 8), spacing: 6) {
-                ForEach(symbols, id: \.self) { candidate in
-                    Button { symbol = candidate; emoji = "" } label: {
-                        Image(systemName: candidate).font(.system(size: 16)).foregroundStyle(color.tint)
-                            .frame(maxWidth: .infinity).frame(height: 32)
-                            .background(symbol == candidate && emoji.isEmpty ? Color.primary.opacity(0.1) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 7))
-                    }
-                    .buttonStyle(.plain).help(candidate).accessibilityLabel("\(candidate) icon")
-                }
-            }
-            HStack(spacing: 10) {
-                Text("Emoji")
-                TextField("Or use an emoji", text: $emoji).textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("Folder emoji")
-                    .onChange(of: emoji) { _, value in if value.count > 1 { emoji = String(value.prefix(1)) } }
-                Text("⌃⌘Space").font(.caption).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 12) {
-                Text("Color")
-                ForEach(FolderColor.allCases, id: \.self) { candidate in
-                    Button { color = candidate } label: {
-                        Circle().fill(candidate.tint).frame(width: 16, height: 16)
-                            .padding(3)
-                            .overlay(Circle().strokeBorder(color == candidate ? Color.primary.opacity(0.6) : .clear, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain).accessibilityLabel("\(candidate.rawValue.capitalized) icon color")
-                }
-            }
+            SavedItemIconPicker(symbol: $symbol, emoji: $emoji, color: $color, emojiAccessibilityLabel: "Folder emoji")
             if let error { Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
             HStack {
                 Spacer()

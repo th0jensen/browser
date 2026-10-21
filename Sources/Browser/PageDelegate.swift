@@ -214,7 +214,9 @@ final class PageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webViewDidClose(_ webView: WKWebView) {
         guard let tab, let browser = tab.browser else { return }
         if browser.peek?.tab.id == tab.id { browser.dismissPeek(); return }
-        if tab.isPopUp, browser.tabs.count == 1, let window = browser.window {
+        // Only a popup that owns this entire window may close it. A background
+        // popup must not use another Space's tab count to decide window ownership.
+        if tab.isPopUp, browser.allTabs.count == 1, browser.allTabs.first === tab, let window = browser.window {
             window.close()
         } else {
             browser.closeTab(tab.id)

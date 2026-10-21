@@ -56,7 +56,7 @@ struct PinnedPagesButton: View {
         .labelStyle(ChromeToolbarLabelStyle())
         .chromeToolbarButtonStyle()
         .controlSize(.regular)
-        .help("Essential Tabs")
+        .help("Space Essentials — saved only in this Space")
         .popover(isPresented: $isPresented) {
             PinnedPagesGrid(browser: browser).padding(BrowserChrome.edgeInset).frame(width: sidebarWidth)
                 .modifier(SplitDropBadge(controller: browser.tabDrag))
@@ -98,7 +98,7 @@ private struct PinnedPageTile: View {
         .glassEffect(active ? .regular.tint(tint.opacity(0.45)).interactive() : .regular.interactive(),
                      in: RoundedRectangle(cornerRadius: BrowserChrome.contentCornerRadius, style: .continuous))
         .help("\(page.title)\n\(page.url.absoluteString)")
-        .accessibilityLabel("Essential Tab: \(page.title)")
+        .accessibilityLabel("Space Essential: \(page.title)")
         .accessibilityAddTraits(active ? [.isSelected] : [])
         .onHover { isHovered = $0 }
         .modifier(TabDragSource(controller: browser.tabDrag, payload: SidebarDragItem.essential(page.id).payload,

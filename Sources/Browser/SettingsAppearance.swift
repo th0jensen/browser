@@ -33,6 +33,20 @@ struct AppearanceSettings: View {
             }
             Section("Sidebar") {
                 Toggle("Automatically hide sidebar", isOn: Binding(get: { windowSettingsTarget.preferences.autoHideSidebar }, set: { windowSettingsTarget.preferences.autoHideSidebar = $0 })).disabled(tabLayout != .vertical)
+                Toggle("Show Space title", isOn: Binding(get: { windowSettingsTarget.preferences.showsSpaceTitle }, set: { windowSettingsTarget.preferences.showsSpaceTitle = $0 }))
+                    .disabled(tabLayout != .vertical)
+                    .help("Show the current Space name and icon above pinned tabs, independently of the bottom Space indicator.")
+                    .accessibilityIdentifier("ShowSpaceTitleToggle")
+                Toggle("Show New Space button", isOn: Binding(get: { windowSettingsTarget.preferences.showsNewSpaceButton }, set: { windowSettingsTarget.preferences.showsNewSpaceButton = $0 }))
+                    .disabled(tabLayout != .vertical)
+                    .help("Show the plus button at the bottom of the sidebar, independently of the Space indicator.")
+                    .accessibilityIdentifier("ShowNewSpaceButtonToggle")
+                Picker("Hide Space indicator", selection: Binding(get: { windowSettingsTarget.preferences.spaceIndicatorHiding }, set: { windowSettingsTarget.preferences.spaceIndicatorHiding = $0 })) {
+                    ForEach(SpaceIndicatorHiding.allCases) { mode in Text(mode.title).tag(mode) }
+                }
+                .disabled(tabLayout != .vertical)
+                .help("Hide the Space icon, dots and overflow control at the bottom of the sidebar. Space shortcuts still work.")
+                .accessibilityIdentifier("SpaceIndicatorHidingPicker")
                 Toggle("Compact tabs", isOn: $usesCompactTabs)
                 LabeledContent("Width") {
                     HStack {
