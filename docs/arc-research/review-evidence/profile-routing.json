@@ -1,0 +1,88 @@
+{
+  "schema": "browser.engineering-validation",
+  "version": 1,
+  "toolchain": {
+    "xcode": "27.1 (27A9275)",
+    "macOSSDK": "27.0",
+    "globalDeveloperSelectionChanged": false
+  },
+  "scope": "Profiles plus current Spaces, then the dependent profile-aware Routing revision. Not the complete feature stack.",
+  "checks": [
+    {
+      "pr": 32,
+      "branch": "pi-agent/arc-profiles",
+      "head": "db1fea67b3528cd7a71ae1a8d0cdade28def06c7",
+      "spacesParent": "15556c47642acb4a119843cc18868bdbc304c556",
+      "command": "just test",
+      "configuration": "Debug",
+      "exitCode": 0,
+      "passed": 503,
+      "failed": 0,
+      "skipped": 2,
+      "sourceUnchangedDuringValidation": true
+    },
+    {
+      "pr": 30,
+      "branch": "pi-agent/arc-link-routing",
+      "head": "99a48e4f1a40691104ef4d1b569757153e50c33a",
+      "profilesParent": "db1fea67b3528cd7a71ae1a8d0cdade28def06c7",
+      "command": "just test",
+      "configuration": "Debug",
+      "exitCode": 0,
+      "passed": 530,
+      "failed": 0,
+      "skipped": 2,
+      "sourceUnchangedDuringValidation": true
+    }
+  ],
+  "independentSourceReview": {
+    "candidate": "99a48e4f1a40691104ef4d1b569757153e50c33a",
+    "method": "Separate read-only assistant invocation with read, grep, find and ls only",
+    "result": "No concrete source-level compilation, correctness or safety blocker identified in the stated scope",
+    "findingClosed": "Control-number menu labels used raw Space indices while actions used eligible indices. Labels now use selectableSpaces and actions capture the displayed Space UUID.",
+    "sharedProfileFilesByteIdentical": [
+      "Sources/Browser/BrowserModel.swift",
+      "Sources/Browser/BrowserSpaces.swift",
+      "Sources/Browser/SpaceSwitcher.swift",
+      "Sources/Browser/SpaceSelectorProfileContext.swift",
+      "Sources/Browser/TabStrip.swift",
+      "Tests/BrowserTests/ProfileSpacePresentationTests.swift"
+    ],
+    "remainingCoverage": [
+      "Actual profile-settings sheet capture/dismissal across Space changes",
+      "Command-menu focused-window transitions",
+      "Actual OS incoming-link delivery and profile-resource behavior",
+      "Additional outer router reentrancy scenarios"
+    ],
+    "githubApproval": false,
+    "releaseApproval": false
+  },
+  "limitations": {
+    "nativeAcceptancePerformed": false,
+    "installedBrowserDeployedOrRelaunched": false,
+    "userPageInteractedWith": false,
+    "fullStackValidated": false,
+    "testCountsAreAdditive": false,
+    "activeLSPCoverage": "Inconclusive; real Xcode compilation and XCTest provide the validation above. Pre-existing size/style diagnostics remain deferred, without inline suppressions.",
+    "rawTestBundlesAndAssistantTranscriptBundled": false,
+    "receiptMeaning": "Durable record of these completed checks. Reproduce with just test at each recorded branch/head; this JSON is not the raw XCTest bundle."
+  },
+  "documentationValidation": {
+    "method": "Offline Node/happy-dom checks through a temporary just recipe",
+    "result": "Passed",
+    "coverage": "23 plan items, 47 stable check IDs, eight accessible diagrams, sidebar model, original research hash, build/stale-result gates, recorded user-review scope without auto-seeding passes, safe notes, filters, theme, storage failure, JSON import/export, text export, print/reset/keyboard and malformed/missing guide-data read-only fallback",
+    "networkRequests": 0,
+    "nativeVisualAcceptance": false,
+    "temporaryHarnessBundled": false
+  },
+  "userReview": {
+    "code": "c078b974dd59de8dd6a0f9976a2d70eaa8d4287f",
+    "currentPassed": 10,
+    "currentNotTried": 6,
+    "otherNotTried": 31,
+    "failuresReported": 0,
+    "continueEngineering": true,
+    "acceptanceTransferredToNewBranches": false,
+    "releaseApproval": false
+  }
+}
