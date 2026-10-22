@@ -9,6 +9,9 @@ struct SpaceSelectorProfileContext {
     let showSettings: (UUID) -> Void
     let clearData: (UUID) -> Void
 
+    var hasNamedProfiles: Bool { titles.keys.contains { $0 != BrowserProfile.defaultID } }
+    func title(for profileID: UUID) -> String? { hasNamedProfiles ? titles[profileID] : nil }
+
     init(titles: [UUID: String], activeProfileID: UUID, canClearData: Bool,
          showSettings: @escaping (UUID) -> Void, clearData: @escaping (UUID) -> Void) {
         self.titles = titles

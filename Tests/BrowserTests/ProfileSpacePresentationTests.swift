@@ -81,6 +81,23 @@ final class ProfileSpacePresentationTests: XCTestCase {
         XCTAssertTrue(BrowserModel(isPrivate: true, spaces: recovered).selectableSpaces.isEmpty)
     }
 
+    func testDefaultOnlyContextKeepsExistingLabelsAndSingleEditAction() throws {
+        let space = BrowserSpace(id: BrowserSpaceStore.defaultSpaceID, title: "Home", profileID: BrowserProfile.defaultID)
+        let context = SpaceSelectorProfileContext(titles: [BrowserProfile.defaultID: "Existing Profile"],
+                                                 activeProfileID: BrowserProfile.defaultID, canClearData: true,
+                                                 showSettings: { _ in XCTFail("Default has no named-profile settings action") },
+                                                 clearData: { _ in XCTFail("Default has no named-profile clear action") })
+        let view = SpaceSelectorView(frame: NSRect(x: 0, y: 0, width: 236, height: 36))
+        view.update(spaces: [space], activeID: space.id, enabled: true, profileContext: context,
+                    select: { _ in }, edit: { _ in }, create: {})
+        view.layoutSubtreeIfNeeded()
+        let button = try XCTUnwrap(view.choiceButtons.first)
+        XCTAssertEqual(button.toolTip, "Home")
+        XCTAssertEqual(button.accessibilityLabel(), "Switch to Space Home")
+        XCTAssertEqual(button.menu?.items.map(\.title), ["Edit Space…"])
+        XCTAssertEqual(view.spaceMenu.items.map(\.title), ["Home"])
+    }
+
     func testNativeProfileLabelsAndActionsSurviveOptionalControlIntegration() throws {
         let owner = UUID()
         let space = BrowserSpace(id: UUID(), title: "Research", profileID: owner)

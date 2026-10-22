@@ -233,12 +233,12 @@ final class SpaceSelectorView: NSView {
         self.create = create
         spaceMenu = NSMenu(title: "All Spaces")
         spaceMenu.autoenablesItems = false
-        if let active = spaces.first(where: { $0.id == activeID }), profileContext != nil {
+        if let active = spaces.first(where: { $0.id == activeID }), profileContext?.hasNamedProfiles == true {
             appendProfileItems(to: spaceMenu, for: active)
             spaceMenu.addItem(.separator())
         }
         for space in spaces {
-            let label = profileContext?.titles[space.profileID].map { "\(space.title) — \($0)" } ?? space.title
+            let label = profileContext?.title(for: space.profileID).map { "\(space.title) — \($0)" } ?? space.title
             let item = NSMenuItem(title: label, action: #selector(selectMenuItem(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = space.id
@@ -274,7 +274,7 @@ final class SpaceSelectorView: NSView {
         choiceButtons = visible.enumerated().map { index, space in
             let button = old[space.id] ?? SpaceChoiceButton(spaceID: space.id)
             button.configure(space, selected: space.id == activeID, compact: compact,
-                             profileTitle: profileContext?.titles[space.profileID])
+                             profileTitle: profileContext?.title(for: space.profileID))
             button.isEnabled = enabled
             button.target = self
             button.action = #selector(selectChoice(_:))
@@ -283,7 +283,7 @@ final class SpaceSelectorView: NSView {
             if button.superview !== selectorGroup { selectorGroup.addSubview(button) }
             let menu = NSMenu(title: space.title)
             menu.autoenablesItems = false
-            if profileContext != nil {
+            if profileContext?.hasNamedProfiles == true {
                 appendProfileItems(to: menu, for: space)
                 menu.addItem(.separator())
             }
