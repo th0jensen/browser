@@ -59,7 +59,8 @@ final class BrowserSpaceStore {
     let profiles: BrowserProfileStore
     private let directory: URL
     private let enabled: Bool
-    private var loadFailed = false
+    /// Descriptor clients must not treat the recovery Default value as loaded metadata.
+    private(set) var loadFailed = false
     private var needsAppearanceBackup = false
     @ObservationIgnored private var folderStores: [UUID: TabFolderStore] = [:]
     @ObservationIgnored private var pinnedStores: [UUID: PinnedPageStore] = [:]

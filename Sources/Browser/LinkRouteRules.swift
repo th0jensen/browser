@@ -36,6 +36,51 @@ struct LinkRouteRule: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// A descriptor-only snapshot shared by rule editing, labels, and delivery checks.
+/// Resolve both owners through the same injected store. Never request WebKit resources here.
+@MainActor
+struct LinkRouteDestination: Identifiable, Equatable {
+    enum Availability: Equatable {
+        case available, missingSpace, unreadableSpaces, missingProfile, unreadableProfiles
+    }
+
+    let id: UUID
+    let space: BrowserSpace?
+    let profile: BrowserProfileDescriptor?
+    let availability: Availability
+    var isAvailable: Bool { availability == .available }
+
+    init(spaceID: UUID, spaces: BrowserSpaceStore) {
+        id = spaceID
+        space = spaces.loadFailed ? nil : spaces.space(spaceID)
+        profile = spaces.profiles.loadFailed ? nil : space.flatMap { spaces.profiles.profile($0.profileID) }
+        if spaces.loadFailed { availability = .unreadableSpaces }
+        else if space == nil { availability = .missingSpace }
+        else if spaces.profiles.loadFailed { availability = .unreadableProfiles }
+        else if profile == nil { availability = .missingProfile }
+        else { availability = .available }
+    }
+
+    static func all(in spaces: BrowserSpaceStore) -> [Self] {
+        guard !spaces.loadFailed else { return [] }
+        return spaces.spaces.map { Self(spaceID: $0.id, spaces: spaces) }
+    }
+
+    var label: String {
+        switch availability {
+        case .available: "\(profile!.title) — \(space!.title)"
+        case .missingSpace: "Missing Space (\(id))"
+        case .unreadableSpaces: "Space unavailable (\(id)) — Spaces file could not be read"
+        case .missingProfile: "\(space!.title) — missing profile (\(space!.profileID))"
+        case .unreadableProfiles: "\(space!.title) — profile unavailable (\(space!.profileID)); Profiles file could not be read"
+        }
+    }
+
+    var identityDescription: String {
+        "Space ID: \(id)" + (space.map { "\nProfile ID: \($0.profileID)" } ?? "")
+    }
+}
+
 @MainActor @Observable
 final class LinkRouteRuleStore {
     static let shared = LinkRouteRuleStore(directory: BrowserProfile.directory, enabled: !BrowserProfile.isTesting)
@@ -49,7 +94,7 @@ final class LinkRouteRuleStore {
         var errorDescription: String? {
             switch self {
             case .invalidHost: "Enter a host such as example.com, without a scheme, port, or path."
-            case .unavailableDestination: "Choose an available Space in the Existing Profile."
+            case .unavailableDestination: "Choose an available Space with a known owning profile."
             case .unreadableFile: "The link rules file could not be read. Keep the file for recovery before changing rules."
             case .invalidRules: "The link rules contain duplicate identifiers."
             }
@@ -72,7 +117,7 @@ final class LinkRouteRuleStore {
     }
 
     func save(_ rule: LinkRouteRule, spaces: BrowserSpaceStore) throws {
-        guard let space = spaces.space(rule.destinationSpaceID), space.profileID == BrowserProfile.defaultID else {
+        guard LinkRouteDestination(spaceID: rule.destinationSpaceID, spaces: spaces).isAvailable else {
             throw Failure.unavailableDestination
         }
         var next = rules

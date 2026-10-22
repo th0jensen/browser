@@ -105,10 +105,11 @@ final class ExternalURLRouter {
             var destination = fallback
             var selectedRule = false
             if let rule = rules.firstMatch(for: url),
-               let target = ordinary.first(where: { browser in
-                   guard let space = browser.spaces.space(rule.destinationSpaceID) else { return false }
-                   return space.profileID == browser.profileID && browser.websiteDataStore(forProfileID: space.profileID) != nil
+               let target = ordinary.first(where: {
+                   LinkRouteDestination(spaceID: rule.destinationSpaceID, spaces: $0.spaces).isAvailable
                }), target.selectSpace(rule.destinationSpaceID) {
+                // Selection installs the destination's immutable profile ownership before opening.
+                // The window's previously selected profile is not a routing constraint.
                 destination = target
                 selectedRule = true
             }

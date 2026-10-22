@@ -12,7 +12,7 @@ struct LinkRoutingSettings: View {
                 Text("Rules apply to web links opened from other apps. The first matching rule wins. Move rules up or down to set their order.")
                 Text("Other links use the front ordinary window and its selected Space. If a destination is missing or unavailable, the same fallback applies. Private windows are never selected.")
                     .foregroundStyle(.secondary)
-                Text("Spaces share the Existing Profile and its logins. Source-app conditions are not available.")
+                Text("Destinations show the owning profile, then the Space. Spaces in the same profile share logins; different profiles keep website data separate. Source-app conditions are not available.")
                     .foregroundStyle(.secondary)
             }
             Section("Host Rules") {
@@ -38,10 +38,11 @@ struct LinkRoutingSettings: View {
                         }
                         Text(rule.includesSubdomains ? "This host and its subdomains" : "This host only")
                             .foregroundStyle(.secondary)
-                        if let destination = spaces.space(rule.destinationSpaceID), destination.profileID == BrowserProfile.defaultID {
-                            Text("Destination Space: \(destination.title)")
-                        } else {
-                            Text("Destination Space: unavailable — uses the ordinary fallback")
+                        let destination = LinkRouteDestination(spaceID: rule.destinationSpaceID, spaces: spaces)
+                        Text("Destination: \(destination.label)")
+                            .help(destination.identityDescription)
+                        if !destination.isAvailable {
+                            Text("Uses the ordinary fallback. Later rules are not tried.")
                                 .foregroundStyle(.secondary)
                         }
                         if rule.sourceBundleID != nil {
@@ -52,9 +53,10 @@ struct LinkRoutingSettings: View {
                 }
                 if rules.rules.isEmpty { Text("No host rules. Links use the ordinary fallback.").foregroundStyle(.secondary) }
                 Button("Add Host Rule") {
-                    draft = LinkRouteRule(host: "", includesSubdomains: false,
-                                          destinationSpaceID: BrowserSpaceStore.defaultSpaceID)
+                    guard let destination = LinkRouteDestination.all(in: spaces).first(where: \.isAvailable) else { return }
+                    draft = LinkRouteRule(host: "", includesSubdomains: false, destinationSpaceID: destination.id)
                 }
+                .disabled(!LinkRouteDestination.all(in: spaces).contains(where: \.isAvailable))
             }
             .disabled(rules.loadFailed)
             if rules.loadFailed { Text(LinkRouteRuleStore.Failure.unreadableFile.localizedDescription).foregroundStyle(.secondary) }
@@ -84,14 +86,16 @@ private struct LinkRouteEditor: View {
             Form {
                 TextField("Host", text: $rule.host, prompt: Text("example.com"))
                 Toggle("Include subdomains", isOn: $rule.includesSubdomains)
-                Picker("Destination Space", selection: $rule.destinationSpaceID) {
-                    ForEach(spaces.spaces.filter { $0.profileID == BrowserProfile.defaultID }) { space in
-                        Text(space.title).tag(space.id)
+                Picker("Profile and Space", selection: $rule.destinationSpaceID) {
+                    ForEach(LinkRouteDestination.all(in: spaces).filter(\.isAvailable)) { destination in
+                        Text(destination.label).tag(destination.id)
                     }
-                    if spaces.space(rule.destinationSpaceID) == nil {
-                        Text("Unavailable Space").tag(rule.destinationSpaceID)
+                    let selected = LinkRouteDestination(spaceID: rule.destinationSpaceID, spaces: spaces)
+                    if !selected.isAvailable {
+                        Text(selected.label).tag(selected.id).disabled(true)
                     }
                 }
+                .help(LinkRouteDestination(spaceID: rule.destinationSpaceID, spaces: spaces).identityDescription)
                 Text("Enter only a host, not a URL. New rules are added last. The first matching rule wins.")
                     .foregroundStyle(.secondary)
             }
@@ -107,6 +111,6 @@ private struct LinkRouteEditor: View {
             }
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 540)
     }
 }
