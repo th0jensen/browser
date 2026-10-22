@@ -44,6 +44,21 @@ struct TabStrip: View {
     private let minTabWidth: CGFloat = 56
     /// Always leave some empty strip to drag the window by.
     private let minDragAreaWidth: CGFloat = 40
+    private let spaceTitleRowHeight: CGFloat = 24
+
+    var showsSpaceTitle: Bool {
+        layout == .vertical && !browser.isPrivate && !browser.isExtensionWindow && browser.chromePreferences.showsSpaceTitle
+    }
+
+    var showsSpaceSelector: Bool {
+        layout == .vertical && !browser.isPrivate && !browser.isExtensionWindow
+            && browser.chromePreferences.showsSpaceControls(spaceCount: browser.selectableSpaces.count)
+    }
+
+    var sidebarSpaceControlsHeight: CGFloat {
+        (showsSpaceSelector ? 36 + BrowserChrome.edgeInset * 2 : 0)
+            + (showsSpaceTitle ? spaceTitleRowHeight + BrowserChrome.edgeInset : 0)
+    }
 
     var body: some View {
         Group {
@@ -149,17 +164,20 @@ struct TabStrip: View {
             }
             let tabsHeight = CGFloat(count) * rowHeight + CGFloat(max(0, count - 1)) * BrowserChrome.smallGap
             let pinRows = CGFloat(max(1, (browser.pinnedPages.items.count + 2) / 3))
-            let pinHeight = pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset + 16
+            let pinHeight = pinRows * PinnedPagesGrid.tileHeight + (pinRows - 1) * BrowserChrome.edgeInset + BrowserChrome.edgeInset
             let dropGapHeight = sidebarDividerHeight + BrowserChrome.smallGap * 3
-            let spaceControlHeight: CGFloat = browser.isPrivate || browser.isExtensionWindow ? 0 : 64 + BrowserChrome.edgeInset * 2
-            let newTabFits = spaceControlHeight + dropGapHeight + tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
+            let newTabFits = sidebarSpaceControlsHeight + dropGapHeight + tabsHeight + (count > 0 ? BrowserChrome.smallGap : 0) + rowHeight + BrowserChrome.edgeInset + pinHeight <= geometry.size.height
 
             VStack(spacing: BrowserChrome.edgeInset) {
                 PinnedPagesGrid(browser: browser)
                     .padding(.horizontal, BrowserChrome.edgeInset)
                     .zIndex(browser.tabDrag.payload?.hasPrefix("browser-essential:") == true ? 200 : 0)
-                BrowserSpaceHeading(browser: browser)
-                    .padding(.horizontal, BrowserChrome.edgeInset)
+                if showsSpaceTitle {
+                    BrowserSpaceHeading(browser: browser)
+                        .frame(height: spaceTitleRowHeight)
+                        .padding(.horizontal, BrowserChrome.edgeInset)
+                        .accessibilityIdentifier("BrowserSpaceTitleRow")
+                }
                 ScrollViewReader { scrollProxy in
                     ScrollView(.vertical) {
                         VStack(spacing: BrowserChrome.smallGap) {
@@ -207,16 +225,11 @@ struct TabStrip: View {
                         .padding(.horizontal, BrowserChrome.edgeInset)
                         .padding(.bottom, BrowserChrome.edgeInset)
                 }
-                if !browser.isPrivate && !browser.isExtensionWindow {
-                    // Persistent navigation, outside both the tab scroller and its New Tab row.
+                if showsSpaceSelector {
+                    // Optional navigation, outside both the tab scroller and its New Tab row.
                     SpaceSwitcher(browser: browser, style: .sidebar)
                         .padding(.horizontal, BrowserChrome.edgeInset)
                         .padding(.bottom, BrowserChrome.edgeInset)
-                }
-            }
-            .background {
-                if !browser.isPrivate && !browser.isExtensionWindow {
-                    (browser.spaces.space(browser.activeSpaceID)?.theme.color ?? .accentColor).opacity(0.035)
                 }
             }
             .contextMenu { stripMenu }

@@ -383,7 +383,8 @@ final class SpacePresentationTests: XCTestCase {
         for index in 0..<100 {
             let layout = SpaceStripLayout(count: 100, selectedIndex: index, width: 180)
             XCTAssertTrue(layout.visibleIndices.contains(index))
-            XCTAssertLessThanOrEqual(layout.visibleIndices.count, 2)
+            XCTAssertEqual(layout.targetSize, 24)
+            XCTAssertLessThanOrEqual(CGFloat(layout.visibleIndices.count) * layout.targetSize, 180 - layout.utilityGutter * 2)
             XCTAssertTrue(layout.showsOverflow)
             XCTAssertFalse(layout.usesCompactMenu)
         }

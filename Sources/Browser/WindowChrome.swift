@@ -11,6 +11,9 @@ enum BrowserChrome {
     static let sidebarTabHeight: CGFloat = 32
     /// Inset shared by the navigation bar and the page, so their edges line up.
     static let edgeInset: CGFloat = 8
+    /// Centre docked contents in the visible column, including the adjacent page gutter.
+    /// Translate content only: page/overlay bounds and the resize target keep their existing geometry.
+    static let dockedSidebarHorizontalInset: CGFloat = edgeInset / 2
     /// One chrome-width inside the page's existing outer chrome-width.
     static let revealInset: CGFloat = edgeInset * 2
 

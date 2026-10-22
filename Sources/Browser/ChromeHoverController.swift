@@ -73,6 +73,7 @@ final class ChromeHoverController {
         }
     }
     private(set) var presentationCount = 0
+    private(set) var sidebarPresentationCount = 0
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
     @ObservationIgnored private var sidebarOpenedFromToolbar = false
     @ObservationIgnored private var toolbarHideTask: Task<Void, Never>?
@@ -179,6 +180,13 @@ final class ChromeHoverController {
         if presentationCount == 0 { reevaluatePointer() }
     }
 
+    func beginSidebarPresentation() { sidebarPresentationCount += 1; revealSidebar() }
+    func endSidebarPresentation() {
+        guard sidebarPresentationCount > 0 else { return }
+        sidebarPresentationCount -= 1
+        if sidebarPresentationCount == 0 { reevaluatePointer() }
+    }
+
     func scheduleToolbarHide() {
         guard compactToolbar, toolbarIsRevealed, toolbarHideTask == nil,
               !addressIsFocused, navigationAwaitingSuccess == nil, !menuIsTracking, !customizationIsRunning, !folderEditorIsPresented, presentationCount == 0, canHideToolbar() else { return }
@@ -195,12 +203,14 @@ final class ChromeHoverController {
 
     func scheduleSidebarHide() {
         guard sidebarIsRevealed, sidebarHideTask == nil, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed,
-              !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarIsReordering else { return }
+              !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarIsReordering,
+              sidebarPresentationCount == 0 else { return }
         sidebarHideTask = Task { @MainActor [weak self, sleep] in
             do { try await sleep(Self.hideDelay) } catch { return }
             guard let self else { return }
             sidebarHideTask = nil
-            guard !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarIsReordering, !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed else { return }
+            guard !menuIsTracking, !folderEditorIsPresented, !sidebarIsResizing, !sidebarIsReordering,
+                  !sidebarOpenedFromToolbar, !addressKeepsSidebarRevealed, sidebarPresentationCount == 0 else { return }
             sidebarIsRevealed = false
         }
     }

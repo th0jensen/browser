@@ -35,10 +35,26 @@ struct BrowserSpace: Codable, Equatable, Identifiable, Sendable {
     let profileID: UUID
     var icon: BrowserSpaceIcon = .circle
     var theme: BrowserSpaceTheme = .system
+    var symbol: String?
+    var emoji = ""
+    var color = FolderColor.primary
+
+    var displaySymbol: String { Self.cleanSymbol(symbol) ?? icon.symbol }
+
+    static func cleanSymbol(_ symbol: String?) -> String? {
+        guard let symbol, symbol.utf8.count <= 100,
+              SavedItemIconSymbols.all.contains(symbol) || BrowserSpaceIcon.allCases.contains(where: { $0.symbol == symbol }) else { return nil }
+        return symbol
+    }
+
+    static func cleanEmoji(_ emoji: String) -> String {
+        guard emoji.utf8.count <= 64, !emoji.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else { return "" }
+        return String(emoji.prefix(1))
+    }
 }
 
 extension BrowserSpace {
-    private enum CodingKeys: String, CodingKey { case id, title, profileID, icon, theme }
+    private enum CodingKeys: String, CodingKey { case id, title, profileID, icon, theme, symbol, emoji, color }
 
     init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -48,6 +64,9 @@ extension BrowserSpace {
         // Appearance is optional metadata. Unknown future palette values must not hide saved tabs.
         icon = (try? values.decode(String.self, forKey: .icon)).flatMap(BrowserSpaceIcon.init(rawValue:)) ?? .circle
         theme = (try? values.decode(String.self, forKey: .theme)).flatMap(BrowserSpaceTheme.init(rawValue:)) ?? .system
+        symbol = Self.cleanSymbol(try? values.decode(String.self, forKey: .symbol))
+        emoji = Self.cleanEmoji((try? values.decode(String.self, forKey: .emoji)) ?? "")
+        color = (try? values.decode(String.self, forKey: .color)).flatMap(FolderColor.init(rawValue:)) ?? .primary
     }
 }
 
@@ -116,20 +135,26 @@ final class BrowserSpaceStore {
 
     @discardableResult
     func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID,
-                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system) throws -> BrowserSpace {
+                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system,
+                     symbol: String? = nil, emoji: String = "", color: FolderColor = .primary) throws -> BrowserSpace {
         guard !loadFailed else { throw Failure.unavailable }
         guard profiles.profile(profileID) != nil else { throw Failure.unsupportedProfile }
-        let space = BrowserSpace(id: UUID(), title: try cleanTitle(title), profileID: profileID, icon: icon, theme: theme)
+        let space = BrowserSpace(id: UUID(), title: try cleanTitle(title), profileID: profileID, icon: icon, theme: theme,
+                                 symbol: BrowserSpace.cleanSymbol(symbol), emoji: BrowserSpace.cleanEmoji(emoji), color: color)
         try commit(spaces + [space])
         return space
     }
 
-    func updateSpace(_ id: UUID, title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme) throws {
+    func updateSpace(_ id: UUID, title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme,
+                     symbol: String? = nil, emoji: String? = nil, color: FolderColor? = nil) throws {
         guard let index = spaces.firstIndex(where: { $0.id == id }) else { throw Failure.unavailable }
         var next = spaces
         next[index].title = try cleanTitle(title)
         next[index].icon = icon
         next[index].theme = theme
+        if let symbol { next[index].symbol = BrowserSpace.cleanSymbol(symbol) }
+        if let emoji { next[index].emoji = BrowserSpace.cleanEmoji(emoji) }
+        if let color { next[index].color = color }
         try commit(next)
     }
 
