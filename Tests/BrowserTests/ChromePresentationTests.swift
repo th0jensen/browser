@@ -39,6 +39,47 @@ final class ChromePresentationTests: XCTestCase {
         XCTAssertEqual(controller.begins, controller.ends)
     }
 
+    func testMovingAHoldBetweenToolbarAndSidebarBalancesBothRegions() {
+        let controller = PresentationCounter()
+        let hold = ChromePresentationHold()
+        hold.setPresented(true, controller: controller)
+        hold.setPresented(true, controller: controller, region: .sidebar)
+        hold.setPresented(true, controller: controller, region: .sidebar)
+        XCTAssertEqual(controller.begins, 1)
+        XCTAssertEqual(controller.ends, 1)
+        XCTAssertEqual(controller.sidebarBegins, 1)
+        hold.end()
+        XCTAssertEqual(controller.sidebarEnds, 1)
+    }
+
+    func testSidebarHoldsCancelPendingHideWithoutRevealingToolbarAndResumeAfterLastRelease() async throws {
+        // Return even when cancelled to exercise the delayed callback's hold guard too.
+        let controller = ChromeHoverController(sleep: { _ in try? await Task.sleep(for: .milliseconds(80)) })
+        controller.verticalTabs = true
+        controller.autoHideSidebar = true
+        controller.compactToolbar = true
+        controller.pointerMoved(to: CGPoint(x: 1, y: 120))
+        controller.pointerMoved(to: CGPoint(x: 700, y: 200))
+        let first = ChromePresentationHold()
+        let second = ChromePresentationHold()
+        first.setPresented(true, controller: controller, region: .sidebar)
+        second.setPresented(true, controller: controller, region: .sidebar)
+        try await Task.sleep(for: .milliseconds(160))
+        XCTAssertTrue(controller.sidebarIsRevealed)
+        XCTAssertFalse(controller.toolbarIsRevealed)
+        XCTAssertEqual(controller.sidebarPresentationCount, 2)
+        first.end()
+        controller.pointerMoved(to: nil)
+        try await Task.sleep(for: .milliseconds(160))
+        XCTAssertTrue(controller.sidebarIsRevealed)
+        XCTAssertEqual(controller.sidebarPresentationCount, 1)
+        second.end()
+        try await Task.sleep(for: .milliseconds(160))
+        XCTAssertFalse(controller.sidebarIsRevealed)
+        XCTAssertEqual(controller.sidebarPresentationCount, 0)
+        XCTAssertEqual(controller.presentationCount, 0)
+    }
+
     func testNativePopoverOnlyRespondsToItsOwnCloseAndCleansUpOnce() {
         let controller = PresentationCounter()
         let popover = NSPopover()
@@ -85,6 +126,12 @@ final class ChromePresentationTests: XCTestCase {
 private final class PresentationCounter: ChromePresentationControlling {
     private(set) var begins = 0
     private(set) var ends = 0
-    func beginPresentation() { begins += 1 }
-    func endPresentation() { ends += 1 }
+    private(set) var sidebarBegins = 0
+    private(set) var sidebarEnds = 0
+    func beginPresentation(in region: ChromePresentationRegion) {
+        if region == .toolbar { begins += 1 } else { sidebarBegins += 1 }
+    }
+    func endPresentation(in region: ChromePresentationRegion) {
+        if region == .toolbar { ends += 1 } else { sidebarEnds += 1 }
+    }
 }

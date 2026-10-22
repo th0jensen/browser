@@ -17,10 +17,6 @@ struct PinnedPagesGrid: View {
         let visiblePages = browser.pinnedPages.items.filter { !companions.contains($0.id) }
         let counts = Self.rowCounts(for: visiblePages.count)
         VStack(spacing: BrowserChrome.edgeInset) {
-            Text(browser.isPrivate ? "Private Essentials" : "Space Essentials")
-                .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help("Saved only in this Space. These tiles are not cross-Space Favorites.")
             if counts.isEmpty {
                 Label("Drag a tab here", systemImage: "pin")
                     .font(.system(size: 11)).foregroundStyle(.tertiary)

@@ -182,6 +182,7 @@ final class SidebarSpaceSwipeView: NSView {
               browser.chromeHover?.sidebarIsResizing != true, browser.chromeHover?.addressIsFocused != true,
               browser.chromeHover?.menuIsTracking != true, browser.chromeHover?.customizationIsRunning != true,
               browser.chromeHover?.folderEditorIsPresented != true, (browser.chromeHover?.presentationCount ?? 0) == 0,
+              (browser.chromeHover?.sidebarPresentationCount ?? 0) == 0,
               browser.addressFocusRequest == browser.consumedAddressFocusRequest,
               let window = ownerWindow, window === self.window, browser.window === window,
               browser.spaces.space(browser.activeSpaceID)?.profileID == browser.profileID,

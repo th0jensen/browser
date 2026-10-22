@@ -597,19 +597,33 @@ final class BrowserModel: NSObject {
 
     func tabAcrossSpaces(withID id: UUID) -> BrowserTab? { allTabs.first { $0.id == id } }
 
+    /// Presentation, shortcuts and footer policy must use the same descriptor-only list.
+    var selectableSpaces: [BrowserSpace] {
+        guard !isPrivate, !isExtensionWindow else { return [] }
+        return spaces.spaces.filter { spaces.profiles.profile($0.profileID) != nil }
+    }
+
+    @discardableResult
+    func createSpace(title: String) throws -> BrowserSpace {
+        try createSpace(title: title, profileID: BrowserProfile.defaultID)
+    }
+
     @discardableResult
     func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID,
-                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system) throws -> BrowserSpace {
+                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system,
+                     symbol: String? = nil, emoji: String = "", color: FolderColor = .primary) throws -> BrowserSpace {
         guard !isPrivate, !isExtensionWindow else { throw BrowserSpaceStore.Failure.unavailable }
-        let space = try spaces.createSpace(title: title, profileID: profileID, icon: icon, theme: theme)
+        let space = try spaces.createSpace(title: title, profileID: profileID, icon: icon, theme: theme,
+                                          symbol: symbol, emoji: emoji, color: color)
         selectSpace(space.id)
         return space
     }
 
     @discardableResult
     func selectSpace(at index: Int) -> Bool {
-        guard spaces.spaces.indices.contains(index) else { return false }
-        return selectSpace(spaces.spaces[index].id)
+        let choices = selectableSpaces
+        guard choices.indices.contains(index) else { return false }
+        return selectSpace(choices[index].id)
     }
 
     @discardableResult

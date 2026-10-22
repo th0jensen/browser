@@ -4,6 +4,14 @@ A Space owns tabs and saved pages. A profile owns website data. Spaces that sele
 
 Use **New Space → Profile** to select an existing profile or create a new one. Profile ownership does not change after a Space or tab is created. A live page is never moved into another profile.
 
+## Sidebar and Space editing
+
+The current Spaces presentation is inherited, not replaced. New and existing Spaces use the same anchored icon/emoji/colour picker as folders. New Space keeps profile selection and creation. Editing an existing Space cannot change its owner. The title, New Space button and indicator remain independent controls; the original sidebar material and docked alignment remain intact.
+
+Named-profile context menus retain Profile Site Settings and Clear Profile Data. Their callbacks check the exact active Space and profile before acting. Settings capture their services before presentation and close when the active Space changes. Hidden, disabled, switched or dismantled native controls cannot reuse old profile actions.
+
+The sidebar, overflow, indicator count and Control-number menu use the same descriptor-only eligible Space list. A missing profile does not become a misleading shortcut slot or count as a reachable Space. Its metadata remains available for recovery. Default-only labels and the single Edit Space context-menu action stay unchanged.
+
 ## Stored data
 
 - The Existing Profile keeps its original WebKit default store and existing files. No login data is moved.
@@ -27,4 +35,4 @@ Profile deletion, profile renaming, and profile-specific extensions or password 
 
 ## Provenance and validation
 
-This is local Browser design based on the Arc research delivery plan. It is not a recovered Arc implementation. This feature adds no prompts or model calls. Automated tests cover separate same-site cookies/local storage, stable named-store identifiers, persistence, migration, lazy restore, unknown owners, private/QA isolation, background callbacks, anonymous icons, and profile-scoped recovery clearing. GUI validation is separate. The updated Arc visual acceptance contract requires a bottom-sidebar Space strip with icons and themes. That revision is owned by the separate Spaces task; this profile change does not reimplement it. Keep profile selection, immutable ownership, unavailable-profile labels, and subsystem limits when merging the footer. No native screenshot parity is claimed. The current Space-local Essential scope is an explicit pending integration decision against Arc's cross-Space Favorites guidance, not a verified match.
+This is local Browser design based on the Arc research delivery plan. It is not a recovered Arc implementation. This feature adds no prompts or model calls. Automated tests cover separate same-site cookies/local storage, stable named-store identifiers, persistence, migration, lazy restore, unknown owners, private/QA isolation, background callbacks, anonymous icons, and profile-scoped recovery clearing. The latest Spaces parent and its shared appearance/visibility controls are integrated. Additional regression tests cover profile-owned appearance persistence, missing-owner ordering, default-only compatibility and retained native profile actions. GUI validation is separate; passing background-hosted XCTest fixtures is not physical-input or screenshot acceptance. No native screenshot parity is claimed. The current Space-local Essential scope is an explicit pending integration decision against Arc's cross-Space Favorites guidance, not a verified match.
