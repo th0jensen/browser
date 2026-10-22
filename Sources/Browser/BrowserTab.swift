@@ -84,12 +84,16 @@ final class BrowserTab: NSObject, Identifiable {
          spaceID: UUID? = nil) {
         id = UUID()
         self.spaceID = spaceID ?? browser?.activeSpaceID ?? BrowserSpaceStore.defaultSpaceID
-        profileID = browser?.profileID ?? BrowserProfile.defaultID
+        profileID = browser?.spaces.space(self.spaceID)?.profileID ?? browser?.profileID ?? BrowserProfile.defaultID
         self.browser = browser
-        ownedWebsiteDataStore = browser?.websiteDataStore
+        ownedWebsiteDataStore = browser?.websiteDataStore(forProfileID: profileID)
         super.init()
-        Self.prepareConfiguration(configuration, includingExtensions: browser?.isPrivate != true)
-        if let browser { browser.preparePageConfiguration(configuration) }
+        // Do not carry scripts or opener context from another store.
+        let configuration = ownedWebsiteDataStore.map { store in
+            configuration.websiteDataStore === store ? configuration : browser!.makeConfiguration(profileID: profileID)
+        } ?? configuration
+        Self.prepareConfiguration(configuration, includingExtensions: supportsExtensions)
+        if let browser { browser.preparePageConfiguration(configuration, profileID: profileID) }
         pageDelegate.tab = self
         install(WKWebView(frame: .zero, configuration: configuration))
     }
@@ -118,11 +122,14 @@ final class BrowserTab: NSObject, Identifiable {
         pageTitle = title
         suspendedState = interactionState
         if restoresVisit { historyVisit = url.map { (nil, $0) } }
-        favicon = browser?.isPrivate == true ? nil : FaviconStore.cachedIcon(for: url)
+        favicon = browser?.isPrivate == true || profileID != BrowserProfile.defaultID ? nil : FaviconStore.cachedIcon(for: url)
         faviconHost = url?.host()
         super.init()
         pageDelegate.tab = self
     }
+
+    var supportsExtensions: Bool { browser?.isPrivate != true && profileID == BrowserProfile.defaultID }
+    private var remembersFavicons: Bool { browser?.isPrivate != true && profileID == BrowserProfile.defaultID }
 
     func didAttachToBrowser() { updateFavicon() }
 
@@ -144,7 +151,7 @@ final class BrowserTab: NSObject, Identifiable {
         webView.allowsLinkPreview = true
         webView.frame = contentView.bounds
         webView.autoresizingMask = [.width, .height]
-        if browser?.isPrivate != true { BrowserExtensions.shared.applyPageBackground(to: webView) }
+        if supportsExtensions { BrowserExtensions.shared.applyPageBackground(to: webView) }
         contentView.addSubview(webView)
         webView.navigationDelegate = pageDelegate
         webView.uiDelegate = pageDelegate
@@ -154,7 +161,7 @@ final class BrowserTab: NSObject, Identifiable {
         PageAppearance.shared.install(in: webView)
         if browser?.isPrivate != true {
             LinkPreviewController.shared.install(in: webView, tab: self)
-            BrowserExtensions.shared.updateRules(in: webView)
+            if supportsExtensions { BrowserExtensions.shared.updateRules(in: webView) }
         }
 
         let options: NSKeyValueObservingOptions = isRestoring ? [] : .initial
@@ -224,9 +231,10 @@ final class BrowserTab: NSObject, Identifiable {
         // A detached or foreign descriptor must never fall back to default-profile cookies.
         guard canUseOwnedProfile else { return }
         invalidateNavigation()
-        let context = browser?.isPrivate == true ? nil : url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) }
+        guard url?.scheme != "webkit-extension" || supportsExtensions else { return }
+        let context = supportsExtensions ? url.flatMap { BrowserExtensions.shared.controller.extensionContext(for: $0) } : nil
         extensionOrigin = context?.baseURL
-        let webView = WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url) ?? context?.webViewConfiguration ?? Self.makeConfiguration())
+        let webView = WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url, profileID: profileID) ?? context?.webViewConfiguration ?? Self.makeConfiguration())
         install(webView, isRestoring: true)
         if let suspendedState {
             webView.interactionState = suspendedState
@@ -371,12 +379,13 @@ final class BrowserTab: NSObject, Identifiable {
         restore()
         let controller = BrowserExtensions.shared.controller
         let oldContext = extensionOrigin.flatMap { controller.extensionContext(for: $0) }
-        let newContext = browser?.isPrivate == true ? nil : controller.extensionContext(for: url)
+        guard url.scheme != "webkit-extension" || supportsExtensions else { return }
+        let newContext = supportsExtensions ? controller.extensionContext(for: url) : nil
         if oldContext !== newContext {
             // WebKit forbids ordinary web pages in an extension-owned configuration, and vice versa.
             suspend()
             suspendedState = nil
-            install(WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url) ?? newContext?.webViewConfiguration ?? Self.makeConfiguration()))
+            install(WKWebView(frame: .zero, configuration: browser?.makeConfiguration(for: url, profileID: profileID) ?? newContext?.webViewConfiguration ?? Self.makeConfiguration()))
         }
         extensionOrigin = newContext?.baseURL
         self.url = url
@@ -437,14 +446,14 @@ final class BrowserTab: NSObject, Identifiable {
               webView.backForwardList.currentItem?.url == url,
               historyVisit.map({ Self.withoutFragment($0.url) != Self.withoutFragment(url) }) ?? true else { return }
         if let browser, browser.isClosed || browser.tab(for: webView) !== self { return }
-        historyVisit = (browser?.history?.recordVisit(to: url, title: webView.title ?? ""), url)
+        historyVisit = (browser?.history(for: profileID)?.recordVisit(to: url, title: webView.title ?? ""), url)
     }
 
     private func updateVisitTitle() {
         guard let historyVisit, let id = historyVisit.id, url == historyVisit.url, !pageTitle.isEmpty else { return }
         if let browser, browser.isClosed
             || (browser.tabAcrossSpaces(withID: self.id) !== self && browser.peek?.tab !== self) { return }
-        browser?.history?.updateTitle(of: id, to: pageTitle)
+        browser?.history(for: profileID)?.updateTitle(of: id, to: pageTitle)
     }
 
     private static func withoutFragment(_ url: URL) -> URL {
@@ -456,7 +465,7 @@ final class BrowserTab: NSObject, Identifiable {
     // MARK: Zoom
 
     private func applyZoom() {
-        let level = browser?.zoomLevels.level(for: host) ?? 1
+        let level = browser?.zoom(for: profileID).level(for: host) ?? 1
         pageZoom = level
         if let webView, webView.pageZoom != level { webView.pageZoom = level }
     }
@@ -466,7 +475,7 @@ final class BrowserTab: NSObject, Identifiable {
         guard let webView else { return }
         webView.pageZoom = level
         pageZoom = level
-        browser?.zoomLevels.setLevel(level, for: host)
+        browser?.zoom(for: profileID).setLevel(level, for: host)
     }
 
     // MARK: Find
@@ -597,9 +606,9 @@ final class BrowserTab: NSObject, Identifiable {
         }
         if faviconHost != host {
             faviconHost = host
-            favicon = browser?.isPrivate == true ? nil : FaviconStore.cachedIcon(for: url)
+            favicon = remembersFavicons ? FaviconStore.cachedIcon(for: url) : nil
         }
-        let remember = browser?.isPrivate != true
+        let remember = remembersFavicons
         let needsSiteIcon = favicon == nil
         faviconTask = Task { [weak self] in
             if needsSiteIcon, let icon = await FaviconStore.icon(for: url, remember: remember) {
@@ -612,7 +621,7 @@ final class BrowserTab: NSObject, Identifiable {
             guard let self, !Task.isCancelled, let webView, !webView.isLoading, webView.url == url else { return }
             let candidates = await FaviconStore.candidates(in: webView)
             guard let icon = await FaviconStore.icon(forPage: url, candidates: candidates,
-                                                     remember: !(browser?.isPrivate ?? false)),
+                                                     remember: remembersFavicons),
                   !Task.isCancelled, self.url == url else { return }
             favicon = icon
         }

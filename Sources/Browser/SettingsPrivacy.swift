@@ -4,7 +4,7 @@ import WebKit
 struct PrivacySettings: View {
     let browsingData: BrowsingData
     let contentBlocker: ContentBlocker
-    @State private var isShowingClearBrowsingData = false
+    @State private var clearDataPresentation: ClearDataPresentation?
     @State private var websiteSearchQuery = ""
     @State private var isConfirmingWebsiteDataRemoval = false
 
@@ -30,7 +30,10 @@ struct PrivacySettings: View {
                         .foregroundStyle(.secondary)
                 }
                 LabeledContent("History and website data") {
-                    Button("Clear…") { isShowingClearBrowsingData = true }
+                    Button("Clear…") {
+                        guard clearDataPresentation == nil else { return }
+                        clearDataPresentation = ClearDataPresentation(profileName: BrowserProfile.displayName, data: browsingData)
+                    }
                 }
             }
 
@@ -69,8 +72,8 @@ struct PrivacySettings: View {
             }
         }
         .task { await browsingData.loadSiteRecords() }
-        .sheet(isPresented: $isShowingClearBrowsingData) {
-            ClearDataView(data: browsingData)
+        .sheet(item: $clearDataPresentation) { request in
+            ClearDataView(request: request)
         }
         .confirmationDialog("Remove data stored by all websites?", isPresented: $isConfirmingWebsiteDataRemoval) {
             Button("Remove All", role: .destructive) {
@@ -187,7 +190,8 @@ struct SiteSettings: View {
 
 /// History ▸ Clear History and Website Data, also opened from Settings ▸ Privacy.
 struct ClearDataView: View {
-    let data: BrowsingData
+    let request: ClearDataPresentation
+    private var data: BrowsingData { request.data }
     @Environment(\.dismiss) private var dismiss
     @State private var range = HistoryClearRange.lastHour
     @State private var options: ClearDataOptions = [.history, .siteData, .cache]
@@ -197,6 +201,9 @@ struct ClearDataView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Clear History and Website Data")
                 .font(.system(size: 15, weight: .semibold))
+            Text("Profile: \(request.profileName)")
+                .font(.callout).foregroundStyle(.secondary)
+                .accessibilityLabel("Clear data for profile \(request.profileName)")
 
             Picker("Clear:", selection: $range) {
                 ForEach(HistoryClearRange.allCases) { range in
@@ -212,10 +219,12 @@ struct ClearDataView: View {
                     Text("Signs you out of most websites.")
                 }
                 Toggle("Cached images and files", isOn: binding(for: .cache))
-                Toggle("Site icons", isOn: binding(for: .favicons))
+                if data.includesSharedState { Toggle("Site icons", isOn: binding(for: .favicons)) }
             }
 
-            Text("Private windows aren’t affected. Their data is removed when they close.")
+            Text(data.includesSharedState
+                 ? "Only the Existing Profile is cleared. Private windows and other profiles are not affected."
+                 : "Only this profile is cleared. Other profiles and private windows are not affected.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

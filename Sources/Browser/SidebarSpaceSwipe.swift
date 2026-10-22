@@ -67,12 +67,14 @@ struct SidebarSpaceSwipeRecognizer {
         return result
     }
 
-    /// Descriptor-only lookup. A foreign immediate neighbor is not skipped or loaded.
-    static func destination(in spaces: [BrowserSpace], activeID: UUID, profileID: UUID, offset: Int) -> UUID? {
+    /// Descriptor-only lookup across known ordinary profiles. Never skip an unavailable immediate neighbor.
+    static func destination(in spaces: [BrowserSpace], activeID: UUID, offset: Int,
+                            isProfileAvailable: (UUID) -> Bool) -> UUID? {
         guard offset == -1 || offset == 1,
-              let index = spaces.firstIndex(where: { $0.id == activeID && $0.profileID == profileID }) else { return nil }
+              let index = spaces.firstIndex(where: { $0.id == activeID }),
+              isProfileAvailable(spaces[index].profileID) else { return nil }
         let destination = index + offset
-        guard spaces.indices.contains(destination), spaces[destination].profileID == profileID else { return nil }
+        guard spaces.indices.contains(destination), isProfileAvailable(spaces[destination].profileID) else { return nil }
         return spaces[destination].id
     }
 }
@@ -184,6 +186,7 @@ final class SidebarSpaceSwipeView: NSView {
               browser.addressFocusRequest == browser.consumedAddressFocusRequest,
               let window = ownerWindow, window === self.window, browser.window === window,
               browser.spaces.space(browser.activeSpaceID)?.profileID == browser.profileID,
+              browser.spaces.profiles.profile(browser.profileID) != nil,
               window.attachedSheet == nil, NSApp.modalWindow == nil,
               window.toolbar?.customizationPaletteIsRunning != true,
               !(window.firstResponder is NSText), !(window.firstResponder is NSTextField),
@@ -215,7 +218,8 @@ final class SidebarSpaceSwipeView: NSView {
         }
         if let offset = result.offset,
            let destination = SidebarSpaceSwipeRecognizer.destination(in: browser.spaces.spaces,
-                activeID: origin.spaceID, profileID: browser.profileID, offset: offset) {
+                activeID: origin.spaceID, offset: offset,
+                isProfileAvailable: { browser.spaces.profiles.profile($0) != nil }) {
             // No asynchronous completion can replay after deactivation, cancellation or another selection.
             browser.selectSpace(destination)
         }

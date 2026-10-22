@@ -33,7 +33,7 @@ struct BrowserApp: App {
 
     var body: some Scene {
         WindowGroup(id: Self.windowID) {
-            BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: history, session: session)
+            BrowserWindow(bookmarks: bookmarks, downloads: downloads, history: history, session: session, browsingData: browsingData)
                 .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .environment(browsingData)
                 .modifier(ScrollbarVisibility())
@@ -246,13 +246,15 @@ private struct BrowserCommands: Commands {
         CommandMenu("Spaces") {
             ForEach(1...9, id: \.self) { number in
                 let space = browser.flatMap { model in
-                    model.spaces.spaces.indices.contains(number - 1) ? model.spaces.spaces[number - 1] : nil
+                    let choices = model.selectableSpaces
+                    return choices.indices.contains(number - 1) ? choices[number - 1] : nil
                 }
                 Button(space.map { "Select Space \(number) — \($0.title)" } ?? "Select Space \(number)") {
-                    browser?.selectSpace(at: number - 1)
+                    if let space { browser?.selectSpace(space.id) }
                 }
                 .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .control)
-                .disabled(space == nil || browser?.isPrivate != false || browser?.isExtensionWindow != false)
+                .disabled(space == nil || browser?.isPrivate != false || browser?.isExtensionWindow != false
+                          || space.map { browser?.spaces.profiles.profile($0.profileID) == nil } == true)
             }
         }
         // Native toggleToolbarShown: only changes NSToolbar.isVisible, which
@@ -322,7 +324,7 @@ private struct BrowserCommands: Commands {
             }
             .disabled(session.reopenableWindows.isEmpty)
 
-            let recentVisits = history.recentVisits(limit: 15)
+            let recentVisits = browser?.history?.recentVisits(limit: 15) ?? []
             if !recentVisits.isEmpty {
                 Divider()
                 ForEach(recentVisits) { visit in
@@ -334,10 +336,11 @@ private struct BrowserCommands: Commands {
             Button("Show All History") { browser?.isShowingHistory.toggle() }
                 .keyboardShortcut("y", modifiers: .command)
                 .disabled(browser?.history == nil)
-            Button("Clear History and Website Data…") { browser?.isShowingClearData = true }
-                .disabled(browser == nil)
+            Button("Clear History and Website Data…") { browser?.requestClearData() }
+                .disabled(browser?.canRequestClearData != true)
         }
         CommandMenu("Bookmarks") {
+            let bookmarks = browser?.spaces.profiles.resources(for: browser?.profileID ?? BrowserProfile.defaultID)?.bookmarks ?? bookmarks
             Button(bookmarks.isBookmarked(bookmarkableTab?.url) ? "Remove Bookmark" : "Bookmark This Page") {
                 guard let tab = bookmarkableTab, let url = tab.url else { return }
                 bookmarks.toggle(title: tab.pageTitle, url: url)

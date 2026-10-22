@@ -79,8 +79,19 @@ enum FaviconRequests {
         return await request(iconURL)
     }
 
+    static func sessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 8
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        return configuration
+    }
+
     static func allowsNetworkRequest(to url: URL) -> Bool {
         guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              url.user == nil, url.password == nil,
               let rawHost = url.host()?.lowercased() else { return false }
         let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
             .trimmingCharacters(in: CharacterSet(charactersIn: "."))
@@ -107,7 +118,19 @@ enum FaviconRequests {
 final class FaviconRedirectPolicy: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
-        completionHandler(request.url.map(FaviconRequests.allowsNetworkRequest) == true ? request : nil)
+        guard request.url.map(FaviconRequests.allowsNetworkRequest) == true else { completionHandler(nil); return }
+        var anonymous = request
+        anonymous.setValue(nil, forHTTPHeaderField: "Cookie")
+        anonymous.setValue(nil, forHTTPHeaderField: "Authorization")
+        anonymous.setValue(nil, forHTTPHeaderField: "Proxy-Authorization")
+        completionHandler(anonymous)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        // Keep normal TLS trust evaluation, but never offer account or proxy credentials.
+        completionHandler(challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust
+                          ? .performDefaultHandling : .cancelAuthenticationChallenge, nil)
     }
 }
 
@@ -173,6 +196,29 @@ private final class FaviconCacheMutations: @unchecked Sendable {
     var generation = 0
 }
 
+/// Only the Existing Profile can use the legacy durable icon cache. Other contexts use anonymous, uncached requests.
+enum FaviconContext: Hashable {
+    case existingProfile
+    case transient(UUID)
+    var remembersIcons: Bool { self == .existingProfile }
+}
+
+struct FaviconRequest: Hashable {
+    let url: URL
+    let context: FaviconContext
+}
+
+private struct FaviconContextKey: EnvironmentKey {
+    static let defaultValue = FaviconContext.transient(UUID())
+}
+
+extension EnvironmentValues {
+    var faviconContext: FaviconContext {
+        get { self[FaviconContextKey.self] }
+        set { self[FaviconContextKey.self] = newValue }
+    }
+}
+
 /// Site icons shared by tabs, the bookmarks bar, and the new tab page.
 @MainActor
 enum FaviconStore {
@@ -205,10 +251,7 @@ enum FaviconStore {
     private static var clearTask: Task<Void, Never>?
 
     nonisolated private static let session: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 8
-        configuration.urlCache = nil
-        return URLSession(configuration: configuration, delegate: FaviconRedirectPolicy(), delegateQueue: nil)
+        URLSession(configuration: FaviconRequests.sessionConfiguration(), delegate: FaviconRedirectPolicy(), delegateQueue: nil)
     }()
 
     /// Forgets the icons kept in memory, and removes the ones saved to disk since `date`.
@@ -239,6 +282,14 @@ enum FaviconStore {
     @concurrent
     nonisolated private static func removeFiles(in cache: FaviconCache, since date: Date) async {
         cache.removeEntries(since: date)
+    }
+
+    static func cachedIcon(for url: URL?, context: FaviconContext) -> Image? {
+        context.remembersIcons ? cachedIcon(for: url) : nil
+    }
+
+    static func icon(for url: URL, context: FaviconContext) async -> Image? {
+        await icon(for: url, remember: context.remembersIcons)
     }
 
     static func cachedIcon(for url: URL?) -> Image? {

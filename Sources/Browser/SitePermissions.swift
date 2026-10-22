@@ -37,6 +37,7 @@ final class SitePermissions {
 
     /// `nil` keeps every answer in memory only.
     @ObservationIgnored private let defaults: UserDefaults?
+    @ObservationIgnored private let file: StoreFile?
     private var decisions: [Key: Bool] = [:]
     private struct PendingPrompt {
         let id: UUID
@@ -48,9 +49,11 @@ final class SitePermissions {
     @ObservationIgnored private var prompts: [String: PendingPrompt] = [:]
     @ObservationIgnored private var revisions: [Key: UInt] = [:]
 
-    init(defaults: UserDefaults? = nil) {
+    init(defaults: UserDefaults? = nil, file: StoreFile? = nil) {
         self.defaults = defaults
-        let saved = defaults?.dictionary(forKey: Self.storageKey) as? [String: [String: Bool]] ?? [:]
+        self.file = file
+        let saved = file?.readNow().flatMap { try? JSONDecoder().decode([String: [String: Bool]].self, from: $0) }
+            ?? defaults?.dictionary(forKey: Self.storageKey) as? [String: [String: Bool]] ?? [:]
         for (site, answers) in saved {
             for (name, isAllowed) in answers {
                 guard let permission = Permission(rawValue: name), permission.isSaved else { continue }
@@ -143,11 +146,11 @@ final class SitePermissions {
     }
 
     private func save() {
-        guard let defaults else { return }
         var saved: [String: [String: Bool]] = [:]
         for (key, isAllowed) in decisions where key.permission.isSaved {
             saved[key.site, default: [:]][key.permission.rawValue] = isAllowed
         }
-        defaults.set(saved, forKey: Self.storageKey)
+        defaults?.set(saved, forKey: Self.storageKey)
+        file?.writeNow(try? JSONEncoder().encode(saved))
     }
 }

@@ -51,12 +51,16 @@ struct SpaceSwitcher: View {
     let browser: BrowserModel
     var style: Style = .menu
     @State private var editor: SpaceEditorRequest?
+    @State private var isShowingProfileSettings = false
+    @State private var profileSettings: ProfileSiteSettingsView?
 
     private var current: BrowserSpace? { browser.spaces.space(browser.activeSpaceID) }
+    private var profileTitle: String { browser.spaces.profiles.profile(browser.profileID)?.title ?? "Profile unavailable" }
+    private var choices: [BrowserSpace] { browser.selectableSpaces }
 
     var body: some View {
         if !browser.isPrivate && !browser.isExtensionWindow,
-           style != .sidebar || browser.chromePreferences.showsSpaceControls(spaceCount: browser.spaces.spaces.count) {
+           style != .sidebar || browser.chromePreferences.showsSpaceControls(spaceCount: choices.count) {
             Group {
                 if style == .sidebar { iconStrip }
                 else { fallbackMenu }
@@ -66,15 +70,19 @@ struct SpaceSwitcher: View {
                      arrowEdge: style == .sidebar ? .trailing : .bottom) { request in
                 SpaceEditor(browser: browser, space: request.space)
             }
-            .chromePresentation(isPresented: editor != nil, controller: browser.chromeHover,
+            .sheet(isPresented: $isShowingProfileSettings) {
+                profileSettings
+            }
+            .chromePresentation(isPresented: editor != nil || isShowingProfileSettings, controller: browser.chromeHover,
                                 region: style == .sidebar ? .sidebar : .toolbar)
-            .onChange(of: browser.activeSpaceID) { _, _ in editor = nil }
+            .onChange(of: browser.activeSpaceID) { _, _ in editor = nil; isShowingProfileSettings = false }
         }
     }
 
     private var fallbackMenu: some View {
         Menu {
-            Text("\(BrowserProfile.displayName) · Shared logins")
+            profileMenuItems
+            Divider()
             spaceMenuItems
             Divider()
             if let current { Button("Edit This Space…") { editor = SpaceEditorRequest(space: current) } }
@@ -88,14 +96,15 @@ struct SpaceSwitcher: View {
             }
             .lineLimit(1)
         }
-        .help("Switch Space. Spaces use the Existing Profile and share logins.")
+        .help("Spaces in the same profile share logins. Different profiles use separate website data.")
         .accessibilityLabel("Space: \(current?.title ?? "Default")")
     }
 
     private var iconStrip: some View {
-        NativeSpaceSelector(spaces: browser.spaces.spaces, activeID: browser.activeSpaceID,
-            showsIndicator: browser.chromePreferences.spaceIndicatorHiding.showsIndicator(spaceCount: browser.spaces.spaces.count),
+        NativeSpaceSelector(spaces: choices, activeID: browser.activeSpaceID,
+            showsIndicator: browser.chromePreferences.spaceIndicatorHiding.showsIndicator(spaceCount: choices.count),
             showsNewSpaceButton: browser.chromePreferences.showsNewSpaceButton,
+            profileContext: SpaceSelectorProfileContext(browser: browser, showSettings: requestProfileSettings),
             select: { browser.selectSpace($0) },
             edit: { editor = SpaceEditorRequest(space: $0) },
             create: { editor = SpaceEditorRequest() })
@@ -103,8 +112,26 @@ struct SpaceSwitcher: View {
             .frame(maxWidth: .infinity)
     }
 
+    private func requestProfileSettings() {
+        guard !browser.isClosed, !browser.isPrivate, !browser.isExtensionWindow,
+              browser.profileID != BrowserProfile.defaultID else { return }
+        profileSettings = ProfileSiteSettingsView(permissions: browser.sitePermissions, zoom: browser.zoomLevels, title: profileTitle)
+        isShowingProfileSettings = true
+    }
+
+    @ViewBuilder private var profileMenuItems: some View {
+        Text("Profile: \(profileTitle)")
+        if !browser.supportsExtensions { Text("Extensions and password autofill are not available in this profile.") }
+        if browser.spaces.profiles.loadFailed { Text("Profiles could not be read. Keep Profiles.json for recovery.") }
+        if browser.profileID != BrowserProfile.defaultID {
+            Button("Profile Site Settings…", action: requestProfileSettings)
+            Button("Clear Profile Data…") { browser.requestClearData() }
+                .disabled(!browser.canRequestClearData)
+        }
+    }
+
     @ViewBuilder private var spaceMenuItems: some View {
-        ForEach(browser.spaces.spaces) { space in
+        ForEach(choices) { space in
             Button { browser.selectSpace(space.id) } label: {
                 Label {
                     Text(space.title)
@@ -112,7 +139,9 @@ struct SpaceSwitcher: View {
                     if space.id == browser.activeSpaceID { Image(systemName: "checkmark") }
                     else { SpaceIcon(space: space) }
                 }
+                Text(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")
             }
+            .disabled(browser.spaces.profiles.profile(space.profileID) == nil)
         }
     }
 }
@@ -122,6 +151,7 @@ private struct NativeSpaceSelector: NSViewRepresentable {
     let activeID: UUID
     let showsIndicator: Bool
     let showsNewSpaceButton: Bool
+    let profileContext: SpaceSelectorProfileContext
     let select: (UUID) -> Void
     let edit: (BrowserSpace) -> Void
     let create: () -> Void
@@ -130,7 +160,7 @@ private struct NativeSpaceSelector: NSViewRepresentable {
     func updateNSView(_ view: SpaceSelectorView, context: Context) {
         view.update(spaces: spaces, activeID: activeID, enabled: context.environment.isEnabled,
             rightToLeft: context.environment.layoutDirection == .rightToLeft,
-            showsIndicator: showsIndicator, showsNewSpaceButton: showsNewSpaceButton,
+            showsIndicator: showsIndicator, showsNewSpaceButton: showsNewSpaceButton, profileContext: profileContext,
             select: select, edit: edit, create: create)
     }
     static func dismantleNSView(_ view: SpaceSelectorView, coordinator: ()) { view.clearActions() }
@@ -150,6 +180,7 @@ final class SpaceSelectorView: NSView {
     private var rightToLeft = false
     private var showsIndicator = true
     private var showsNewSpaceButton = true
+    private var profileContext: SpaceSelectorProfileContext?
     private var select: ((UUID) -> Void)?
     private var edit: ((BrowserSpace) -> Void)?
     private var create: (() -> Void)?
@@ -188,6 +219,7 @@ final class SpaceSelectorView: NSView {
 
     func update(spaces: [BrowserSpace], activeID: UUID, enabled: Bool, rightToLeft: Bool = false,
                 showsIndicator: Bool = true, showsNewSpaceButton: Bool = true,
+                profileContext: SpaceSelectorProfileContext? = nil,
                 select: @escaping (UUID) -> Void, edit: @escaping (BrowserSpace) -> Void, create: @escaping () -> Void) {
         self.spaces = spaces
         self.activeID = activeID
@@ -195,13 +227,19 @@ final class SpaceSelectorView: NSView {
         self.rightToLeft = rightToLeft
         self.showsIndicator = showsIndicator
         self.showsNewSpaceButton = showsNewSpaceButton
+        self.profileContext = profileContext
         self.select = select
         self.edit = edit
         self.create = create
         spaceMenu = NSMenu(title: "All Spaces")
         spaceMenu.autoenablesItems = false
+        if let active = spaces.first(where: { $0.id == activeID }), profileContext?.hasNamedProfiles == true {
+            appendProfileItems(to: spaceMenu, for: active)
+            spaceMenu.addItem(.separator())
+        }
         for space in spaces {
-            let item = NSMenuItem(title: space.title, action: #selector(selectMenuItem(_:)), keyEquivalent: "")
+            let label = profileContext?.title(for: space.profileID).map { "\(space.title) — \($0)" } ?? space.title
+            let item = NSMenuItem(title: label, action: #selector(selectMenuItem(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = space.id
             item.state = space.id == activeID ? .on : .off
@@ -235,7 +273,8 @@ final class SpaceSelectorView: NSView {
         }
         choiceButtons = visible.enumerated().map { index, space in
             let button = old[space.id] ?? SpaceChoiceButton(spaceID: space.id)
-            button.configure(space, selected: space.id == activeID, compact: compact)
+            button.configure(space, selected: space.id == activeID, compact: compact,
+                             profileTitle: profileContext?.title(for: space.profileID))
             button.isEnabled = enabled
             button.target = self
             button.action = #selector(selectChoice(_:))
@@ -244,6 +283,10 @@ final class SpaceSelectorView: NSView {
             if button.superview !== selectorGroup { selectorGroup.addSubview(button) }
             let menu = NSMenu(title: space.title)
             menu.autoenablesItems = false
+            if profileContext?.hasNamedProfiles == true {
+                appendProfileItems(to: menu, for: space)
+                menu.addItem(.separator())
+            }
             let item = NSMenuItem(title: "Edit Space…", action: #selector(editSpace(_:)), keyEquivalent: "")
             item.representedObject = space.id
             item.target = self
@@ -293,6 +336,43 @@ final class SpaceSelectorView: NSView {
         guard enabled, showsIndicator, let id = sender.representedObject as? UUID, let space = spaces.first(where: { $0.id == id }) else { return }
         edit?(space)
     }
+    private func appendProfileItems(to menu: NSMenu, for space: BrowserSpace) {
+        guard let context = profileContext else { return }
+        let label = NSMenuItem(title: "Profile: \(context.titles[space.profileID] ?? "Profile unavailable")", action: nil, keyEquivalent: "")
+        label.isEnabled = false
+        menu.addItem(label)
+        guard space.id == activeID, space.profileID == context.activeProfileID,
+              context.activeProfileID != BrowserProfile.defaultID else { return }
+        for (title, action, allowed) in [
+            ("Profile Site Settings…", #selector(showProfileSettings(_:)), true),
+            ("Clear Profile Data…", #selector(clearProfileData(_:)), context.canClearData)
+        ] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = space.id
+            item.isEnabled = enabled && allowed
+            menu.addItem(item)
+        }
+    }
+
+    private func profileActionOwner(_ sender: NSMenuItem) -> UUID? {
+        guard enabled, showsIndicator, let context = profileContext,
+              let id = sender.representedObject as? UUID, id == activeID,
+              let space = spaces.first(where: { $0.id == id }), space.profileID == context.activeProfileID,
+              context.activeProfileID != BrowserProfile.defaultID else { return nil }
+        return id
+    }
+
+    @objc private func showProfileSettings(_ sender: NSMenuItem) {
+        guard let id = profileActionOwner(sender) else { return }
+        profileContext?.showSettings(id)
+    }
+
+    @objc private func clearProfileData(_ sender: NSMenuItem) {
+        guard let id = profileActionOwner(sender), profileContext?.canClearData == true else { return }
+        profileContext?.clearData(id)
+    }
+
     @objc private func createSpace() { if enabled && showsNewSpaceButton { create?() } }
     @objc private func showAllSpaces() { presentMenu(relativeTo: overflowButton) }
     private func presentMenu(relativeTo button: NSButton) {
@@ -301,6 +381,7 @@ final class SpaceSelectorView: NSView {
     }
     func clearActions() {
         select = nil; edit = nil; create = nil
+        profileContext = nil
         enabled = false
         let controls: [NSButton] = choiceButtons + [plusButton, overflowButton]
         controls.forEach {
@@ -343,7 +424,7 @@ final class SpaceChoiceButton: SpaceSelectorButton {
     init(spaceID: UUID) { self.spaceID = spaceID; super.init(frame: .zero) }
     required init?(coder: NSCoder) { nil }
 
-    func configure(_ space: BrowserSpace, selected: Bool, compact: Bool) {
+    func configure(_ space: BrowserSpace, selected: Bool, compact: Bool, profileTitle: String? = nil) {
         isSelectedSpace = selected
         displayedEmoji = selected ? space.emoji : ""
         displayedSymbol = selected && displayedEmoji.isEmpty ? space.displaySymbol : nil
@@ -353,8 +434,9 @@ final class SpaceChoiceButton: SpaceSelectorButton {
         image = displayedSymbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: nil) }
         symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
         contentTintColor = NSColor(space.color.tint)
-        toolTip = compact ? "All Spaces — \(space.title)" : space.title
-        setAccessibilityLabel(compact ? "All Spaces, current Space \(space.title)" : "Switch to Space \(space.title)")
+        let owner = profileTitle.map { ", \($0)" } ?? ""
+        toolTip = (compact ? "All Spaces — \(space.title)" : space.title) + owner
+        setAccessibilityLabel((compact ? "All Spaces, current Space \(space.title)" : "Switch to Space \(space.title)") + owner)
         setAccessibilitySelected(selected)
         setAccessibilityValue(selected ? "Selected" : "Not selected")
         needsDisplay = true
@@ -403,9 +485,9 @@ struct BrowserSpaceHeading: View {
             }
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.primary)
-            .help(space.title)
+            .help("\(space.title) — \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")")
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("Space \(space.title)")
+            .accessibilityLabel("Space \(space.title), \(browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")")
             .onChange(of: browser.activeSpaceID) { _, _ in editor = nil }
         }
     }
@@ -420,6 +502,9 @@ private struct SpaceEditor: View {
     @State private var color: FolderColor
     private let theme: BrowserSpaceTheme
     @State private var errorMessage: String?
+    @State private var selectedProfileID: UUID
+    @State private var newProfileName = ""
+    private let newProfileChoice = UUID(uuidString: "00000000-0000-4000-8000-000000000003")!
     @FocusState private var nameIsFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -427,6 +512,7 @@ private struct SpaceEditor: View {
         self.browser = browser
         self.space = space
         _name = State(initialValue: space?.title ?? "")
+        _selectedProfileID = State(initialValue: space?.profileID ?? browser.profileID)
         _symbol = State(initialValue: space?.displaySymbol ?? "globe")
         _emoji = State(initialValue: space?.emoji ?? "")
         _color = State(initialValue: space?.color ?? .primary)
@@ -436,8 +522,31 @@ private struct SpaceEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(space == nil ? "New Space" : "Edit Space").font(.headline)
+            Text("Spaces in the same profile share logins. Different profiles keep website data separate.")
+                .font(.callout).foregroundStyle(.secondary)
             TextField("Space name", text: $name).textFieldStyle(.roundedBorder).focused($nameIsFocused)
                 .accessibilityLabel("Space name")
+            if let space {
+                LabeledContent("Profile", value: browser.spaces.profiles.profile(space.profileID)?.title ?? "Profile unavailable")
+                Text("A Space’s profile cannot change. Create a new Space to use another profile.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                Picker("Profile", selection: $selectedProfileID) {
+                    ForEach(browser.spaces.profiles.profiles) { Text($0.title).tag($0.id) }
+                    Text("New Profile…").tag(newProfileChoice)
+                }
+                if selectedProfileID == newProfileChoice { TextField("Profile name", text: $newProfileName) }
+            }
+            if selectedProfileID != BrowserProfile.defaultID {
+                Text("Separate cookies, website data, history, bookmarks, and site settings. "
+                     + "Extensions and password autofill are not available. App Settings still manage the Existing Profile. "
+                     + "Tracker protection and app preferences apply to all profiles. Downloads save to the shared Downloads folder.")
+                    .font(.callout).foregroundStyle(.secondary)
+                #if DEBUG
+                Text("Debug and QA website data are temporary, even for named profiles.")
+                    .font(.callout).foregroundStyle(.secondary)
+                #endif
+            }
             SavedItemIconPicker(symbol: $symbol, emoji: $emoji, color: $color, emojiAccessibilityLabel: "Space emoji")
             if let errorMessage { Text(errorMessage).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true) }
             HStack {
@@ -445,7 +554,9 @@ private struct SpaceEditor: View {
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(space == nil ? "Create" : "Save") { save() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || (space == nil && selectedProfileID == newProfileChoice
+                                  && newProfileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }
         .padding(20).frame(width: 390)
@@ -460,7 +571,11 @@ private struct SpaceEditor: View {
             if let space {
                 try browser.spaces.updateSpace(space.id, title: name, icon: legacyIcon, theme: theme, symbol: symbol, emoji: emoji, color: color)
             } else {
-                try browser.createSpace(title: name, icon: legacyIcon, theme: theme, symbol: symbol, emoji: emoji, color: color)
+                if selectedProfileID == newProfileChoice {
+                    selectedProfileID = try browser.spaces.profiles.create(title: newProfileName).id
+                }
+                try browser.createSpace(title: name, profileID: selectedProfileID, icon: legacyIcon, theme: theme,
+                                        symbol: symbol, emoji: emoji, color: color)
             }
             dismiss()
         } catch { errorMessage = error.localizedDescription }

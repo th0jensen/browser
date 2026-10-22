@@ -119,8 +119,12 @@ enum PasswordAutofill {
 
     /// Fills a saved password into the tab's page, after the user picked it. Nothing fills unless the page shows
     /// exactly the password's origin, both before and after reading the keychain.
+    static func supports(_ tab: BrowserTab) -> Bool {
+        tab.profileID == BrowserProfile.defaultID && tab.browser?.isPrivate == false
+    }
+
     static func fill(_ account: SavedPassword, in tab: BrowserTab, from passwords: PasswordManager) async {
-        guard let webView = tab.webView, PasswordOrigin(url: webView.url) == account.origin else { return }
+        guard supports(tab), let webView = tab.webView, PasswordOrigin(url: webView.url) == account.origin else { return }
         guard let secret = passwords.password(for: account) else {
             await showFailure(passwords.lastError ?? "This saved password is no longer available.", in: tab)
             return
@@ -158,8 +162,9 @@ final class PasswordMessageHandler: NSObject, WKScriptMessageHandler {
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.world == PasswordAutofill.world, let browser, !browser.isPrivate,
-              let passwords = browser.passwords, let webView = message.webView,
-              let tab = browser.tab(for: webView) else { return }
+              let webView = message.webView, let tab = browser.tab(for: webView),
+              PasswordAutofill.supports(tab),
+              let passwords = browser.passwordsForDefaultProfile else { return }
         if (message.body as? [String: Any])?["type"] as? String == "fields" {
             guard message.frameInfo.isMainFrame, PasswordOrigin(message.frameInfo.securityOrigin) != nil else { return }
             passwords.loadIfNeeded()

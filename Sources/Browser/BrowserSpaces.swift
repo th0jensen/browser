@@ -28,7 +28,7 @@ enum BrowserSpaceTheme: String, Codable, CaseIterable, Identifiable, Sendable {
     var title: String { self == .system ? "System Accent" : rawValue.capitalized }
 }
 
-/// A navigation context, not a separate login. This release uses one existing profile.
+/// A visual navigation context. Spaces with the same profile share website data.
 struct BrowserSpace: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     var title: String
@@ -75,9 +75,11 @@ final class BrowserSpaceStore {
     static let defaultSpaceID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
     static let shared = BrowserSpaceStore(directory: BrowserProfile.directory, enabled: !BrowserProfile.isTesting)
     private(set) var spaces: [BrowserSpace]
+    let profiles: BrowserProfileStore
     private let directory: URL
     private let enabled: Bool
-    private var loadFailed = false
+    /// Descriptor clients must not treat the recovery Default value as loaded metadata.
+    private(set) var loadFailed = false
     private var needsAppearanceBackup = false
     @ObservationIgnored private var folderStores: [UUID: TabFolderStore] = [:]
     @ObservationIgnored private var pinnedStores: [UUID: PinnedPageStore] = [:]
@@ -91,13 +93,14 @@ final class BrowserSpaceStore {
             switch self {
             case .unavailable: "The Spaces file could not be read. Keep the file for recovery before creating a Space."
             case .invalidName: "Enter a Space name."
-            case .unsupportedProfile: "This browser supports only the Existing Profile. Spaces share its login state."
+            case .unsupportedProfile: "The profile for this Space is not available. Its pages were not opened."
             }
         }
     }
 
-    init(directory: URL, enabled: Bool = true,
+    init(directory: URL, enabled: Bool = true, profiles: BrowserProfileStore? = nil,
          writeCheckpoint: ((WriteCheckpoint, URL) throws -> Void)? = nil) {
+        self.profiles = profiles ?? BrowserProfileStore(directory: directory, enabled: enabled)
         self.directory = directory
         self.enabled = enabled
         self.writeCheckpoint = writeCheckpoint
@@ -113,23 +116,30 @@ final class BrowserSpaceStore {
             }
             var ids = Set<UUID>()
             // Do not reinterpret a foreign profile as the existing profile.
-            guard saved.allSatisfy({ $0.profileID == BrowserProfile.defaultID && ids.insert($0.id).inserted }),
-                  saved.contains(where: { $0.id == Self.defaultSpaceID }) else { throw Failure.unsupportedProfile }
+            guard saved.allSatisfy({ ids.insert($0.id).inserted }),
+                  saved.contains(where: { $0.id == Self.defaultSpaceID && $0.profileID == BrowserProfile.defaultID }) else { throw Failure.unsupportedProfile }
             spaces = saved
         } catch { loadFailed = true }
     }
 
     func space(_ id: UUID) -> BrowserSpace? { spaces.first { $0.id == id } }
 
-    @discardableResult
-    func createSpace(title: String) throws -> BrowserSpace {
-        try createSpace(title: title, icon: .circle, theme: .system)
+    /// Shared by restore and recovery deletion. A record cannot prove its own ownership.
+    func owns(_ session: SpaceSession) -> Bool {
+        profiles.profile(session.profileID) != nil && space(session.spaceID)?.profileID == session.profileID
+            && session.tabs.allSatisfy {
+                ($0.profileID == nil || $0.profileID == session.profileID)
+                    && ($0.spaceID == nil || $0.spaceID == session.spaceID)
+            }
     }
 
     @discardableResult
-    func createSpace(title: String, icon: BrowserSpaceIcon, theme: BrowserSpaceTheme,
+    func createSpace(title: String, profileID: UUID = BrowserProfile.defaultID,
+                     icon: BrowserSpaceIcon = .circle, theme: BrowserSpaceTheme = .system,
                      symbol: String? = nil, emoji: String = "", color: FolderColor = .primary) throws -> BrowserSpace {
-        let space = BrowserSpace(id: UUID(), title: try cleanTitle(title), profileID: BrowserProfile.defaultID, icon: icon, theme: theme,
+        guard !loadFailed else { throw Failure.unavailable }
+        guard profiles.profile(profileID) != nil else { throw Failure.unsupportedProfile }
+        let space = BrowserSpace(id: UUID(), title: try cleanTitle(title), profileID: profileID, icon: icon, theme: theme,
                                  symbol: BrowserSpace.cleanSymbol(symbol), emoji: BrowserSpace.cleanEmoji(emoji), color: color)
         try commit(spaces + [space])
         return space

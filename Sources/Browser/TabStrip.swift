@@ -52,7 +52,7 @@ struct TabStrip: View {
 
     var showsSpaceSelector: Bool {
         layout == .vertical && !browser.isPrivate && !browser.isExtensionWindow
-            && browser.chromePreferences.showsSpaceControls(spaceCount: browser.spaces.spaces.count)
+            && browser.chromePreferences.showsSpaceControls(spaceCount: browser.selectableSpaces.count)
     }
 
     var sidebarSpaceControlsHeight: CGFloat {

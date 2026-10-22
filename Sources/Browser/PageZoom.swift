@@ -12,12 +12,15 @@ final class ZoomStore {
 
     /// `nil` keeps the levels in memory only.
     @ObservationIgnored private let defaults: UserDefaults?
+    @ObservationIgnored private let file: StoreFile?
     /// Only levels other than 100%.
     private(set) var levelsByHost: [String: Double]
 
-    init(defaults: UserDefaults? = .standard) {
+    init(defaults: UserDefaults? = .standard, file: StoreFile? = nil) {
         self.defaults = defaults
-        levelsByHost = defaults?.dictionary(forKey: Self.storageKey) as? [String: Double] ?? [:]
+        self.file = file
+        levelsByHost = file?.readNow().flatMap { try? JSONDecoder().decode([String: Double].self, from: $0) }
+            ?? defaults?.dictionary(forKey: Self.storageKey) as? [String: Double] ?? [:]
     }
 
     func level(for host: String?) -> Double {
@@ -28,11 +31,13 @@ final class ZoomStore {
         guard let host else { return }
         levelsByHost[host] = level == 1 ? nil : level
         defaults?.set(levelsByHost, forKey: Self.storageKey)
+        file?.writeNow(try? JSONEncoder().encode(levelsByHost))
     }
 
     func removeAll() {
         levelsByHost = [:]
         defaults?.removeObject(forKey: Self.storageKey)
+        file?.writeNow(try? JSONEncoder().encode(levelsByHost))
     }
 
     static func level(after level: Double) -> Double {
