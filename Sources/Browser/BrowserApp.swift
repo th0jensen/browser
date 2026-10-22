@@ -246,10 +246,11 @@ private struct BrowserCommands: Commands {
         CommandMenu("Spaces") {
             ForEach(1...9, id: \.self) { number in
                 let space = browser.flatMap { model in
-                    model.spaces.spaces.indices.contains(number - 1) ? model.spaces.spaces[number - 1] : nil
+                    let choices = model.selectableSpaces
+                    return choices.indices.contains(number - 1) ? choices[number - 1] : nil
                 }
                 Button(space.map { "Select Space \(number) — \($0.title)" } ?? "Select Space \(number)") {
-                    browser?.selectSpace(at: number - 1)
+                    if let space { browser?.selectSpace(space.id) }
                 }
                 .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .control)
                 .disabled(space == nil || browser?.isPrivate != false || browser?.isExtensionWindow != false

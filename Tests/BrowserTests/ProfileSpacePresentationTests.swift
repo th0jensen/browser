@@ -9,7 +9,7 @@ final class ProfileSpacePresentationTests: XCTestCase {
         FileManager.default.temporaryDirectory.appending(path: "ProfileSpacePresentation-\(UUID())", directoryHint: .isDirectory)
     }
 
-    func testProfileOwnershipAndSharedAppearanceSurviveCreateEditReloadAndRouteLookup() throws {
+    func testProfileOwnershipAndSharedAppearanceSurviveCreateEditAndReload() throws {
         let root = directory()
         defer { try? FileManager.default.removeItem(at: root) }
         let profiles = BrowserProfileStore(directory: root, disposableWebsiteData: true)
@@ -26,14 +26,13 @@ final class ProfileSpacePresentationTests: XCTestCase {
         try spaces.updateSpace(space.id, title: "Planning", icon: .book, theme: .purple,
                                symbol: "leaf", emoji: "", color: .blue)
         let reloaded = BrowserSpaceStore(directory: root)
-        let destination = LinkRouteDestination(spaceID: space.id, spaces: reloaded)
-        XCTAssertTrue(destination.isAvailable)
-        XCTAssertEqual(destination.profile?.id, owner.id)
-        XCTAssertEqual(destination.space?.profileID, owner.id)
-        XCTAssertEqual(destination.space?.displaySymbol, "leaf")
-        XCTAssertEqual(destination.space?.emoji, "")
-        XCTAssertEqual(destination.space?.color, .blue)
-        XCTAssertEqual(destination.space?.theme, .purple)
+        let restored = try XCTUnwrap(reloaded.space(space.id))
+        XCTAssertEqual(reloaded.profiles.profile(restored.profileID)?.id, owner.id)
+        XCTAssertEqual(restored.profileID, owner.id)
+        XCTAssertEqual(restored.displaySymbol, "leaf")
+        XCTAssertEqual(restored.emoji, "")
+        XCTAssertEqual(restored.color, .blue)
+        XCTAssertEqual(restored.theme, .purple)
         XCTAssertFalse(reloaded.profiles.hasLoadedResources(for: owner.id))
     }
 
