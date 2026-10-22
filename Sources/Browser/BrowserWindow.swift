@@ -15,7 +15,6 @@ struct BrowserWindow: View {
         browser.spaces.profiles.resources(for: browser.profileID)?.bookmarks ?? defaultBookmarks
     }
     let session: SessionStore?
-    @Environment(BrowsingData.self) private var browsingData: BrowsingData?
     @Environment(\.openWindow) private var openWindow
     @StateObject private var windowState: BrowserWindowState
     private var browser: BrowserModel { windowState.browser }
@@ -78,13 +77,14 @@ struct BrowserWindow: View {
     }
 
     init(bookmarks: BookmarkStore, downloads: DownloadManager, history: HistoryStore? = nil,
-         session: SessionStore? = nil, isPrivate: Bool = false) {
+         session: SessionStore? = nil, isPrivate: Bool = false, browsingData: BrowsingData? = nil) {
         self.defaultBookmarks = bookmarks
         self.session = session
         // StateObject constructs this once, before evaluating the window's first body.
         _windowState = StateObject(wrappedValue: BrowserWindowState(
             browser: isPrivate ? BrowserModel.makePrivate(downloads: downloads)
-                : BrowserModel(downloads: downloads, history: history, passwords: .shared, createsInitialTab: false),
+                : BrowserModel(downloads: downloads, history: history, passwords: .shared, createsInitialTab: false,
+                               browsingData: browsingData),
             session: session, router: .shared))
         _chromeHover = State(initialValue: ChromeHoverController())
     }
@@ -158,15 +158,10 @@ struct BrowserWindow: View {
             hoverCard(tabFrames: tabFrames)
                 .privateChrome(browser.isPrivate)
         }
-        .sheet(isPresented: $browser.isShowingClearData) {
-            if browser.profileID != BrowserProfile.defaultID {
-                if let history = browser.history, let service = browser.sessionStore ?? session {
-                    ProfileClearDataView(history: history, dataStore: browser.websiteDataStore,
-                                         session: service, profileID: browser.profileID, spaces: browser.spaces)
-                } else {
-                    Text("Profile data clearing is not available in this window.").padding()
-                }
-            } else if !browser.isPrivate, let browsingData { ClearDataView(data: browsingData) }
+        .sheet(item: Binding(get: { browser.clearDataPresentation }, set: { request in
+            if request == nil { browser.dismissClearData() }
+        })) { request in
+            ClearDataView(request: request)
         }
         .sheet(isPresented: $browser.isShowingHistory) {
             if let history = browser.history {

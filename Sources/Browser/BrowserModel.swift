@@ -15,6 +15,7 @@ final class BrowserModel: NSObject {
     private let defaultZoomLevels: ZoomStore
     private let defaultWebsiteDataStore: WKWebsiteDataStore
     private let defaultPasswords: PasswordManager?
+    @ObservationIgnored private let defaultBrowsingData: BrowsingData?
     var downloads: DownloadManager { downloads(for: profileID) }
     var sitePermissions: SitePermissions { permissions(for: profileID) }
     var history: HistoryStore? { history(for: profileID) }
@@ -46,7 +47,7 @@ final class BrowserModel: NSObject {
     @ObservationIgnored weak var sessionStore: SessionStore?
     var findFocusRequest = 0
     var isShowingHistory = false
-    var isShowingClearData = false
+    private(set) var clearDataPresentation: ClearDataPresentation?
     var profileID: UUID { spaces.space(activeSpaceID)?.profileID ?? BrowserProfile.defaultID }
     let spaces: BrowserSpaceStore
     private(set) var activeSpaceID = BrowserSpaceStore.defaultSpaceID
@@ -149,11 +150,12 @@ final class BrowserModel: NSObject {
          history: HistoryStore? = nil, zoomLevels: ZoomStore = .shared,
          websiteDataStore: WKWebsiteDataStore = BrowserProfile.websiteDataStore,
          passwords: PasswordManager? = nil, isPrivate: Bool = false, createsInitialTab: Bool = true,
-         spaces: BrowserSpaceStore? = nil) {
+         spaces: BrowserSpaceStore? = nil, browsingData: BrowsingData? = nil) {
         self.chromePreferences = chromePreferences ?? WindowChromePreferences()
         self.defaultDownloads = downloads
         self.defaultSitePermissions = isPrivate ? SitePermissions() : sitePermissions
         self.defaultHistory = isPrivate ? nil : history
+        self.defaultBrowsingData = isPrivate ? nil : browsingData
         self.defaultZoomLevels = isPrivate ? ZoomStore(defaults: nil) : zoomLevels
         self.defaultWebsiteDataStore = isPrivate && websiteDataStore.isPersistent ? .nonPersistent() : websiteDataStore
         self.isPrivate = isPrivate
@@ -210,6 +212,41 @@ final class BrowserModel: NSObject {
         (allTabs + (peek.map { [$0.tab] } ?? [])).first { $0.webView === webView }
     }
 
+    var canRequestClearData: Bool {
+        guard !isPrivate, !isExtensionWindow, !isClosed, clearDataPresentation == nil,
+              spaces.profiles.profile(profileID) != nil else { return false }
+        if profileID == BrowserProfile.defaultID {
+            guard let data = defaultBrowsingData else { return false }
+            return data.profileID == BrowserProfile.defaultID && data.history === defaultHistory
+                && data.dataStore === defaultWebsiteDataStore
+                && (!BrowserProfile.usesDisposableWebsiteData || !data.dataStore.isPersistent)
+                && (sessionStore == nil || data.session === sessionStore)
+        }
+        return sessionStore != nil
+    }
+
+    /// Capture before opening. Repeated requests and Space switches cannot substitute a new destination.
+    @discardableResult
+    func requestClearData(websiteDataOperations: BrowsingData.WebsiteDataOperations? = nil) -> Bool {
+        guard canRequestClearData, let profile = spaces.profiles.profile(profileID) else { return false }
+        let data: BrowsingData
+        if profile.id == BrowserProfile.defaultID {
+            guard let existing = defaultBrowsingData else { return false }
+            data = existing
+        } else {
+            guard let history = history(for: profile.id), let store = websiteDataStore(forProfileID: profile.id),
+                  let service = sessionStore,
+                  !BrowserProfile.usesDisposableWebsiteData || !store.isPersistent else { return false }
+            data = BrowsingData(history: history, session: service, dataStore: store,
+                                websiteDataOperations: websiteDataOperations, includesSharedState: false,
+                                profileID: profile.id, ownershipResolver: spaces.owns)
+        }
+        clearDataPresentation = ClearDataPresentation(profileName: profile.title, data: data)
+        return true
+    }
+
+    func dismissClearData() { clearDataPresentation = nil }
+
     func requestSessionSave() {
         guard !isPrivate, !isExtensionWindow else { return }
         sessionStore?.requestSave()
@@ -220,6 +257,7 @@ final class BrowserModel: NSObject {
     func windowDidClose() {
         guard !isClosed else { return }
         isClosed = true
+        dismissClearData()
         cancelTidyingTabs()
         titleTasks.values.forEach { $0.cancel() }
         for tab in allTabs { tab.stopLoading() }
@@ -647,7 +685,8 @@ final class BrowserModel: NSObject {
             let legacy = SpaceSession(spaceID: BrowserSpaceStore.defaultSpaceID, profileID: BrowserProfile.defaultID,
                                       tabs: session.tabs, selectedIndex: session.selectedIndex, splits: session.splits)
             restoreSession(WindowSession(tabs: session.tabs, selectedIndex: session.selectedIndex,
-                                         activeSpaceID: BrowserSpaceStore.defaultSpaceID, spaceSessions: [legacy]))
+                                         activeSpaceID: BrowserSpaceStore.defaultSpaceID, spaceSessions: [legacy],
+                                         unavailableSpaceSessions: session.unavailableSpaceSessions))
             return
         }
         // Private and extension windows keep their existing single-context behavior.

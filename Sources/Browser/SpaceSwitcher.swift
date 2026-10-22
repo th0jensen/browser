@@ -173,7 +173,8 @@ struct SpaceSwitcher: View {
         if browser.spaces.profiles.loadFailed { Text("Profiles could not be read. Keep Profiles.json for recovery.") }
         if browser.profileID != BrowserProfile.defaultID {
             Button("Profile Site Settings…") { isShowingProfileSettings = true }
-            Button("Clear Profile Data…") { browser.isShowingClearData = true }
+            Button("Clear Profile Data…") { browser.requestClearData() }
+                .disabled(!browser.canRequestClearData)
         }
     }
 
