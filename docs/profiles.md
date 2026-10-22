@@ -21,6 +21,10 @@ The sidebar, overflow, indicator count and Control-number menu use the same desc
 - Session records contain Space and profile ownership. Background pages restore lazily. Unknown or mismatched owners remain recovery records; they do not load with default-profile cookies.
 - Clearing all history removes only records that the current Space descriptors validate as belonging to that profile. Clearing and restore use the same validator. Unknown-Space records, descriptor/profile mismatches, and unavailable-owner recovery remain, even before restore classifies them. Open windows are not closed.
 
+## External links
+
+[Link Routing](link-routing.md) can target available Spaces in the Existing Profile or named ordinary profiles. Settings shows the owning profile and Space together. An ordinary window can switch to the destination's profile before opening a link. Unknown or unavailable destinations use the existing ordinary fallback; private windows are never selected. Listing and validating destinations uses descriptors only and does not load profile website data.
+
 ## Limits
 
 Extensions, extension content blockers, and browser password save/autofill work only in the Existing Profile. Named profiles do not receive its extension controller or password scripts. Browser Settings labels this scope. The Space menu provides named-profile site settings and data clearing.

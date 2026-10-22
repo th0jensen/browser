@@ -3,11 +3,12 @@ import SwiftUI
 struct BrowserSettings: View {
     let browsingData: BrowsingData
     private enum Category: String, CaseIterable, Identifiable {
-        case general = "General", appearance = "Appearance", privacy = "Privacy", passwords = "Passwords", siteSettings = "Site Settings", downloads = "Downloads", extensions = "Extensions", intelligence = "Intelligence"
+        case general = "General", linkRouting = "Link Routing", appearance = "Appearance", privacy = "Privacy", passwords = "Passwords", siteSettings = "Site Settings", downloads = "Downloads", extensions = "Extensions", intelligence = "Intelligence"
         var id: String { rawValue }
         var symbol: String {
             switch self {
             case .general: "gearshape"
+            case .linkRouting: "arrow.triangle.branch"
             case .appearance: "paintpalette"
             case .privacy: "hand.raised"
             case .passwords: "key"
@@ -25,7 +26,7 @@ struct BrowserSettings: View {
             List(selection: $selection) {
                 Section("Browser") { category(.general); category(.appearance); category(.downloads) }
                 Section("Privacy and Security") { category(.privacy); category(.passwords); category(.siteSettings) }
-                Section("Features") { category(.extensions); category(.intelligence) }
+                Section("Features") { category(.linkRouting); category(.extensions); category(.intelligence) }
             }
             .listStyle(.sidebar)
             .frame(width: 190)
@@ -41,6 +42,7 @@ struct BrowserSettings: View {
                 Group {
                     switch selection ?? .general {
                     case .general: GeneralSettings(updater: .shared)
+                    case .linkRouting: LinkRoutingSettings(rules: .shared, spaces: .shared)
                     case .appearance: AppearanceSettings()
                     case .privacy: PrivacySettings(browsingData: browsingData, contentBlocker: .shared)
                     case .passwords: PasswordSettings(passwords: .shared, passkeys: .shared)
